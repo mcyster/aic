@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+prompt="$(cat)"
+
+opencode run --continue "Surface: console.
+
+For your own prose:
+- Use plain terminal text.
+- Prefix progress/commentary lines with '## '.
+- Keep the final conversational response unprefixed.
+- Do not use Markdown headings, tables, or fenced code blocks.
+- Do not repeat tool output in the final response.
+
+User:
+${prompt}"

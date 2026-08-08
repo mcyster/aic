@@ -21,6 +21,7 @@
           packages = [
             packageSet.cargo
             packageSet.clippy
+            packageSet.opencode
             packageSet.rust-analyzer
             packageSet.rustc
             packageSet.rustfmt
