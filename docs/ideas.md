@@ -2,7 +2,7 @@
 
 ## Conversation Providers
 
-Select the first conversation provider and client library after evaluating protocol compatibility, streaming support, authentication, error modeling, maintenance, and dependency cost.
+Evaluate additional providers and provider libraries after the direct OpenAI Responses implementation establishes the required streaming, replay, error, and tool semantics.
 
 ## Command-Line Input
 
@@ -10,4 +10,4 @@ Consider standard input and file-based prompts when concrete automation workflow
 
 ## Conversation State
 
-Define persistence only after the expected interaction model and provider message formats are understood.
+Evaluate when the Phase 1 atomic file-per-event store needs concurrent append coordination, indexing, compaction, or migration to a database.

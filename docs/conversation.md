@@ -1,17 +1,231 @@
 # Conversation Architecture
 
-**Status:** Phase 1 design
+**Status:** Phase 1 implementation in progress
 **Goal:** Establish a strong event-oriented architecture that can evolve without requiring a restart as model APIs, providers, and runtime behavior change.
 
 This design is intentionally incomplete.
 
 Phase 1 should prove the architecture against the OpenAI Responses API, preserve enough information to learn from newer event-oriented model APIs, and avoid premature provider-neutral generalization.
 
+The initial implementation now covers durable conversation and agent-run streams, incremental OpenAI SSE event persistence, idempotent assistant projection, CLI output, response-ID continuation, and semantic replay data. Tool-call execution and response round-tripping remain the next milestone.
+
 The priority is:
 
 > Strong direction, simple implementation, preserved information, easy evolution.
 
 We explicitly do **not** need a perfect event-sourcing framework, agent runtime, or provider abstraction in Phase 1.
+
+---
+
+## Current implementation contract
+
+The implementation currently supports one text turn per process invocation through the OpenAI Responses API.
+
+The durable semantic model contains:
+
+```text
+Conversation
+ConversationEvent::User
+ConversationEvent::Assistant
+```
+
+The durable operational model contains:
+
+```text
+AgentRun
+AgentRunEvent::RunStarted
+AgentRunEvent::ModelProviderEvent
+AgentRunEvent::RunCompleted
+AgentRunEvent::RunFailed
+```
+
+The other event kinds described in this document define the intended architecture, not current behavior.
+In particular, tool calls, tool responses, context mutation, automation, data events, and cross-provider replay are not implemented yet.
+
+### Turn execution
+
+A successful turn follows this sequence:
+
+```text
+load or create Conversation
+    ↓
+report ConversationId
+    ↓
+recover missing Assistant projections from prior AgentRuns
+    ↓
+append User event
+    ↓
+select provider continuation or semantic reconstruction
+    ↓
+create AgentRun
+    ↓
+append RunStarted with the request snapshot
+    ↓
+send the OpenAI request
+    ↓
+append each parsed provider event as it arrives
+    ↓
+append Assistant projected from response.completed
+    ↓
+append RunCompleted
+    ↓
+write assistant text to standard output
+```
+
+The conversation ID is reported before model I/O so the user can recover and continue the conversation if the invocation fails.
+The `User` event is also durable before model I/O.
+Consequently, a failed invocation remains part of semantic history and can affect the input reconstructed for a later turn.
+
+### Request snapshots
+
+`RunStarted` stores the request information required to understand the attempted invocation:
+
+```text
+provider
+model
+response_verbosity, when configured
+previous_response_id, when used
+input
+```
+
+This snapshot is durable before the external request begins.
+It is an audit and recovery record, not a promise that every future provider option will be represented by these fields.
+The snapshot should grow only when a new option affects replay or the meaning of the run.
+
+### Continuation selection
+
+The current OpenAI adapter prefers provider-side continuation only when the event immediately before the newly appended `User` event is an `Assistant` event whose source `response.completed` event contains a response ID.
+
+In that case the request contains:
+
+```text
+previous_response_id
+input = only the new user message
+```
+
+Otherwise the adapter reconstructs input from all semantic `User` and `Assistant` events in position order.
+
+This rule intentionally handles interrupted alternation.
+For example, if a prior model invocation failed after its `User` event was persisted, the next invocation cannot continue only from the last successful provider response because doing so would omit the failed turn's user input.
+It therefore uses local semantic reconstruction.
+
+If an OpenAI continuation request returns HTTP `400 Bad Request` or `404 Not Found`, the runtime records that run as failed and performs one new run using local semantic reconstruction without `previous_response_id`.
+Other HTTP failures are returned without automatic reconstruction.
+The failed continuation attempt remains durable; fallback does not rewrite it.
+
+### Semantic projection and recovery
+
+An OpenAI `response.completed` provider event is the stable source event for an `Assistant` projection.
+The projection identity currently consists of:
+
+```text
+source_run_id
+source_run_event_id
+output_index = 0
+event kind = assistant
+```
+
+Before each new turn, the runtime scans prior runs for completed assistant output and attempts to append the corresponding semantic event.
+Conversation persistence returns the existing event when the projection identity is already present.
+This closes the crash window between persisting `response.completed` and persisting `Assistant` without requiring a transaction across both logs.
+
+Recovery currently occurs as part of executing another turn.
+There is no standalone repair command or background recovery process.
+
+Projection currently recognizes:
+
+```text
+response.output_text.delta
+response.output_text.done
+response.refusal.delta
+response.refusal.done
+response.completed
+```
+
+Text and refusal output both become semantic assistant text.
+The implementation supports one combined assistant output per run, so the projection output index is currently always zero.
+
+### Persistence layout
+
+The event store root is selected in this order:
+
+```text
+AIC_DATA_DIR
+XDG_DATA_HOME/aic
+HOME/.local/share/aic
+```
+
+The current file layout is:
+
+```text
+<root>/
+    conversations/
+        <conversation UUID>/
+            conversation.json
+            events/
+                <position>-<event UUID>.json
+    agent-runs/
+        <agent-run UUID>/
+            agent-run.json
+            events/
+                <position>-<event UUID>.json
+```
+
+Positions are zero-based, rendered as twenty decimal digits in filenames, and validated as contiguous when a stream is loaded.
+JSON content stores typed UUID values, timestamps in Unix epoch milliseconds, schema version `1`, and the event payload.
+
+Directories are created with mode `0700` and files with mode `0600` on Unix.
+Each JSON value is written to a new temporary file, flushed with `sync_all`, atomically renamed into place, and followed by a parent-directory sync.
+These operations protect an individual append from partial-file visibility.
+They do not provide concurrent-writer coordination.
+
+### Provider event fidelity
+
+The OpenAI adapter persists every successfully parsed JSON SSE payload before applying it to the live semantic projection.
+Unknown event types and unknown JSON fields are retained in the provider payload.
+
+Current persistence is raw at the parsed JSON level, not at the byte or transport level.
+SSE framing, comments, `[DONE]`, and malformed JSON are not stored.
+This is the current interpretation of preserving provider payloads "as faithfully as practical."
+
+### Observable CLI contract
+
+The console surface currently emits:
+
+```text
+stderr: #> conversation conversation_...
+stdout: final semantic assistant text
+```
+
+No provider deltas, reasoning events, or operational status are written to standard output.
+The implementation returns the just-persisted assistant text directly to the executable rather than reloading the Conversation Log for rendering, but the returned value and persisted `Assistant` event are created from the same projection result.
+
+### Current guarantees and limits
+
+The current implementation guarantees:
+
+- separate semantic and operational logs
+- typed UUIDv7 identifiers in the Rust domain model
+- deterministic per-stream replay by contiguous position
+- durable run identity and request snapshot before model I/O
+- incremental parsed-provider-event persistence
+- idempotent recovery of assistant projections
+- provider continuation with semantic reconstruction fallback
+- private local persistence permissions on Unix
+
+The current implementation does not guarantee:
+
+- safe concurrent writers to the same stream
+- exactly-once external requests or tool execution
+- byte-for-byte provider stream archival
+- schema migration or rejection of unsupported schema versions
+- redaction of secrets in prompts, provider payloads, or model output
+- recovery without a subsequent `turn` invocation
+- multiple semantic outputs from one run
+- local reconstruction of OpenAI-native reasoning state
+- tool-call execution or round-tripping
+
+These boundaries are deliberate Phase 1 constraints unless a later section states a stronger target.
 
 ---
 
@@ -1307,9 +1521,9 @@ Where uncertain:
 
 ---
 
-## 38. First implementation milestone
+## 38. Implementation baseline and next milestone
 
-The first coherent implementation should prove:
+The current implementation proves:
 
 ```text
 CreateConversation
@@ -1352,16 +1566,27 @@ project Conversation to CLI
 reinvoke OpenAI using the appropriate replay strategy
 ```
 
-Then add:
+The next coherent milestone is tool-call round-tripping:
 
 ```text
-tool call
-tool execution
-tool response
-model reinvocation
+OpenAI emits a completed function call
+    ↓
+derive and persist ToolCall
+    ↓
+derive pending ExecuteTool work
+    ↓
+execute the selected tool
+    ↓
+persist ToolResponse linked by ToolCallId
+    ↓
+project the tool result into OpenAI input
+    ↓
+invoke the model again
+    ↓
+persist the final Assistant event
 ```
 
-and validate the boundaries rather than attempting full runtime sophistication.
+This milestone should validate stable tool-call identity, idempotent control projection, crash behavior around external tool execution, and provider response construction without introducing a general workflow engine.
 
 ---
 
@@ -1374,7 +1599,5 @@ Implementation experience should feed back into it.
 If OpenAI Responses exposes assumptions that conflict with this model, document those pressures explicitly rather than hiding them behind increasingly elaborate abstractions.
 
 Related architecture documents should be updated so they do not continue to describe these decisions as unresolved.
-
-Add this document to the documentation index.
 
 Major future architectural changes should be captured in ADRs when useful.

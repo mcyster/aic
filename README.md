@@ -1,26 +1,84 @@
 # aic
 
-`aic` provides command-line access to agentic services.
+`aic` provides durable command-line conversations through OpenAI's Responses API.
 
-The first command invokes a stubbed conversation turn:
+## Prerequisites
+
+The supported development environment uses [Nix](https://nixos.org/) with flakes enabled. You also need an OpenAI API key.
+
+Enter the environment directly:
 
 ```console
-aic turn "Explain ownership in Rust"
+nix develop
 ```
 
-## Development
-
-Enter the development environment with direnv:
+If you use [direnv](https://direnv.net/), enter it automatically when opening the repository:
 
 ```console
 direnv allow
 ```
 
-Alternatively, enter it directly:
+Set your API key in the current shell:
 
 ```console
-nix develop
+export OPENAI_API_KEY=...
 ```
+
+With direnv, you can instead put the export in `.env` or `$HOME/.env.aic`; both files are loaded by the repository's `.envrc`.
+
+## Run From Source
+
+Start a conversation without installing the binary:
+
+```console
+cargo run -- turn "Explain ownership in Rust"
+```
+
+The command writes progress and the conversation ID to standard error. It writes the assistant response to standard output after OpenAI completes the response. Continue the conversation with that ID:
+
+```console
+cargo run -- turn --conversation conversation_019... "Show an example"
+```
+
+The default model is `gpt-5.6`. Select another OpenAI model with `--model`:
+
+```console
+cargo run -- turn --model MODEL_NAME "Explain ownership in Rust"
+```
+
+Response verbosity defaults to `low` for concise CLI turns. Select `low`, `medium`, or `high` with `--verbosity`:
+
+```console
+cargo run -- turn --verbosity medium "Explain ownership in Rust"
+```
+
+Run `cargo run -- --help` or `cargo run -- turn --help` for the complete command-line help.
+
+## Build
+
+Build an optimized binary from inside the Nix development environment:
+
+```console
+cargo build --release
+```
+
+The binary is written to `target/release/aic`. Run it directly:
+
+```console
+./target/release/aic turn "Explain ownership in Rust"
+```
+
+To invoke it as `aic` from any directory, place the binary in a directory on your `PATH`.
+
+## Data
+
+Conversations and parsed provider events are stored in the first available location:
+
+1. `$AIC_DATA_DIR`
+2. `$XDG_DATA_HOME/aic`
+3. `$HOME/.local/share/aic`
+
+## Development
 
 Run the project checks:
 

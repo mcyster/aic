@@ -2,6 +2,10 @@
 
 `aic` is a single Cargo package containing one executable.
 
-The command-line module translates process arguments into typed commands. The conversation module owns conversation-specific values and behavior. The executable composes these modules and writes the response to standard output.
+The command-line module translates process arguments into typed turn requests. The turn service coordinates semantic conversation events, durable agent-run events, and the OpenAI Responses provider. The executable writes semantic assistant output to standard output and conversation metadata to standard error.
 
-The initial conversation service is deterministic and does not perform network access. A provider will be selected before introducing asynchronous execution, HTTP dependencies, provider configuration, or provider abstractions.
+Conversation and agent-run streams use separate local append-only logs. Each event is stored as an atomically renamed JSON file with a typed UUIDv7 identifier, monotonic stream position, timestamp, and schema version. Phase 1 assumes one writer per stream.
+
+The first provider uses OpenAI's Responses API through a narrow HTTP/SSE adapter. Raw provider events are persisted before semantic projection. Completed model output becomes an idempotent conversation event referencing its source agent-run event. Subsequent turns use the prior OpenAI response ID when available and retain semantic history for local reconstruction.
+
+The detailed design and implementation boundaries are in [Conversation Architecture](conversation.md).

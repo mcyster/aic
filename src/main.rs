@@ -1,12 +1,20 @@
+mod agent_run;
 mod command_line;
 mod conversation;
+mod identifier;
+mod openai;
+mod persistence;
+mod turn;
+
+use std::error::Error;
 
 use clap::Parser;
 use command_line::CommandLine;
 
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
     let command_line = CommandLine::parse();
-    let assistant_response = command_line.execute();
+    let turn_result = command_line.execute()?;
 
-    println!("{assistant_response}");
+    println!("{}", turn_result.assistant_text);
+    Ok(())
 }
