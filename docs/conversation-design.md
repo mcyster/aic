@@ -286,19 +286,50 @@ Those can be introduced later if branching or explicit causality becomes importa
 
 `User` represents user-provided input.
 
-The domain model should not be intrinsically text-only.
+The conversation log should reference external content rather than embed large binary payloads directly.
 
-The content model should leave room for:
+For example:
 
-```text
-text
-image
-file
-audio
-structured input
+```rust
+struct ImageId(Uuid);
+struct FileId(Uuid);
+
+enum UserContent {
+    Text(String),
+    Image(ImageId),
+    File(FileId),
+}
+
+struct User {
+    content: Vec<UserContent>,
+}
 ```
 
-Phase 1 only needs text.
+A single `User` event may carry multiple content parts, for example text alongside an image. This is why `content` is a `Vec<UserContent>` rather than a single `UserContent`.
+
+The conceptual flow is:
+
+```text
+store image/file/blob
+    ↓
+obtain strongly typed durable ID
+    ↓
+append User event containing that ID
+```
+
+For example:
+
+```text
+User
+    Text("what is in this image?")
+    Image(image_019...)
+```
+
+This keeps conversation events small, avoids duplicating binary content during replay, and lets the content store, retention, deduplication, permissions, and transport evolve independently from the conversation model.
+
+The `ModelDriver` is responsible for resolving referenced content into the provider-specific representation needed for invocation.
+
+Phase 1 only needs text and whatever minimal image/file referencing is required by concrete use cases. The architectural rule is that large binary content lives outside the conversation event log and is referenced by typed ID.
 
 A failed model invocation does not remove the already-durable `User` event. The user turn remains part of future reconstruction.
 
@@ -595,29 +626,149 @@ This decision should be documented as an explicit architectural exception to ADR
 
 ## 20. ModelDriver interface
 
+The `ModelDriver` invocation boundary should make input immutability and caller-visible outcomes explicit.
+
 Conceptually:
 
 ```rust
 trait ModelDriver {
     async fn invoke(
         &self,
-        input: ModelDriverInput,
+        input: &ModelDriverInput,
         events: &mut ModelDriverRunEventSink,
-    ) -> Result<()>;
+    ) -> Result<ModelDriverResult, ModelDriverError>;
 }
 ```
 
-The exact Rust signature is not prescribed.
+The exact Rust signature is not prescribed, but this is the intended shape.
 
-Implementation may prefer a callback, stream, channel, or another idiomatic async mechanism.
+### Immutable invocation input
 
-The important properties are:
+`ModelDriverInput` represents an immutable invocation snapshot.
+
+It should contain stable identities and the information required for this invocation, for example:
+
+```rust
+struct ModelDriverInput {
+    conversation_id: ConversationId,
+    run_id: ModelDriverRunId,
+
+    model: ModelId,
+    conversation: ConversationSnapshot,
+    config: ModelConfig,
+}
+```
+
+The precise fields will emerge during implementation.
+
+Passing:
+
+```rust
+&ModelDriverInput
+```
+
+means the driver cannot mutate the input through that reference.
+
+For ordinary owned Rust fields such as structs, enums, `String`, and `Vec`, this gives the desired deep immutability through the borrowed value.
+
+Interior-mutability types such as:
+
+```text
+Mutex
+RwLock
+RefCell
+Atomic*
+```
+
+can still mutate state behind an immutable reference, so `ModelDriverInput` should avoid them unless there is a specific demonstrated reason.
+
+The intended contract is:
+
+> A ModelDriver invocation receives a stable immutable snapshot. It emits new facts through the run-event sink rather than mutating its input.
+
+`conversation_id` and `run_id` are references to durable identities. They do not imply mutable access to the stored Conversation or ModelDriverRun.
+
+### Strongly typed invocation result
+
+Do not use:
+
+```rust
+Result<()>
+```
+
+as the public invocation contract.
+
+The caller should receive a strongly typed result that tells it how the invocation ended at the API/control-flow level.
+
+Conceptually:
+
+```rust
+struct ModelDriverResult {
+    run_id: ModelDriverRunId,
+    status: ModelDriverStatus,
+}
+```
+
+with a small status vocabulary such as:
+
+```rust
+enum ModelDriverStatus {
+    Completed,
+    NeedsCallerAction,
+}
+```
+
+The exact variants should be driven by real OpenAI implementation needs.
+
+The result should not duplicate detailed semantic facts already persisted in the event logs. For example, tool requests and assistant responses remain durable events rather than being copied wholesale into `ModelDriverResult`.
+
+The result exists so the caller can react without inspecting provider-specific details.
+
+### Strongly typed errors
+
+Expected invocation failures are represented explicitly:
+
+```rust
+Result<ModelDriverResult, ModelDriverError>
+```
+
+with a typed error model approximately like:
+
+```rust
+enum ModelDriverError {
+    Authentication(...),
+    RateLimited(...),
+    Transport(...),
+    InvalidRequest(...),
+    Provider(...),
+    Persistence(...),
+}
+```
+
+The exact taxonomy should remain small and implementation-driven.
+
+Rust does not use Java-style checked exceptions or `throws` declarations.
+
+Recoverable/expected failures are part of the function type through `Result<T, E>`.
+
+Unexpected programmer failures may panic, but provider, transport, validation, persistence, and similar operational failures should normally be represented by `ModelDriverError`.
+
+This makes the error contract explicit in the type system.
+
+### Invocation responsibilities
+
+The important properties remain:
 
 - invocation is one model-driver call, not the entire autonomous tool loop
+- input is an immutable snapshot
 - run events are emitted incrementally
 - the caller owns the outer loop
+- the caller receives a typed success/outcome value
+- expected failures are typed
 - OpenAI SDK types do not cross the boundary
 - provider-specific replay logic belongs behind the boundary
+
+The precise `invoke` contract is expected to receive further iteration during Phase 1.
 
 ---
 
@@ -705,9 +856,11 @@ Conceptually:
 
 ```rust
 trait ModelDriverRunEventSink {
-    fn emit(&mut self, event: ModelDriverRunEvent) -> Result<()>;
+    fn emit(&mut self, event: ModelDriverRunEvent) -> Result<(), ModelDriverError>;
 }
 ```
+
+`emit` reuses the same `ModelDriverError` taxonomy introduced in §20 (for example `Persistence`) so the run-event sink carries the same typed-error discipline as `invoke`.
 
 The seam is important now.
 
@@ -1496,6 +1649,10 @@ ModelDriverRunEvents as operational/provider history
 
 a narrow explicit ModelDriver abstraction
 
+immutable ModelDriverInput snapshots
+
+strongly typed ModelDriverResult and ModelDriverError
+
 strongly typed UUIDv7 IDs
 
 monotonic per-stream replay positions
@@ -1509,6 +1666,8 @@ ProjectionIdentity on derived semantic events
 idempotent cross-log projection and recovery
 
 ToolCallId correlation for multiple tool requests
+
+typed external references for images/files/blobs
 
 provider-native versus semantic replay
 
@@ -1696,7 +1855,40 @@ The goal is a useful abstraction, not an untouchable one.
 
 ---
 
-## 52. Replay and consistency future direction
+## 52. Content storage future direction
+
+Conversation events should continue to reference large or binary content by strongly typed durable IDs rather than embedding it.
+
+Future content storage may add:
+
+```text
+deduplication
+content-addressed storage
+remote object storage
+retention policy
+access control
+lazy materialization
+provider-specific upload caches
+```
+
+Those concerns should remain outside the semantic Conversation Log.
+
+The stable contract is:
+
+```text
+ConversationEvent
+    references content ID
+
+content store
+    owns bytes and content lifecycle
+
+ModelDriver
+    resolves referenced content for provider invocation
+```
+
+---
+
+## 53. Replay and consistency future direction
 
 The current per-stream monotonic position is sufficient for deterministic local replay.
 
@@ -1721,7 +1913,7 @@ That distinction should remain stable.
 
 # Documentation
 
-## 53. Documentation status
+## 54. Documentation status
 
 This document is a **Phase 1 architectural direction**, not a permanent finished API.
 
