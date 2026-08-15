@@ -1,7 +1,8 @@
 # Documentation
 
 - [Architecture](architecture.md)
-- [Conversation architecture](conversation.md)
+- [Conversation model](conversation.md)
+- [Conversation and ModelDriver architecture](conversation-design.md)
 - [CLI-first surface](cli-first-surface.md)
 - [Development standards](development-standards.md)
 - [Ideas](ideas.md)

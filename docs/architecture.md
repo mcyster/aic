@@ -8,4 +8,4 @@ Conversation and agent-run streams use separate local append-only logs. Each eve
 
 The first provider uses OpenAI's Responses API through a narrow HTTP/SSE adapter. Raw provider events are persisted before semantic projection. Completed model output becomes an idempotent conversation event referencing its source agent-run event. Subsequent turns use the prior OpenAI response ID when available and retain semantic history for local reconstruction.
 
-The detailed design and implementation boundaries are in [Conversation Architecture](conversation.md).
+The stable semantic concepts are summarized in the [Conversation Model](conversation.md). The detailed design and implementation boundaries are in [Conversation and ModelDriver Architecture](conversation-design.md).
