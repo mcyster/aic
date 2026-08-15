@@ -4,7 +4,7 @@ These are early design notes, not a settled specification.
 
 ## Direction
 
-`aic` is CLI-first. It uses the existing shell as its user interface rather than embedding a terminal chat application or full-screen TUI. One invocation represents one conversational turn.
+`tog` is CLI-first. It uses the existing shell as its user interface rather than embedding a terminal chat application or full-screen TUI. One invocation represents one conversational turn.
 
 The durable abstraction is the conversation, separate from the local CLI or agent process. Agent execution may eventually be local or remote, foreground or background, without changing the conversation model.
 

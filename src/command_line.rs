@@ -7,7 +7,7 @@ use crate::turn::{TurnProgress, TurnRequest, TurnResult, TurnResultValue, TurnSe
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "aic",
+    name = "tog",
     version,
     about = "Command-line access to agentic services"
 )]

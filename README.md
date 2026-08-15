@@ -1,6 +1,6 @@
-# aic
+# tog
 
-`aic` provides durable command-line conversations through OpenAI's Responses API.
+`tog` provides durable command-line conversations through OpenAI's Responses API.
 
 ## Prerequisites
 
@@ -24,7 +24,7 @@ Set your API key in the current shell:
 export OPENAI_API_KEY=...
 ```
 
-With direnv, you can instead put the export in `.env` or `$HOME/.env.aic`; both files are loaded by the repository's `.envrc`.
+With direnv, you can instead put the export in `.env` or `$HOME/.env.tog`; both files are loaded by the repository's `.envrc`.
 
 ## Run From Source
 
@@ -62,21 +62,21 @@ Build an optimized binary from inside the Nix development environment:
 cargo build --release
 ```
 
-The binary is written to `target/release/aic`. Run it directly:
+The binary is written to `target/release/tog`. Run it directly:
 
 ```console
-./target/release/aic turn "Explain ownership in Rust"
+./target/release/tog turn "Explain ownership in Rust"
 ```
 
-To invoke it as `aic` from any directory, place the binary in a directory on your `PATH`.
+To invoke it as `tog` from any directory, place the binary in a directory on your `PATH`.
 
 ## Data
 
 Conversations and parsed provider events are stored in the first available location:
 
-1. `$AIC_DATA_DIR`
-2. `$XDG_DATA_HOME/aic`
-3. `$HOME/.local/share/aic`
+1. `$TOG_DATA_DIR`
+2. `$XDG_DATA_HOME/tog`
+3. `$HOME/.local/share/tog`
 
 ## Development
 

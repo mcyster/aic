@@ -150,9 +150,9 @@ The implementation supports one combined assistant output per run, so the projec
 The event store root is selected in this order:
 
 ```text
-AIC_DATA_DIR
-XDG_DATA_HOME/aic
-HOME/.local/share/aic
+TOG_DATA_DIR
+XDG_DATA_HOME/tog
+HOME/.local/share/tog
 ```
 
 The current file layout is:

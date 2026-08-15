@@ -15,7 +15,7 @@ The complete development standards are in [`docs/development-standards.md`](docs
 
 - Use descriptive, full-word names for project-defined types, functions, modules, variables, parameters, and generic parameters.
 - Do not use project-defined abbreviations or single-letter names.
-- Standard Rust and domain terminology such as `std`, `str`, `Ok`, `Err`, `Self`, and `aic` is allowed.
+- Standard Rust and domain terminology such as `std`, `str`, `Ok`, `Err`, `Self`, and `tog` is allowed.
 - Do not add comments to Rust source files. Extract complexity into well-named entities instead.
 - Normalize external values at boundaries and convert them into validated project types.
 - Use `Option` for absence and `Result` for recoverable failure.

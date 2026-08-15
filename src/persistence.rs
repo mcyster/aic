@@ -20,16 +20,16 @@ pub(crate) struct EventStore {
 
 impl EventStore {
     pub(crate) fn from_environment() -> io::Result<Self> {
-        let root_directory = if let Some(configured_directory) = std::env::var_os("AIC_DATA_DIR") {
+        let root_directory = if let Some(configured_directory) = std::env::var_os("TOG_DATA_DIR") {
             PathBuf::from(configured_directory)
         } else if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-            PathBuf::from(data_home).join("aic")
+            PathBuf::from(data_home).join("tog")
         } else if let Some(home_directory) = std::env::var_os("HOME") {
-            PathBuf::from(home_directory).join(".local/share/aic")
+            PathBuf::from(home_directory).join(".local/share/tog")
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "AIC_DATA_DIR, XDG_DATA_HOME, or HOME must be set",
+                "TOG_DATA_DIR, XDG_DATA_HOME, or HOME must be set",
             ));
         };
 
@@ -289,7 +289,7 @@ mod tests {
     use crate::conversation::{ConversationEvent, ProjectionIdentity};
 
     fn temporary_store() -> EventStore {
-        let directory = std::env::temp_dir().join(format!("aic-test-{}", uuid::Uuid::now_v7()));
+        let directory = std::env::temp_dir().join(format!("tog-test-{}", uuid::Uuid::now_v7()));
         EventStore::new(directory).expect("the event store should be created")
     }
 

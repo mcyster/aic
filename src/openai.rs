@@ -21,7 +21,7 @@ impl OpenAiClient {
     pub(crate) fn from_environment() -> OpenAiResult<Self> {
         let api_key = std::env::var("OPENAI_API_KEY")
             .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "OPENAI_API_KEY must be set"))?;
-        let base_url = std::env::var("AIC_OPENAI_BASE_URL")
+        let base_url = std::env::var("TOG_OPENAI_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_owned());
         Ok(Self {
             http_client: Client::new(),

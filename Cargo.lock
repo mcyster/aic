@@ -3,17 +3,6 @@
 version = 4
 
 [[package]]
-name = "aic"
-version = "0.1.0"
-dependencies = [
- "clap",
- "reqwest",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1229,6 +1218,17 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
+name = "tog"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "uuid",
+]
 
 [[package]]
 name = "tokio"

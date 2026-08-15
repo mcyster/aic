@@ -7,12 +7,12 @@ use std::thread::{self, JoinHandle};
 
 use serde_json::Value;
 
-fn aic_command() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_aic"))
+fn tog_command() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_tog"))
 }
 
 fn temporary_data_directory() -> PathBuf {
-    std::env::temp_dir().join(format!("aic-command-test-{}", uuid::Uuid::now_v7()))
+    std::env::temp_dir().join(format!("tog-command-test-{}", uuid::Uuid::now_v7()))
 }
 
 struct MockOpenAiServer {
@@ -131,11 +131,11 @@ fn write_response(stream: &mut TcpStream, response: MockResponse) {
 }
 
 fn configured_command(server: &MockOpenAiServer, data_directory: &PathBuf) -> Command {
-    let mut command = aic_command();
+    let mut command = tog_command();
     command
         .env("OPENAI_API_KEY", "test-key")
-        .env("AIC_OPENAI_BASE_URL", &server.base_url)
-        .env("AIC_DATA_DIR", data_directory);
+        .env("TOG_OPENAI_BASE_URL", &server.base_url)
+        .env("TOG_DATA_DIR", data_directory);
     command
 }
 
@@ -159,7 +159,7 @@ fn turn_persists_events_and_prints_semantic_output() {
     let command_output = configured_command(&server, &data_directory)
         .args(["turn", "Say hello"])
         .output()
-        .expect("aic should run");
+        .expect("tog should run");
 
     assert!(command_output.status.success());
     assert_eq!(
@@ -189,7 +189,7 @@ fn turn_sends_selected_response_verbosity() {
     let command_output = configured_command(&server, &data_directory)
         .args(["turn", "--verbosity", "high", "Explain ownership"])
         .output()
-        .expect("aic should run");
+        .expect("tog should run");
 
     assert!(command_output.status.success());
     let requests = server.finish();
@@ -334,7 +334,7 @@ fn failed_user_turn_is_included_in_the_next_local_reconstruction() {
 
 #[test]
 fn turn_rejects_a_missing_user_prompt() {
-    let command_output = aic_command().arg("turn").output().expect("aic should run");
+    let command_output = tog_command().arg("turn").output().expect("tog should run");
 
     assert!(!command_output.status.success());
     assert!(
@@ -346,10 +346,10 @@ fn turn_rejects_a_missing_user_prompt() {
 
 #[test]
 fn help_lists_the_turn_command() {
-    let command_output = aic_command()
+    let command_output = tog_command()
         .arg("--help")
         .output()
-        .expect("aic should run");
+        .expect("tog should run");
 
     assert!(command_output.status.success());
     assert!(

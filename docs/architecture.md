@@ -1,6 +1,6 @@
 # Architecture
 
-`aic` is a single Cargo package containing one executable.
+`tog` is a single Cargo package containing one executable.
 
 The command-line module translates process arguments into typed turn requests. The turn service coordinates semantic conversation events, durable agent-run events, and the OpenAI Responses provider. The executable writes semantic assistant output to standard output and conversation metadata to standard error.
 
