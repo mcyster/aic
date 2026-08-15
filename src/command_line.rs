@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use clap::{Args, Parser, Subcommand};
 
 use crate::agent_run::ResponseVerbosity;
-use crate::identifier::ConversationId;
+use crate::conversation::ConversationId;
 use crate::turn::{TurnProgress, TurnRequest, TurnResult, TurnResultValue, TurnService};
 
 #[derive(Debug, Parser)]

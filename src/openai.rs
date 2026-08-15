@@ -6,8 +6,8 @@ use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use serde_json::{Map, Value, json};
 
+use crate::agent_run::AgentRunEventId;
 use crate::agent_run::ModelRequestSnapshot;
-use crate::identifier::AgentRunEventId;
 
 pub(crate) type OpenAiResult<T> = Result<T, Box<dyn Error>>;
 
@@ -316,7 +316,7 @@ mod tests {
 
         let output = parse_server_sent_events(Cursor::new(stream), |event_type, _| {
             persisted_types.push(event_type);
-            Ok(crate::identifier::AgentRunEventId::new())
+            Ok(crate::agent_run::AgentRunEventId::new())
         })
         .expect("the response stream should parse");
 
@@ -342,7 +342,7 @@ mod tests {
         );
 
         let output = parse_server_sent_events(Cursor::new(stream), |_, _| {
-            Ok(crate::identifier::AgentRunEventId::new())
+            Ok(crate::agent_run::AgentRunEventId::new())
         })
         .expect("the refusal stream should parse");
 

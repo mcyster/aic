@@ -3,10 +3,10 @@ use std::error::Error;
 use serde_json::{Value, json};
 
 use crate::agent_run::{
-    AgentRunEvent, ModelRequestSnapshot, ResponseVerbosity, StoredAgentRunEvent,
+    AgentRunEvent, AgentRunEventId, AgentRunId, ModelRequestSnapshot, ResponseVerbosity,
+    StoredAgentRunEvent,
 };
-use crate::conversation::{ConversationEvent, ProjectionIdentity, UserPrompt};
-use crate::identifier::{AgentRunEventId, AgentRunId, ConversationId};
+use crate::conversation::{ConversationEvent, ConversationId, ProjectionIdentity, UserPrompt};
 use crate::openai::{
     OpenAiClient, OpenAiOutput, OpenAiResponseError, completed_response_text, semantic_input,
 };
@@ -57,7 +57,7 @@ impl TurnService {
         self.recover_semantic_events(conversation.id)?;
         self.event_store.append_conversation_event(
             conversation.id,
-            ConversationEvent::User {
+            ConversationEvent::UserPrompt {
                 text: request.user_prompt.text().to_owned(),
             },
         )?;
@@ -69,8 +69,8 @@ impl TurnService {
                 .rev()
                 .nth(1)
                 .and_then(|stored_event| match &stored_event.event {
-                    ConversationEvent::Assistant { projection, .. } => Some(*projection),
-                    ConversationEvent::User { .. } => None,
+                    ConversationEvent::AssistantResponse { projection, .. } => Some(*projection),
+                    ConversationEvent::UserPrompt { .. } => None,
                 });
         let previous_response_id = previous_projection
             .map(|projection| self.response_id_for_projection(projection))
@@ -117,7 +117,7 @@ impl TurnService {
 
         self.event_store.append_conversation_event(
             conversation.id,
-            ConversationEvent::Assistant {
+            ConversationEvent::AssistantResponse {
                 text: output.assistant_text.clone(),
                 projection: ProjectionIdentity {
                     source_run_id: agent_run_id,
@@ -198,7 +198,7 @@ impl TurnService {
             if let Some((source_run_event_id, assistant_text)) = project_assistant(&events) {
                 self.event_store.append_conversation_event(
                     conversation_id,
-                    ConversationEvent::Assistant {
+                    ConversationEvent::AssistantResponse {
                         text: assistant_text,
                         projection: ProjectionIdentity {
                             source_run_id: agent_run.id,
@@ -249,8 +249,8 @@ impl TurnService {
             .load_conversation_events(conversation_id)?
             .into_iter()
             .map(|stored_event| match stored_event.event {
-                ConversationEvent::User { text } => ("user".to_owned(), text),
-                ConversationEvent::Assistant { text, .. } => ("assistant".to_owned(), text),
+                ConversationEvent::UserPrompt { text } => ("user".to_owned(), text),
+                ConversationEvent::AssistantResponse { text, .. } => ("assistant".to_owned(), text),
             });
         Ok(semantic_input(messages))
     }

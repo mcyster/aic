@@ -4,8 +4,49 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
-use crate::identifier::{AgentRunEventId, AgentRunId, ConversationId};
+use crate::conversation::ConversationId;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct AgentRunId(Uuid);
+
+impl AgentRunId {
+    pub(crate) fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    pub(crate) fn storage_key(self) -> String {
+        self.0.simple().to_string()
+    }
+}
+
+impl Display for AgentRunId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "agent_run_{}", self.0.simple())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct AgentRunEventId(Uuid);
+
+impl AgentRunEventId {
+    pub(crate) fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    pub(crate) fn storage_key(self) -> String {
+        self.0.simple().to_string()
+    }
+}
+
+impl Display for AgentRunEventId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "agent_run_event_{}", self.0.simple())
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct AgentRun {

@@ -8,9 +8,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-use crate::agent_run::{AgentRun, AgentRunEvent, StoredAgentRunEvent};
-use crate::conversation::{Conversation, ConversationEvent, StoredConversationEvent};
-use crate::identifier::{AgentRunEventId, AgentRunId, ConversationEventId, ConversationId};
+use crate::agent_run::{AgentRun, AgentRunEvent, AgentRunEventId, AgentRunId, StoredAgentRunEvent};
+use crate::conversation::{
+    Conversation, ConversationEvent, ConversationEventId, ConversationId, StoredConversationEvent,
+};
 
 const SCHEMA_VERSION: u32 = 1;
 
@@ -303,7 +304,7 @@ mod tests {
         store
             .append_conversation_event(
                 conversation.id,
-                ConversationEvent::User {
+                ConversationEvent::UserPrompt {
                     text: "first".to_owned(),
                 },
             )
@@ -311,7 +312,7 @@ mod tests {
         store
             .append_conversation_event(
                 conversation.id,
-                ConversationEvent::User {
+                ConversationEvent::UserPrompt {
                     text: "second".to_owned(),
                 },
             )
@@ -341,7 +342,7 @@ mod tests {
                 },
             )
             .expect("the source event should be persisted");
-        let assistant_event = ConversationEvent::Assistant {
+        let assistant_event = ConversationEvent::AssistantResponse {
             text: "hello".to_owned(),
             projection: ProjectionIdentity {
                 source_run_id: agent_run.id,
