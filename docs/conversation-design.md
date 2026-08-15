@@ -1,93 +1,56 @@
 # Conversation and ModelDriver Architecture
 
 **Status:** Phase 1 design  
-**Purpose:** Define a strong event-oriented architecture for `tog` that can be implemented against the OpenAI Responses API now, while preserving enough information and clean enough boundaries to evolve without a restart later.
+**Purpose:** Define a simple, durable conversation model and a narrow `ModelDriver` boundary that can be implemented against the OpenAI Responses API now and can support switching models/providers within a conversation.
 
 This design is intentionally incomplete.
 
-Phase 1 is not trying to build a perfect event-sourcing framework, a distributed runtime, or a universal multi-provider SDK. It is trying to establish the seams we are least willing to undo later.
+Phase 1 is not trying to build a perfect event-sourcing framework, a durable provider-protocol log, a distributed runtime, or a universal multi-provider SDK.
 
-The guiding principle is:
+The priority is:
 
-> Strong direction, simple implementation, preserved information, easy evolution.
+> Get the semantic conversation model and ModelDriver boundary right first.
+
+The most important Phase 1 invariant is:
+
+> Every ModelDriver must be able to continue a conversation using the Conversation Log alone, regardless of which ModelDriver produced the earlier events.
+
+People are expected to change models during a conversation far more often than they are expected to replay historical provider protocol streams.
 
 Where uncertain:
 
-> Preserve information and keep the boundary open.
+> Prefer a simple semantic contract now and preserve room for richer tracing and provider-native optimizations later.
 
 ---
 
 ## 1. Architectural overview
 
-There are two durable event streams with different purposes:
+Phase 1 has one durable semantic event stream:
 
 ```text
 Conversation Log
     semantic history
-
-ModelDriver Run Log
-    operational / provider history
+    durable replay source
+    cross-model / cross-provider contract
 ```
 
-The distinction is fundamental.
-
-### Conversation Log
-
-Answers:
-
-> What happened in the conversation?
-
-Examples include:
+A `ModelDriver` consumes an immutable view of that conversation and produces semantic conversation events:
 
 ```text
-User
-ModelNote
-ToolRequest
-ToolResponse
-AssistantResponse
-ModelSpecific
-Context
-Automation
-Data
-Error
+Conversation
+    ↓
+ModelDriver.invoke(...)
+    ↓
+ConversationEvents
+    ↓
+append to Conversation
 ```
 
-This is the stable semantic surface used by consumers such as the CLI, semantic replay, automation, search, and future UIs.
+Provider-specific details such as OpenAI Responses events, response IDs, token timing, reasoning protocol state, and HTTP diagnostics are **not part of the Phase 1 semantic replay contract**.
 
-### ModelDriver Run Log
+They may be captured through logging/tracing for observability.
 
-Answers:
-
-> What happened while a model invocation was being performed?
-
-Examples include:
-
-```text
-RunStarted
-ProviderEvent
-RunCompleted
-RunFailed
-```
-
-This is where provider-specific activity belongs, including raw OpenAI Responses events.
-
-The broad flow is:
-
-```text
-Command
-   ↓
-ModelDriver Run
-   ↓
-durable ModelDriverRunEvents
-   ↓
-projection
-   ↓
-durable ConversationEvents
-   ↓
-CLI / replay / automation / other projections
-```
-
-Phase 1 may implement these boundaries with direct function calls and local sinks. No actual messaging infrastructure is required.
+Later, concrete benefits may justify making some of that provider-specific information durable, but semantic replay must not depend on it.
 
 ---
 
@@ -106,17 +69,31 @@ struct Conversation {
 }
 ```
 
-Phase 1 does not require creation itself to be represented as event zero.
+The event stream begins when something happens.
 
-The event stream begins when something happens in the conversation.
+Phase 1 does not require conversation creation itself to be event zero.
 
-This keeps the model simpler without preventing a future `ConversationCreated` event if creation later becomes semantically useful.
+The Conversation Log answers:
+
+> What happened in the conversation?
+
+It is the durable source for:
+
+```text
+ModelDriver input
+CLI projection
+model switching
+semantic replay
+automation
+search/indexing
+future UIs
+```
 
 ---
 
 ## 3. ConversationEvent
 
-Conversation events are facts, not commands.
+Conversation events describe facts, not provider transport mechanics.
 
 Conceptually:
 
@@ -135,17 +112,15 @@ enum ConversationEvent {
 }
 ```
 
-The exact Rust payload types should emerge from implementation, but these semantic categories are the intended Phase 1 vocabulary.
+The vocabulary should grow only when a concrete repeated semantic need justifies another event type.
 
-A `ConversationEvent` is deliberately distinct from a provider event. OpenAI-specific Responses events do not belong directly in this enum.
+OpenAI Responses events such as `response.created`, text deltas, and function argument deltas are not themselves conversation events.
 
 ---
 
-## 4. Commands
+## 4. Commands and events
 
-Commands represent intent.
-
-Examples:
+Commands represent intent:
 
 ```text
 CreateConversation
@@ -157,50 +132,43 @@ SetData
 PostAutomation
 ```
 
-Commands are not part of the canonical conversation history.
-
-The conceptual distinction is:
+Conversation events represent facts:
 
 ```text
 Command
     something should happen
 
-ModelDriverRun
-    a durable attempt to invoke a model
-
 ConversationEvent
-    something happened in the conversation
+    something happened
 ```
 
-Do not force all command handling into:
+Commands are not part of canonical conversation history.
+
+Do not force every command into:
 
 ```text
 handle(command) -> Vec<Event>
 ```
 
-That shape does not naturally model streaming, failures, incremental persistence, external I/O, or concurrency.
-
-For Phase 1, simple commands may be handled synchronously while model invocation is explicitly streaming/effectful.
+Model invocation, tools, and external I/O naturally involve streaming, failures, and incremental output.
 
 ---
 
 ## 5. Strongly typed identifiers
 
-All durable entities and cross-event references should use strongly typed identifiers.
-
-Use UUIDv7 internally, wrapped in Rust newtypes.
+Durable entities and cross-event references use strongly typed UUIDv7 identifiers.
 
 Conceptually:
 
 ```rust
 struct ConversationId(Uuid);
 struct ConversationEventId(Uuid);
-
-struct ModelDriverRunId(Uuid);
-struct ModelDriverRunEventId(Uuid);
-
 struct ToolCallId(Uuid);
+struct ImageId(Uuid);
+struct FileId(Uuid);
 ```
+
+More typed IDs should be introduced when a concrete durable entity requires one.
 
 The compiler should prevent accidental substitution of one identifier type for another.
 
@@ -209,14 +177,14 @@ Serialized forms should include a type prefix where practical:
 ```text
 conversation_019...
 conversation_event_019...
-model_driver_run_019...
-model_driver_run_event_019...
 tool_call_019...
+image_019...
+file_019...
 ```
 
-The verbosity is intentional. Explicitly typed IDs are easier for humans and models to distinguish and reduce accidental or guessed cross-references.
+The verbosity is intentional. Explicit IDs are easier for humans and models to distinguish and reduce accidental or guessed references.
 
-UUIDv7 provides useful approximate temporal locality, but UUID ordering is not authoritative replay ordering.
+UUIDv7 ordering is useful for locality and diagnostics but is not authoritative replay ordering.
 
 ---
 
@@ -224,42 +192,38 @@ UUIDv7 provides useful approximate temporal locality, but UUID ordering is not a
 
 Identity and ordering solve different problems.
 
-Every durable event stream should assign a monotonically increasing position.
-
-Conceptually:
+Each stored conversation event has a monotonically increasing position:
 
 ```rust
-struct StoredEvent<T, Id> {
+struct StoredConversationEvent {
     position: u64,
-    id: Id,
+    id: ConversationEventId,
     timestamp: DateTime<Utc>,
     schema_version: u32,
-    event: T,
+    event: ConversationEvent,
 }
 ```
 
-Properties:
+- `id` gives stable identity
+- `position` gives authoritative replay order
+- `timestamp` records observed wall-clock time
+- `schema_version` permits persisted-format evolution
 
-- `id`: stable identity and cross-reference
-- `position`: authoritative deterministic replay order within the stream
-- `timestamp`: observed wall-clock time, not ordering authority
-- `schema_version`: persisted schema evolution
+Phase 1 may assume a single writer and use a simple position allocator.
 
-Phase 1 may assume a single writer and use a trivial position allocator.
+We do not need locks, distributed sequencing, compare-and-append, or a global event clock yet.
 
-We do not need locks, distributed sequencing, optimistic append, or a global clock yet.
+The invariant is simply:
 
-The invariant we do want now is:
+> Replay the Conversation Log in stored position order.
 
-> Persistence assigns a monotonic position within each durable stream and replay occurs in position order.
-
-Future implementations may strengthen how that position is allocated atomically without changing the domain model.
+Future persistence implementations may strengthen atomic allocation without changing the semantic model.
 
 ---
 
 ## 7. Semantic relationships are not ordering
 
-Domain relationships should use typed IDs, not stream positions.
+Semantic relationships use typed IDs rather than stream positions.
 
 For example:
 
@@ -270,30 +234,21 @@ struct ToolResponse {
 }
 ```
 
-The `ToolCallId` tells us which request the response belongs to.
+The `ToolCallId` identifies which request the response answers.
 
-The event position tells us when it was appended.
+The event position identifies when the response entered the conversation.
 
-Similarly, projected conversation events use ModelDriver run/event IDs for provenance.
-
-Phase 1 does not require a generic causal DAG or arbitrary `previous_event_id` relationships.
-
-Those can be introduced later if branching or explicit causality becomes important.
+Phase 1 does not require a generic causal graph or arbitrary predecessor relationships.
 
 ---
 
-## 8. User
+## 8. User content and external blobs
 
-`User` represents user-provided input.
+`User` records user-provided input.
 
-The conversation log should reference external content rather than embed large binary payloads directly.
-
-For example:
+A user event may contain multiple content parts:
 
 ```rust
-struct ImageId(Uuid);
-struct FileId(Uuid);
-
 enum UserContent {
     Text(String),
     Image(ImageId),
@@ -305,19 +260,19 @@ struct User {
 }
 ```
 
-A single `User` event may carry multiple content parts, for example text alongside an image. This is why `content` is a `Vec<UserContent>` rather than a single `UserContent`.
+Large or binary content should not be embedded directly in the Conversation Log.
 
-The conceptual flow is:
+Instead:
 
 ```text
 store image/file/blob
     ↓
 obtain strongly typed durable ID
     ↓
-append User event containing that ID
+append User event containing the ID
 ```
 
-For example:
+Example:
 
 ```text
 User
@@ -325,64 +280,53 @@ User
     Image(image_019...)
 ```
 
-This keeps conversation events small, avoids duplicating binary content during replay, and lets the content store, retention, deduplication, permissions, and transport evolve independently from the conversation model.
+This keeps conversation events small and lets content storage, retention, permissions, deduplication, and provider transport evolve independently.
 
-The `ModelDriver` is responsible for resolving referenced content into the provider-specific representation needed for invocation.
+The ModelDriver resolves referenced content into whatever provider-specific representation is required.
 
-Phase 1 only needs text and whatever minimal image/file referencing is required by concrete use cases. The architectural rule is that large binary content lives outside the conversation event log and is referenced by typed ID.
+Phase 1 only needs the concrete content types we actually use.
 
-A failed model invocation does not remove the already-durable `User` event. The user turn remains part of future reconstruction.
+A failed model invocation never removes the already-durable `User` event.
 
 ---
 
 ## 9. ModelNote
 
-`ModelNote` represents model-produced information that is semantically useful to the conversation but is not the final assistant response.
+`ModelNote` records model-produced information that is semantically useful to the conversation but is not the final assistant response.
 
-This can be used for model-visible/user-visible notes when the provider exposes information we choose to preserve semantically.
+It can support user-facing or model-relevant notes when useful.
 
-It should not become a dumping ground for every raw provider event. Raw provider details remain in the ModelDriver Run Log.
+It must not become a copy of every provider transport event.
 
-Whether a note is shown to a user is a projection/UI decision.
+Whether a note is displayed is a presentation decision.
 
 ---
 
 ## 10. AssistantResponse
 
-`AssistantResponse` represents semantic assistant output added to the conversation.
+`AssistantResponse` records the semantic assistant response produced by an invocation.
 
-It is not equivalent to every piece of output emitted by a model invocation.
-
-For example:
+Provider transport may involve many low-level events:
 
 ```text
-ModelDriverRunEvent
-    response.created
-
-ModelDriverRunEvent
-    text.delta "Hel"
-
-ModelDriverRunEvent
-    text.delta "lo"
-
-ModelDriverRunEvent
-    output.done
-
-        ↓ semantic projection
-
-ConversationEvent
-    AssistantResponse("Hello")
+text.delta "Hel"
+text.delta "lo"
+output.done
 ```
 
-The run log preserves the detailed provider history.
+but the semantic conversation records:
 
-The conversation log preserves the semantic result.
+```text
+AssistantResponse("Hello")
+```
+
+A ModelDriver may internally use streaming to construct or emit the response, but another ModelDriver does not need to understand that provider's streaming protocol.
 
 ---
 
 ## 11. ToolRequest
 
-`ToolRequest` records that the model requested a tool invocation.
+`ToolRequest` records that a model requested a tool invocation.
 
 Each request has a stable `ToolCallId`:
 
@@ -395,35 +339,17 @@ struct ToolRequest {
 }
 ```
 
-A `ToolRequest` is a conversation fact.
+A ToolRequest is a semantic fact.
 
-It is not itself the imperative operation that executes the tool.
+It does not execute the tool itself.
 
-The caller/runtime may derive:
-
-```text
-ExecuteTool(tool_call_id)
-```
-
-from conversation state.
-
-The naming distinction is intentional:
-
-```text
-ToolRequest
-    semantic conversation event
-
-ToolCallId
-    stable correlation identity
-```
+The caller/runtime owns execution.
 
 ---
 
 ## 12. ToolResponse
 
-`ToolResponse` records the result of executing one tool request.
-
-It references exactly one `ToolCallId`:
+`ToolResponse` records the result of one tool request and references exactly one `ToolCallId`:
 
 ```rust
 struct ToolResponse {
@@ -432,19 +358,15 @@ struct ToolResponse {
 }
 ```
 
-The relationship is explicit and durable.
+A response is appended to the Conversation Log as soon as it arrives.
 
-A tool response is appended to the conversation as soon as it arrives.
-
-No batch object is required.
+No batch abstraction is required.
 
 ---
 
 ## 13. Multiple tool requests
 
-A single ModelDriver invocation may produce zero, one, or many `ToolRequest`s.
-
-For example:
+A single ModelDriver invocation may produce zero, one, or many `ToolRequest`s:
 
 ```text
 ModelDriver invocation
@@ -454,7 +376,7 @@ ToolRequest(B)
 ToolRequest(C)
 ```
 
-The caller/runtime may execute them sequentially or concurrently.
+The caller may execute them sequentially or concurrently.
 
 Responses are appended as they arrive:
 
@@ -464,23 +386,24 @@ ToolResponse(A)
 ToolResponse(C)
 ```
 
-The core model does not impose a concurrency or reinvocation policy.
+The core model does not prescribe:
 
-Phase 1 commits only to:
+```text
+tool concurrency
+response batching
+when reinvocation occurs
+whether all tool responses must arrive first
+```
 
-- 0..N tool requests may come from one invocation
-- every request has its own `ToolCallId`
-- every response references exactly one `ToolCallId`
-- responses may be appended immediately in completion order
-- the caller/runtime decides when to invoke the `ModelDriver` again
+The caller owns that policy.
 
-This keeps the conversation model simple and keeps orchestration policy outside it.
+Phase 1 commits only to stable correlation through `ToolCallId`.
 
 ---
 
 ## 14. Context
 
-`Context` represents state that may affect subsequent model invocation.
+`Context` records state that may affect later model invocation.
 
 Examples:
 
@@ -488,101 +411,77 @@ Examples:
 instructions
 working directory
 selected files
-environment
 project
 permissions
+environment information intentionally exposed to the model
 ```
 
 Context is distinct from user input.
-
-The important distinction is:
-
-```text
-Context
-    may contribute to future model input
-
-Data
-    metadata about the conversation
-    not model input by default
-```
 
 ---
 
 ## 15. Automation
 
-`Automation` represents an external or asynchronous actor contributing something to the conversation.
+`Automation` records information contributed by an external or asynchronous actor.
 
-This is distinct from a tool response.
-
-For example:
-
-```text
-ToolResponse
-    response to a model-requested tool
-
-Automation
-    independent process contributes new information
-```
-
-This distinction was useful in the prior conversation model and remains useful here.
+It is distinct from `ToolResponse`, which answers a model-requested tool invocation.
 
 ---
 
 ## 16. Data
 
-`Data` represents durable machine-readable metadata associated with the conversation.
+`Data` records durable machine-readable metadata associated with the conversation.
 
 Examples:
 
 ```text
 external IDs
-cost
 usage summaries
 annotations
-UI metadata
 tags
 diagnostics
+UI metadata
 ```
 
-`Data` is not included in model context by default.
+Data is not model input by default.
 
 ---
 
 ## 17. ModelSpecific
 
-`ModelSpecific` is an intentional semantic escape hatch.
+`ModelSpecific` is a deliberate semantic escape hatch.
 
-It represents model/provider-specific information that is useful enough to retain at the conversation level but does not yet justify a universal semantic event type.
+It represents model/provider-specific information that is useful enough to retain in the semantic conversation but does not yet justify a universal event type.
 
 It should remain relatively rare.
 
-Raw provider protocol events still belong in the ModelDriver Run Log.
+This lets a ModelDriver preserve something genuinely useful without forcing the conversation model to predict every future provider capability.
 
-`ModelSpecific` exists so the semantic model can evolve without either losing useful information or prematurely inventing generic abstractions.
+Raw provider protocol events still belong in tracing/diagnostics rather than the semantic Conversation Log.
 
 ---
 
 ## 18. Error
 
-A model invocation failure can be semantically relevant to the conversation and should therefore be representable as:
+`Error` records a failure that is semantically relevant to the conversation.
+
+A failed invocation may therefore leave:
 
 ```text
-ConversationEvent::Error(...)
+User(...)
+ModelNote(...)
+ToolRequest(...)
+ToolResponse(...)
+Error(...)
 ```
 
-The operational failure remains in the ModelDriver Run Log as `RunFailed`.
+depending on what happened before the failure.
 
-The two representations have different purposes:
+Events that have already been appended are not rolled back.
 
-```text
-ModelDriverRunEvent::RunFailed
-    operational/provider diagnostics
+The Error event should contain useful conversation-level information without exposing every provider/runtime diagnostic.
 
-ConversationEvent::Error
-    semantic failure for conversation projections
-```
-
-The semantic error should contain useful conversation-level information without requiring all provider/runtime diagnostics to leak into the conversation.
+Detailed diagnostics belong in tracing/logging.
 
 ---
 
@@ -590,76 +489,81 @@ The semantic error should contain useful conversation-level information without 
 
 ## 19. Why ModelDriver is an explicit abstraction
 
-Phase 1 intentionally introduces a narrow `ModelDriver` abstraction even though only one concrete provider is initially implemented.
+Phase 1 intentionally introduces a narrow `ModelDriver` abstraction even though only one provider is initially implemented.
 
 This is deliberate.
 
-The abstraction is not primarily justified by “we might support Anthropic later.”
-
-It is justified by the need to define:
+The abstraction defines:
 
 > What is the rest of the system allowed to know about model invocation?
 
-Without this boundary, OpenAI Responses concepts can easily leak into conversation, runtime, CLI, and projection code while we are still learning the new API.
+Its purpose is to keep OpenAI Responses concepts out of the conversation, caller, CLI, and orchestration layers while we learn the new API.
 
-This is a deliberate exception to the usual “avoid speculative abstraction” rule.
+This is an explicit exception to the normal preference against speculative abstraction.
 
 The guardrail is:
 
-> Keep `ModelDriver` extremely small and let the concrete OpenAI implementation pressure its shape.
+> Keep ModelDriver very small and let concrete implementations pressure its shape.
 
 Do not build:
 
 ```text
 provider capability matrices
 generic feature negotiation
-provider inheritance hierarchies
 large associated-type frameworks
-universal normalized event enums
+universal provider event enums
+provider inheritance hierarchies
 ```
 
-A later second implementation should be allowed to reshape the abstraction rather than merely conform to it.
-
-This decision should be documented as an explicit architectural exception to ADR 0001 rather than silently violating it.
+A second driver should be allowed to reshape the abstraction.
 
 ---
 
-## 20. ModelDriver interface
+## 20. Cross-driver semantic contract
 
-The `ModelDriver` invocation boundary should make input immutability and caller-visible outcomes explicit.
+Every ModelDriver must be able to invoke using only the semantic conversation state supplied in `ModelDriverInput`.
+
+This is the central portability rule.
+
+For example:
+
+```text
+User
+OpenAI AssistantResponse
+User
+Anthropic AssistantResponse
+ToolRequest
+ToolResponse
+User
+Gemini ...
+```
+
+must be a valid conversation.
+
+A driver must not require prior turns to have been produced by itself.
+
+Provider-native continuation may later improve fidelity or performance, but it must remain optional.
+
+Correctness and model switching are based on semantic ConversationEvents.
+
+---
+
+## 21. ModelDriverInput
+
+`ModelDriverInput` is an immutable invocation snapshot.
 
 Conceptually:
 
 ```rust
-trait ModelDriver {
-    async fn invoke(
-        &self,
-        input: &ModelDriverInput,
-        events: &mut ModelDriverRunEventSink,
-    ) -> Result<ModelDriverResult, ModelDriverError>;
-}
-```
-
-The exact Rust signature is not prescribed, but this is the intended shape.
-
-### Immutable invocation input
-
-`ModelDriverInput` represents an immutable invocation snapshot.
-
-It should contain stable identities and the information required for this invocation, for example:
-
-```rust
 struct ModelDriverInput {
     conversation_id: ConversationId,
-    run_id: ModelDriverRunId,
-
-    model: ModelId,
     conversation: ConversationSnapshot,
+    model: ModelId,
     config: ModelConfig,
 }
 ```
 
-The precise fields will emerge during implementation.
+The precise fields should emerge from implementation.
 
 Passing:
 
@@ -667,9 +571,9 @@ Passing:
 &ModelDriverInput
 ```
 
-means the driver cannot mutate the input through that reference.
+means the driver cannot mutate ordinary owned data through that reference.
 
-For ordinary owned Rust fields such as structs, enums, `String`, and `Vec`, this gives the desired deep immutability through the borrowed value.
+For normal Rust-owned values such as structs, enums, `String`, and `Vec`, that provides the desired deep immutability through the borrowed input.
 
 Interior-mutability types such as:
 
@@ -680,15 +584,82 @@ RefCell
 Atomic*
 ```
 
-can still mutate state behind an immutable reference, so `ModelDriverInput` should avoid them unless there is a specific demonstrated reason.
+can still mutate behind `&T`, so input snapshots should avoid them unless there is a demonstrated need.
 
 The intended contract is:
 
-> A ModelDriver invocation receives a stable immutable snapshot. It emits new facts through the run-event sink rather than mutating its input.
+> A ModelDriver receives an immutable semantic snapshot and produces new facts rather than mutating historical conversation state.
 
-`conversation_id` and `run_id` are references to durable identities. They do not imply mutable access to the stored Conversation or ModelDriverRun.
+A `conversation_id` is an identity reference, not mutable access to the stored conversation.
 
-### Strongly typed invocation result
+---
+
+## 22. ModelDriver invocation
+
+The exact `invoke` shape is intentionally still under iteration.
+
+A useful starting point is:
+
+```rust
+trait ModelDriver {
+    async fn invoke(
+        &self,
+        input: &ModelDriverInput,
+        events: &mut ConversationEventSink,
+    ) -> Result<ModelDriverResult, ModelDriverError>;
+}
+```
+
+The exact event-emission mechanism may be a callback, sink, stream, iterator, channel, or another idiomatic Rust shape.
+
+The important Phase 1 properties are:
+
+- one call represents one model invocation
+- input is immutable
+- semantic conversation events may be emitted incrementally
+- emitted events can be appended immediately
+- the caller owns the outer model/tool loop
+- success is strongly typed
+- expected failures are strongly typed
+- provider SDK types do not cross the boundary
+
+We expect to iterate directly on this interface during implementation.
+
+---
+
+## 23. Immediate event persistence
+
+Semantic events are appended as they happen.
+
+A ModelDriver invocation is not a transaction whose partial output disappears if `invoke()` later returns `Err`.
+
+Conceptually:
+
+```text
+User already durable
+    ↓
+invoke ModelDriver
+    ↓
+ModelNote appended
+    ↓
+ToolRequest appended
+    ↓
+later provider failure
+    ↓
+Error appended
+    ↓
+invoke returns Err
+```
+
+`Result` communicates the outcome of the operation.
+
+It does not define a rollback boundary for conversation history.
+
+This preserves the existing useful guarantee that a failed turn still participates in future reconstruction.
+
+---
+
+## 24. ModelDriverResult
 
 Do not use:
 
@@ -698,18 +669,17 @@ Result<()>
 
 as the public invocation contract.
 
-The caller should receive a strongly typed result that tells it how the invocation ended at the API/control-flow level.
+The caller should receive a strongly typed result that tells it how the invocation ended at the control-flow level.
 
 Conceptually:
 
 ```rust
 struct ModelDriverResult {
-    run_id: ModelDriverRunId,
     status: ModelDriverStatus,
 }
 ```
 
-with a small status vocabulary such as:
+with a small implementation-driven vocabulary, perhaps:
 
 ```rust
 enum ModelDriverStatus {
@@ -718,21 +688,25 @@ enum ModelDriverStatus {
 }
 ```
 
-The exact variants should be driven by real OpenAI implementation needs.
+The exact variants should be driven by actual OpenAI behavior.
 
-The result should not duplicate detailed semantic facts already persisted in the event logs. For example, tool requests and assistant responses remain durable events rather than being copied wholesale into `ModelDriverResult`.
+The result should not duplicate detailed semantic facts already represented by ConversationEvents.
 
-The result exists so the caller can react without inspecting provider-specific details.
+For example, tool requests remain events rather than being copied wholesale into `ModelDriverResult`.
 
-### Strongly typed errors
+The result exists so the caller knows how to react without understanding provider details.
 
-Expected invocation failures are represented explicitly:
+---
+
+## 25. ModelDriverError
+
+Expected invocation failures are explicit in the function type:
 
 ```rust
 Result<ModelDriverResult, ModelDriverError>
 ```
 
-with a typed error model approximately like:
+A small error model might begin with:
 
 ```rust
 enum ModelDriverError {
@@ -749,669 +723,108 @@ The exact taxonomy should remain small and implementation-driven.
 
 Rust does not use Java-style checked exceptions or `throws` declarations.
 
-Recoverable/expected failures are part of the function type through `Result<T, E>`.
+Expected operational failures are represented through `Result<T, E>`.
 
-Unexpected programmer failures may panic, but provider, transport, validation, persistence, and similar operational failures should normally be represented by `ModelDriverError`.
-
-This makes the error contract explicit in the type system.
-
-### Invocation responsibilities
-
-The important properties remain:
-
-- invocation is one model-driver call, not the entire autonomous tool loop
-- input is an immutable snapshot
-- run events are emitted incrementally
-- the caller owns the outer loop
-- the caller receives a typed success/outcome value
-- expected failures are typed
-- OpenAI SDK types do not cross the boundary
-- provider-specific replay logic belongs behind the boundary
-
-The precise `invoke` contract is expected to receive further iteration during Phase 1.
+Unexpected programming failures may panic, but transport, provider, validation, persistence, and similar failures should normally be represented by `ModelDriverError`.
 
 ---
 
-# ModelDriver Runs
+# Replay and model switching
 
-## 21. ModelDriverRun
+## 26. Semantic replay is the Phase 1 correctness contract
 
-A `ModelDriverRun` represents a durable attempt to invoke a model driver.
+Phase 1 reconstructs model input from the Conversation Log.
 
 Conceptually:
-
-```rust
-struct ModelDriverRun {
-    id: ModelDriverRunId,
-    conversation_id: ConversationId,
-    created_at: DateTime<Utc>,
-    // invocation/request snapshot
-}
-```
-
-The exact persisted representation may evolve.
-
-The distinction is:
-
-```text
-InvokeModelDriver
-    transient intent
-
-ModelDriverRun
-    durable attempt
-
-ModelDriverRunEvents
-    durable operational/provider history
-
-ConversationEvents
-    semantic consequences
-```
-
-Phase 1 should create a durable `ModelDriverRun` before external model I/O begins.
-
-Phase 1 may initially use one `ModelDriverRun` per ModelDriver invocation.
-
-Do not generalize it into a whole agent/workflow run yet.
-
----
-
-## 22. ModelDriverRunEvent
-
-A run has its own durable append-only event stream.
-
-Phase 1 needs only a small vocabulary:
-
-```rust
-enum ModelDriverRunEvent {
-    RunStarted(...),
-    ProviderEvent(...),
-    RunCompleted(...),
-    RunFailed(...),
-}
-```
-
-Future versions may add:
-
-```text
-RetryStarted
-RetryCompleted
-Checkpoint
-ToolStarted
-ToolCompleted
-```
-
-if real requirements make those useful.
-
----
-
-## 23. Run event boundary
-
-The architecture should behave as though `ModelDriverRunEvent`s are emitted onto an event stream or bus.
-
-Phase 1 does not require messaging infrastructure.
-
-A local synchronous/async sink is sufficient.
-
-Conceptually:
-
-```rust
-trait ModelDriverRunEventSink {
-    fn emit(&mut self, event: ModelDriverRunEvent) -> Result<(), ModelDriverError>;
-}
-```
-
-`emit` reuses the same `ModelDriverError` taxonomy introduced in §20 (for example `Persistence`) so the run-event sink carries the same typed-error discipline as `invoke`.
-
-The seam is important now.
-
-The infrastructure behind it can remain trivial.
-
-A likely Phase 1 flow is:
-
-```text
-create ModelDriverRun
-    ↓
-append RunStarted
-    ↓
-call OpenAI
-    ↓
-receive provider event
-    ↓
-append ProviderEvent
-    ↓
-project semantic conversation output
-    ↓
-receive next provider event
-```
-
----
-
-## 24. Durable run lifecycle
-
-A durable `ModelDriverRun` must exist before the external provider call begins.
-
-This closes the crash window where a request is sent but no provider event has yet been received.
-
-Conceptually:
-
-```text
-InvokeModelDriver
-    ↓
-create ModelDriverRun
-    ↓
-append RunStarted
-    ↓
-external OpenAI call
-```
-
-Phase 1 does not need sophisticated transaction semantics between creation and `RunStarted`.
-
-The important guarantee is that local invocation identity and request information exist before external I/O.
-
-The run should retain enough invocation configuration to understand or reconstruct what was attempted.
-
-At minimum:
-
-```text
-provider
-model
-instructions/configuration
-tool definitions or references
-input/replay strategy
-```
-
-The precise request snapshot format may evolve.
-
----
-
-## 25. Raw provider events
-
-Raw provider events belong in the ModelDriver Run Log.
-
-For OpenAI Responses, these may include events such as:
-
-```text
-response.created
-output_item.added
-reasoning-related events
-output_text.delta
-function_call_arguments.delta
-response.completed
-...
-```
-
-Do not immediately collapse them into a universal model event enum.
-
-Use an open representation conceptually like:
-
-```rust
-struct ProviderEvent {
-    provider: ProviderId,
-    model: String,
-    event_type: String,
-    payload: Value,
-}
-```
-
-wrapped by:
-
-```text
-ModelDriverRunEvent::ProviderEvent(...)
-```
-
-No OpenAI SDK-specific type should cross the `ModelDriver` boundary.
-
----
-
-## 26. Preserve provider payloads
-
-Preserve provider payloads as faithfully as practical.
-
-Where feasible, persistence should happen from the original provider/SSE payload before an SDK representation has discarded unknown information.
-
-SDKs may:
-
-```text
-drop unknown fields
-normalize structures
-rename values
-lag newly introduced provider fields
-```
-
-“Raw” does not require byte-for-byte archival in Phase 1.
-
-It means:
-
-> Avoid unnecessary information loss.
-
----
-
-## 27. Provider response identity
-
-Provider-side IDs should be captured when available.
-
-For OpenAI, this includes response IDs.
-
-Local `ModelDriverRunId` remains authoritative inside `tog`.
-
-Provider IDs are external references useful for continuation, diagnostics, and correlation.
-
----
-
-# Projection and provenance
-
-## 28. Projection philosophy
-
-The core abstraction over provider events is not a universal event taxonomy.
-
-Instead, stored history supports several projections:
-
-```text
-ModelDriver native replay
-Conversation semantic projection
-runtime/control projection
-CLI/UI projection
-```
-
-Projection may transform, coalesce, ignore, or interpret events.
-
-It is not simply a set of booleans such as:
-
-```text
-send_to_model = true
-show_to_user = true
-```
-
----
-
-## 29. Semantic projection
-
-A durable `ModelDriverRunEvent` may derive zero or more semantic `ConversationEvent`s.
-
-Examples:
-
-```text
-OpenAI response.created
-    → nothing semantic
-
-reasoning summary completed
-    → perhaps ModelNote
-
-completed function call
-    → ToolRequest
-
-completed assistant output
-    → AssistantResponse
-
-provider-specific useful semantic output
-    → ModelSpecific
-
-run failure
-    → Error
-```
-
-Projection operates from durable stored run events, not untracked transient provider events.
-
----
-
-## 30. ProjectionIdentity
-
-Every conversation event derived from ModelDriver run history must retain stable provenance.
-
-Use a projection identity conceptually like:
-
-```rust
-struct ProjectionIdentity {
-    source_run_id: ModelDriverRunId,
-    source_run_event_id: ModelDriverRunEventId,
-    output_index: u32,
-}
-```
-
-`output_index` allows one source run event to produce more than one semantic event.
-
-For example:
-
-```text
-ModelDriverRunEvent X
-    ↓
-ModelNote           output_index = 0
-ToolRequest         output_index = 1
-AssistantResponse   output_index = 2
-```
-
-Projection provenance is cross-cutting storage metadata and should live in the stored conversation-event envelope rather than being repeated in every event payload.
-
-Conceptually:
-
-```rust
-struct StoredConversationEvent {
-    position: u64,
-    id: ConversationEventId,
-    timestamp: DateTime<Utc>,
-    schema_version: u32,
-    projection: Option<ProjectionIdentity>,
-    event: ConversationEvent,
-}
-```
-
-Direct user/automation events normally have:
-
-```text
-projection = None
-```
-
-Events derived from run history have:
-
-```text
-projection = Some(...)
-```
-
----
-
-## 31. Projection API must preserve provenance
-
-Avoid an API like:
-
-```rust
-emit(ConversationEvent)
-```
-
-for semantic output derived from a run event.
-
-A naked event loses the source identity needed for idempotent crash recovery.
-
-For Phase 1, a deliberately simple shape is preferable:
-
-```rust
-struct ProjectedConversationEvent {
-    output_index: u32,
-    event: ConversationEvent,
-}
-
-fn project(
-    source: &StoredModelDriverRunEvent,
-) -> Vec<ProjectedConversationEvent>;
-```
-
-The commit layer combines:
-
-```text
-source ModelDriverRunId
-source ModelDriverRunEventId
-output_index
-```
-
-into `ProjectionIdentity`.
-
-The exact implementation can vary, but provenance should be structurally difficult to forget.
-
----
-
-## 32. Cross-log consistency
-
-The ModelDriver Run Log and Conversation Log are persisted independently.
-
-A process may crash after a source run event is durable but before the derived semantic event is written.
-
-Correctness should not require a transaction spanning both logs.
-
-Instead:
-
-> Semantic projection must be reproducible and idempotent.
-
-Persistence treats `ProjectionIdentity` as unique.
-
-Conceptually:
-
-```text
-UNIQUE (
-    source_run_id,
-    source_run_event_id,
-    output_index
-)
-```
-
-or an equivalent invariant.
-
-Example:
-
-```text
-ModelDriverRunEvent X: output.done
-    persisted
-
-CRASH
-
-AssistantResponse not persisted
-```
-
-Recovery:
-
-```text
-reload run events
-    ↓
-re-run projector
-    ↓
-derive AssistantResponse(output_index=0)
-    ↓
-ProjectionIdentity(X, 0) absent
-    ↓
-append
-```
-
-If it was already committed:
-
-```text
-re-run projector
-    ↓
-derive same ProjectionIdentity
-    ↓
-already exists
-    ↓
-skip
-```
-
-On restart, incomplete or relevant runs may therefore be reprojected safely.
-
-This preserves the crash-recovery behavior that already exists in the previous system.
-
----
-
-## 33. Immediate persistence
-
-Events are committed as they happen.
-
-A ModelDriver invocation is not a transaction whose partial history disappears when `invoke()` returns `Err`.
-
-The invariant is:
-
-> Once an event has happened and been durably appended, a later failure does not roll it back.
-
-Conceptually:
-
-```text
-append User
-    ↓
-invoke ModelDriver
-    ↓
-append ModelDriverRunEvents incrementally
-    ↓
-project + append semantic ConversationEvents incrementally
-    ↓
-failure occurs
-    ↓
-append RunFailed
-    ↓
-project + append Error
-    ↓
-return Err
-```
-
-`Result` communicates the invocation outcome.
-
-It does not define a persistence transaction boundary.
-
-Avoid:
-
-```text
-invoke
-    ↓
-collect staged events
-    ↓
-success → commit
-error   → discard
-```
-
-because that loses already-produced history and weakens crash recovery.
-
----
-
-# Replay
-
-## 34. Replay has two forms
-
-Provider continuation and local reconstruction are distinct mechanisms.
-
-### Provider-side continuation
-
-For example, OpenAI may support:
-
-```text
-previous_response_id
-```
-
-This relies on provider-retained state and provider-specific semantics.
-
-### Local reconstruction
-
-The application constructs a new invocation from durable local history:
 
 ```text
 ConversationEvents
-ModelDriverRunEvents
-stored request/configuration
-tool history
+    ↓
+ModelDriver-specific translation
+    ↓
+provider request
 ```
 
-Provider continuation is useful, but local durability must not assume provider state is permanent or portable.
+OpenAI translates semantic events to OpenAI Responses input.
+
+Anthropic translates the same semantic events to Anthropic content/messages.
+
+Gemini translates the same semantic events to its own representation.
+
+No ModelDriver may require another provider's raw protocol history.
 
 ---
 
-## 35. Same-provider replay
+## 27. Model switching
 
-When continuing with the same provider and sufficient native history is available:
-
-```text
-Conversation Log
-+
-ModelDriver Run history
-    ↓
-provider-native projection
-    ↓
-new provider request
-```
-
-The OpenAI ModelDriver owns the rules for reconstructing or continuing OpenAI state.
-
-A critical invariant is:
-
-> Do not replay both provider-native output and the semantic event derived from that same output.
+Switching models/providers in the middle of a conversation is a first-class expected behavior, not an edge case.
 
 For example:
-
-```text
-raw OpenAI output items
-+
-AssistantResponse derived from those items
-```
-
-must not both become duplicate model input.
-
-The ModelDriver chooses one authoritative representation.
-
----
-
-## 36. Cross-provider replay
-
-A different provider cannot necessarily consume OpenAI-native events or reasoning state.
-
-Cross-provider replay therefore uses the semantic Conversation Log.
-
-Conceptually:
 
 ```text
 User
-ModelNote
-ToolRequest
-ToolResponse
-AssistantResponse
-Context
-ModelSpecific where portable/meaningful
-Error where appropriate
+AssistantResponse produced by OpenAI
+User
+AssistantResponse produced by another ModelDriver
+User
+...
 ```
 
-becomes input translated by the new ModelDriver.
+The new ModelDriver reads the semantic conversation and continues from it.
 
-Thus:
+Some provider-specific fidelity may be lost when switching.
 
-```text
-same provider
-    native/high-fidelity replay where useful
+That is acceptable.
 
-different provider
-    semantic conversation replay
-```
-
-Phase 1 only implements OpenAI, but the separation is intentional.
+The semantic Conversation Log is the portability boundary.
 
 ---
 
-# Runtime/control
+## 28. Provider-native continuation
 
-## 37. Runtime projection
+Provider-native continuation is explicitly **not required for Phase 1 correctness**.
 
-Runtime logic may derive pending work from durable conversation state.
+For example, OpenAI may offer response IDs or reasoning-state mechanisms that improve same-provider continuation.
 
-For example:
-
-```text
-ToolRequest(tool_call_A)
-ToolResponse(tool_call_A) absent
-    ↓
-tool A may require execution
-```
-
-and:
+These may later be used as optimizations:
 
 ```text
-ToolRequest(tool_call_A)
-ToolResponse(tool_call_A) present
-    ↓
-no pending response for A
+lower token usage
+higher reasoning fidelity
+lower latency
+better continuation
 ```
 
-This operates over conversation history rather than an isolated event.
+But the fallback must remain:
 
-Phase 1 only needs enough runtime logic for tool round-tripping.
+```text
+semantic Conversation Log
+    ↓
+fresh provider request
+```
 
-It does not need a generalized scheduler or workflow engine.
+A driver should never become unable to continue merely because provider-native history is unavailable.
 
 ---
 
-## 38. Outer orchestration loop
+# Caller/runtime
 
-`ModelDriver` represents one model invocation.
+## 29. Outer orchestration loop
 
-It does not own the entire autonomous loop.
+ModelDriver represents one model invocation.
 
-The caller/runtime owns orchestration:
+It does not own the whole autonomous loop.
+
+The caller owns orchestration:
 
 ```text
 Conversation
     ↓
 ModelDriver.invoke()
     ↓
-0..N semantic outputs, perhaps ToolRequests
+0..N semantic events
+    ↓
+perhaps ToolRequests
     ↓
 caller executes tools however it chooses
     ↓
@@ -1420,93 +833,73 @@ ToolResponses appended as they arrive
 caller decides when to invoke ModelDriver again
 ```
 
-This deliberately avoids embedding concurrency or batching policy into the driver or conversation model.
+This keeps concurrency, batching, scheduling, retry, and tool policy outside the ModelDriver abstraction.
+
+---
+
+## 30. Pending tool work
+
+Runtime logic may derive pending tool work from semantic conversation state.
+
+For example:
+
+```text
+ToolRequest(A)
+ToolResponse(A) absent
+    → A may require execution
+```
+
+while:
+
+```text
+ToolRequest(A)
+ToolResponse(A) present
+    → no pending response for A
+```
+
+Phase 1 needs only enough of this logic to support basic tool round-tripping.
+
+It does not need a general workflow engine.
 
 ---
 
 # CLI
 
-## 39. CLI is a projection of the Conversation Log
+## 31. CLI is a projection of the Conversation Log
 
-The normal CLI surface is derived from semantic `ConversationEvent`s.
+The CLI consumes semantic conversation events.
 
-It is not driven directly by raw provider events.
+It does not consume OpenAI transport events directly.
 
 Conceptually:
 
 ```text
-ModelDriverRunEvents
-    ↓
-semantic projection
+ModelDriver
     ↓
 ConversationEvents
+    ↓
+Conversation Log
     ↓
 CLI projection
 ```
 
-For example:
+This keeps the CLI independent of provider implementation.
 
-```text
-text.delta "Hel"
-text.delta "lo"
-output.done
-
-    ↓
-
-AssistantResponse("Hello")
-
-    ↓
-
-CLI output
-```
-
-The CLI decides how semantic events map to stdout/stderr and interactive presentation.
-
-The important architectural point is:
-
-> The CLI consumes the conversation model, not the OpenAI transport stream.
-
----
-
-## 40. Future interactive presentation
-
-A richer interactive renderer may eventually combine:
-
-```text
-ConversationEvents
-+
-selected ModelDriverRunEvents
-```
-
-to show progress such as:
-
-```text
-reasoning summaries
-model activity
-tool progress
-streaming output
-status
-```
-
-That does not change the Conversation Log or make raw provider events semantic conversation events.
-
-This can evolve independently as another projection.
+A future interactive experience may also consume tracing/progress signals, but those do not redefine the semantic conversation contract.
 
 ---
 
 # OpenAI Phase 1
 
-## 41. OpenAI implementation strategy
+## 32. OpenAI implementation strategy
 
-Phase 1 implements `ModelDriver` directly against the OpenAI Responses API.
+Phase 1 implements `ModelDriver` against the OpenAI Responses API.
 
-The purpose is partly architectural discovery.
+The goal is partly implementation and partly architectural discovery.
 
-We want firsthand experience with the newer event-oriented API before deciding how much to rely on a multi-provider Rust library.
+We want firsthand experience with the newer Responses model before deciding how much to rely on a provider-neutral Rust library.
 
-This does not make OpenAI the domain model.
-
-OpenAI remains an implementation behind `ModelDriver`.
+OpenAI remains an implementation detail behind ModelDriver.
 
 A later implementation may be:
 
@@ -1517,52 +910,54 @@ GenAiModelDriver backed by rust-genai
 another direct provider integration
 ```
 
-and may force useful changes to the abstraction.
+and may cause the trait to evolve.
 
 ---
 
-## 42. OpenAI ownership
+## 33. OpenAI ModelDriver responsibilities
 
-The OpenAI ModelDriver owns:
+The OpenAI implementation owns:
 
 ```text
 Responses API request construction
+semantic ConversationEvent → OpenAI input translation
 OpenAI SDK / HTTP interaction
-SSE event handling
-raw provider event capture
+stream parsing
+text aggregation
+tool-call translation
 OpenAI response IDs
-reasoning/state handling
-native replay
-provider continuation
-tool-call protocol translation
+reasoning/provider-specific protocol handling
+provider errors
 ```
 
-No OpenAI SDK/API type crosses the `ModelDriver` boundary.
+No OpenAI SDK/API type crosses the ModelDriver boundary.
+
+The implementation emits semantic conversation events rather than exposing raw OpenAI protocol events to the caller.
 
 ---
 
-## 43. Phase 1 OpenAI scope
+## 34. Phase 1 OpenAI scope
 
-Support enough to exercise the architecture:
+Support enough to exercise the semantic architecture:
 
 ```text
-basic text input
+basic text input/output
 Responses API invocation
-streaming response events
-raw provider-event persistence
-response IDs
-usage
-reasoning-related state where available
+streaming response consumption
+AssistantResponse
+ModelNote where useful
 function/tool requests
 tool responses
-continuation/reinvocation
+multiple tool requests
+typed success/error behavior
+semantic reconstruction from Conversation Log
 ```
-
-Do not attempt full Responses API coverage.
 
 Out of scope unless nearly free:
 
 ```text
+durable raw provider-event archival
+provider-native replay as a correctness dependency
 hosted web search
 file search
 computer use
@@ -1570,82 +965,293 @@ image generation
 background execution
 ```
 
+Image/file input may be added when needed through typed content references.
+
 ---
 
-## 44. Incremental provider persistence
+# Observability and tracing
 
-Provider events should be persisted incrementally as they arrive.
+## 35. Phase 1 tracing
 
-Conceptually:
+Provider-specific detail is useful even though it is not part of the semantic replay contract.
+
+Phase 1 may trace/log:
 
 ```text
-receive provider event
-    ↓
-assign ModelDriverRunEventId
-assign run position
-    ↓
-persist
-    ↓
-project semantic output if now complete
-    ↓
-continue stream
+provider
+model
+request/response IDs
+latency
+time to first token/event
+usage/token counts
+raw or structured provider events
+tool-call protocol activity
+error diagnostics
+HTTP/provider metadata
 ```
 
-Do not wait until the complete model response before recording operational history.
-
-This gives:
+This information is primarily for:
 
 ```text
-crash visibility
-debuggability
-deterministic replay
-provider archaeology
-future projection flexibility
+debugging
+performance analysis
+cost analysis
+understanding provider behavior
+development of the ModelDriver abstraction
+```
+
+It does not need to be represented as ConversationEvents.
+
+It does not need to be replayable.
+
+It does not need to be durable for correctness.
+
+Existing tracing infrastructure should be preferred before introducing a separate durable event bus.
+
+---
+
+## 36. Raw provider events
+
+Raw provider events may be extremely useful while learning the Responses API.
+
+Capture them through tracing/logging when practical.
+
+For example:
+
+```text
+response.created
+output_item.added
+reasoning events
+output_text.delta
+function_call_arguments.delta
+response.completed
+```
+
+The important distinction is:
+
+```text
+ConversationEvent
+    semantic product behavior
+
+provider trace event
+    implementation/diagnostic behavior
+```
+
+Phase 1 should not introduce semantic complexity merely to make raw provider protocol history replayable.
+
+---
+
+## 37. Tracing does not constrain ModelDriver implementations
+
+A new ModelDriver should be straightforward to write.
+
+At a high level, an implementation should need to:
+
+```text
+1. translate semantic conversation to provider input
+2. call the provider
+3. interpret provider output
+4. emit semantic ConversationEvents
+5. return a typed outcome/error
+6. optionally emit useful traces
+```
+
+It should not need to implement:
+
+```text
+a timeless deterministic projection algebra
+durable provider-log schema migration
+cross-version re-projection
+provider-log replay compatibility
+global projection identities
+```
+
+Those requirements should only appear later if concrete value justifies them.
+
+Ease of writing ModelDrivers is a first-class design constraint.
+
+---
+
+# Future direction
+
+## 38. Durable ModelDriver run history
+
+A future phase may introduce a durable ModelDriver run/event log if concrete needs justify it.
+
+Potential motivations include:
+
+```text
+crash recovery inside partially completed model invocations
+higher-fidelity same-provider replay
+reasoning-state preservation
+provider-native continuation
+forensic debugging
+long-running/background model work
+distributed execution
+```
+
+A possible future shape is:
+
+```text
+ModelDriver invocation
+    ↓
+durable ModelDriverRun
+    ↓
+durable provider/run events
+    ↓
+observability / recovery / native replay
+```
+
+But that future log must remain supplemental to the semantic contract.
+
+The invariant should remain:
+
+> A ModelDriver can always continue from the Conversation Log alone.
+
+---
+
+## 39. Future event buses
+
+Tracing and semantic emission may later become explicit buses/streams with multiple subscribers.
+
+For example:
+
+```text
+ModelDriver
+    ├── semantic ConversationEvent stream
+    └── observability/provider event stream
+```
+
+Potential subscribers:
+
+```text
+conversation persistence
+CLI/UI progress
+metrics
+tracing
+debug logging
+provider-native cache
+future durable run history
+```
+
+Phase 1 does not need messaging infrastructure.
+
+A local function call, sink, callback, or tracing span is sufficient.
+
+The seam matters more than the machinery.
+
+---
+
+## 40. Future provider-native optimizations
+
+When concrete evidence shows value, a ModelDriver may retain provider-native information to improve same-provider continuation.
+
+Examples:
+
+```text
+OpenAI response IDs
+reasoning state
+provider cache references
+uploaded file handles
+provider-specific conversation IDs
+```
+
+These should be treated as caches/optimizations around the semantic conversation, not the only representation of history.
+
+Switching providers must remain possible without them.
+
+---
+
+## 41. Future content storage
+
+Conversation events should continue to reference large/binary content through durable typed IDs.
+
+A future content store may add:
+
+```text
+content-addressed storage
+deduplication
+remote object storage
+retention
+access control
+lazy materialization
+provider upload caches
+```
+
+The stable contract remains:
+
+```text
+ConversationEvent
+    references content ID
+
+content store
+    owns bytes/lifecycle
+
+ModelDriver
+    resolves content for provider invocation
+```
+
+---
+
+## 42. Future replay and concurrency
+
+The Phase 1 per-conversation position is sufficient for deterministic semantic replay.
+
+Later requirements may motivate:
+
+```text
+global append positions
+projection cursors
+concurrent writers
+optimistic append
+transactional sequence allocation
+explicit causal relationships
+```
+
+Those are persistence/runtime concerns.
+
+They should not change the distinction between:
+
+```text
+typed identity
+conversation replay order
+semantic correlation
 ```
 
 ---
 
 # Security
 
-## 45. Phase 1 security baseline
+## 43. Phase 1 security baseline
 
-Raw provider events, context, and tool output may contain sensitive information.
+Conversation context, tool output, content references, and provider traces may contain sensitive information.
 
-Examples:
+Phase 1 does not need a complete redaction/retention system.
 
-```text
-credentials
-tokens
-environment variables
-private file contents
-provider metadata
-tool output
-user data
-```
-
-A complete redaction, retention, and permission system is outside Phase 1.
-
-However, Phase 1 should:
+It should:
 
 - avoid knowingly persisting obvious credentials
 - avoid intentionally capturing environment secrets
-- persist local conversation/run data with private filesystem permissions
-- document that raw event persistence may contain sensitive data
+- use private filesystem permissions for local durable conversation data
+- be cautious when tracing raw provider payloads
+- document that diagnostic logs may contain sensitive content
 
-Security hardening remains a future requirement, not a reason to block the initial architecture.
+More complete security and retention policy belongs to a later phase.
 
 ---
 
 # Phase 1 boundaries
 
-## 46. What Phase 1 commits to
+## 44. What Phase 1 commits to
 
-Phase 1 commits to these architectural seams:
+Phase 1 commits to:
 
 ```text
-ConversationEvents as semantic history
+Conversation Log as the durable semantic truth
 
-ModelDriverRunEvents as operational/provider history
+every ModelDriver can work from Conversation alone
+
+model/provider switching within a conversation
 
 a narrow explicit ModelDriver abstraction
 
@@ -1653,58 +1259,53 @@ immutable ModelDriverInput snapshots
 
 strongly typed ModelDriverResult and ModelDriverError
 
-strongly typed UUIDv7 IDs
+strongly typed UUIDv7 identities
 
-monotonic per-stream replay positions
+monotonic ConversationEvent positions
 
-raw/open provider payload preservation
+ToolCallId correlation
 
-immediate durable append
-
-ProjectionIdentity on derived semantic events
-
-idempotent cross-log projection and recovery
-
-ToolCallId correlation for multiple tool requests
+multiple tool requests without batching policy
 
 typed external references for images/files/blobs
 
-provider-native versus semantic replay
+immediate semantic event append
 
 caller-owned orchestration loop
 
-CLI as a projection of the Conversation Log
+CLI as a projection of Conversation
 ```
 
-These are the decisions we want to avoid needing to undo.
+These are the seams we do not want to need to undo.
 
 ---
 
-## 47. What Phase 1 intentionally does not solve
+## 45. What Phase 1 intentionally does not solve
 
 Phase 1 does not require:
 
 ```text
+durable ModelDriver run logs
+durable raw provider-event logs
+projection identities between two durable logs
+cross-version provider-log reprojection
+provider-native replay for correctness
 distributed event buses
-locks or concurrent append coordination
+locks/concurrent append coordination
 global event clocks
 generic causal DAGs
-cross-log distributed transactions
 exactly-once tool side effects
-tool execution attempt journals
-universal normalized provider event taxonomy
-perfect cross-provider replay
 general workflow orchestration
-complete failure taxonomy
-production-grade redaction/retention
+universal provider event taxonomy
+production-grade tracing retention
 complete OpenAI Responses coverage
 ```
 
-These are future extensions, not missing prerequisites.
+These may become useful later, but they should not burden the first ModelDriver implementation.
 
 ---
 
-## 48. First implementation milestone
+## 46. First implementation milestone
 
 The first coherent implementation should prove:
 
@@ -1713,34 +1314,23 @@ CreateConversation
 
 append User("hello")
 
-InvokeModelDriver
+construct immutable ModelDriverInput from Conversation
 
-create durable ModelDriverRun
+invoke OpenAiModelDriver
 
-append RunStarted
+consume OpenAI Responses stream internally
 
-call OpenAI Responses through OpenAiModelDriver
+emit AssistantResponse
 
-receive provider events
+append AssistantResponse immediately
 
-persist each ModelDriverRunEvent immediately
-with typed IDs and monotonic positions
+return typed ModelDriverResult
 
-project complete semantic outputs
-with ProjectionIdentity
+reload Conversation
 
-append AssistantResponse
+invoke OpenAiModelDriver again using only semantic Conversation history
 
-append RunCompleted
-
-reload persisted state
-
-re-run semantic projection safely
-without duplicate ConversationEvents
-
-project Conversation to CLI
-
-reinvoke OpenAI using the selected replay strategy
+switch to another ModelDriver later without requiring OpenAI run history
 ```
 
 Then add:
@@ -1750,181 +1340,41 @@ Then add:
 tool execution
 ToolResponses appended as they arrive
 caller-driven reinvocation
-failure → RunFailed → Error
+failure → Error
+content references as concrete use cases require
+useful provider tracing
 ```
 
-The objective is to validate the boundaries, not to build runtime sophistication.
-
----
-
-# Future direction
-
-## 49. Event-stream evolution
-
-Phase 1 uses local calls/sinks while preserving event-stream boundaries.
-
-The likely future shape is:
-
-```text
-Commands
-    ↓
-ModelDriver Run stream
-    ↓
-durable ModelDriverRunEvents
-    ↓
-multiple projections
-    ├── Conversation Log
-    ├── runtime/control
-    ├── progress / interactive UI
-    ├── observability
-    └── provider-native replay
-```
-
-And:
-
-```text
-durable ConversationEvents
-    ↓
-multiple projections
-    ├── CLI
-    ├── interactive UI
-    ├── semantic model replay
-    ├── search/indexing
-    └── automation
-```
-
-A synchronous call is sufficient today.
-
-Future implementations may introduce:
-
-```text
-async event buses
-multiple subscribers/projectors
-projection cursors
-background recovery
-checkpoints
-global stream positions
-concurrent writers
-optimistic append
-richer ModelDriverRun lifecycles
-cross-process orchestration
-tool execution attempt journals
-```
-
-The current design should leave room for these without implementing them prematurely.
-
----
-
-## 50. Projection future direction
-
-The projection model is intentionally more important than a normalized provider event taxonomy.
-
-As new providers and capabilities arrive, we should first ask:
-
-```text
-What should be returned to the model?
-What should become semantic conversation state?
-What should be shown to the user?
-What should cause runtime action?
-```
-
-Only introduce new universal event types when repeated concrete implementations demonstrate that they are truly common.
-
-`ModelSpecific` and raw `ProviderEvent` payloads provide escape hatches while the architecture learns.
-
----
-
-## 51. ModelDriver future direction
-
-The current `ModelDriver` trait is intentionally narrow.
-
-Future providers may reveal that the initial shape is wrong.
-
-That is acceptable.
-
-The abstraction exists to protect the boundary and help us reason about the system, not to freeze a speculative universal provider API.
-
-When a second implementation arrives:
-
-1. compare its concrete needs with OpenAI
-2. retain what is actually common
-3. change the trait where necessary
-4. avoid preserving an early shape merely for compatibility
-
-The goal is a useful abstraction, not an untouchable one.
-
----
-
-## 52. Content storage future direction
-
-Conversation events should continue to reference large or binary content by strongly typed durable IDs rather than embedding it.
-
-Future content storage may add:
-
-```text
-deduplication
-content-addressed storage
-remote object storage
-retention policy
-access control
-lazy materialization
-provider-specific upload caches
-```
-
-Those concerns should remain outside the semantic Conversation Log.
-
-The stable contract is:
-
-```text
-ConversationEvent
-    references content ID
-
-content store
-    owns bytes and content lifecycle
-
-ModelDriver
-    resolves referenced content for provider invocation
-```
-
----
-
-## 53. Replay and consistency future direction
-
-The current per-stream monotonic position is sufficient for deterministic local replay.
-
-Later, system-wide projections may motivate a global append position or cursor.
-
-Concurrent writers may motivate compare-and-append or transactional sequence allocation.
-
-Tool side-effect recovery may motivate a separate durable tool-attempt log with idempotency keys.
-
-None of these require changing the fundamental distinction between:
-
-```text
-typed identity
-stream replay order
-semantic correlation
-projection provenance
-```
-
-That distinction should remain stable.
+The objective is to prove semantic portability and the ModelDriver boundary before adding provider-native sophistication.
 
 ---
 
 # Documentation
 
-## 54. Documentation status
+## 47. Relationship to ADR 0001
 
-This document is a **Phase 1 architectural direction**, not a permanent finished API.
+The early `ModelDriver` abstraction is a deliberate exception to the normal rule against speculative provider abstractions.
+
+Its purpose is not to predict a universal provider API.
+
+Its purpose is to define and protect the model-invocation boundary while implementing the first provider.
+
+Keep it small.
+
+Let future implementations change it.
+
+ADR 0001 or related architecture notes should explicitly record this rationale so the exception is deliberate rather than accidental.
+
+---
+
+## 48. Documentation status
+
+This document is a **Phase 1 architectural direction**, not a finished permanent API.
 
 Implementation experience should feed back into it.
 
-If OpenAI Responses exposes assumptions that conflict with this model, document those pressures rather than hiding them behind increasingly elaborate abstractions.
+If OpenAI Responses exposes assumptions that conflict with the design, document those pressures rather than hiding them behind increasingly elaborate abstractions.
 
-Related architecture documents should be updated so they do not continue to describe these decisions as unresolved.
-
-The explicit early `ModelDriver` abstraction should be reconciled with ADR 0001 as a deliberate exception: the abstraction is being used to define and protect a design boundary, not because a second provider already exists.
-
-Add this document to the documentation index.
+The shorter `docs/conversation.md` should describe the stable semantic conversation model and should not imply that a durable ModelDriver run log is required for Phase 1.
 
 Major future architectural changes should be captured in ADRs where useful.
