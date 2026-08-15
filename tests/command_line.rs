@@ -157,7 +157,7 @@ fn turn_persists_events_and_prints_semantic_output() {
     let data_directory = temporary_data_directory();
 
     let command_output = configured_command(&server, &data_directory)
-        .args(["turn", "Say hello"])
+        .args(["say", "hi"])
         .output()
         .expect("tog should run");
 
@@ -173,7 +173,7 @@ fn turn_persists_events_and_prints_semantic_output() {
     assert!(standard_error.contains("## receiving OpenAI response (1 provider event)\n"));
     let requests = server.finish();
     assert_eq!(requests[0]["model"], "gpt-5.6");
-    assert_eq!(requests[0]["input"][0]["content"], "Say hello");
+    assert_eq!(requests[0]["input"][0]["content"], "say hi");
     assert_eq!(requests[0]["stream"], true);
     assert_eq!(requests[0]["text"]["verbosity"], "low");
 }
@@ -187,7 +187,7 @@ fn turn_sends_selected_response_verbosity() {
     let data_directory = temporary_data_directory();
 
     let command_output = configured_command(&server, &data_directory)
-        .args(["turn", "--verbosity", "high", "Explain ownership"])
+        .args(["--verbosity", "high", "Explain ownership"])
         .output()
         .expect("tog should run");
 
@@ -210,7 +210,7 @@ fn subsequent_turn_continues_from_the_previous_response() {
     ]);
     let data_directory = temporary_data_directory();
     let first_output = configured_command(&server, &data_directory)
-        .args(["turn", "First question"])
+        .args([":turn", "First question"])
         .output()
         .expect("the first turn should run");
     assert!(first_output.status.success());
@@ -218,7 +218,7 @@ fn subsequent_turn_continues_from_the_previous_response() {
 
     let second_output = configured_command(&server, &data_directory)
         .args([
-            "turn",
+            ":turn",
             "--conversation",
             &conversation_id,
             "Second question",
@@ -253,14 +253,14 @@ fn rejected_continuation_falls_back_to_local_semantic_history() {
     ]);
     let data_directory = temporary_data_directory();
     let first_output = configured_command(&server, &data_directory)
-        .args(["turn", "First question"])
+        .args([":turn", "First question"])
         .output()
         .expect("the first turn should run");
     let conversation_id = reported_conversation_id(&first_output.stderr);
 
     let second_output = configured_command(&server, &data_directory)
         .args([
-            "turn",
+            ":turn",
             "--conversation",
             &conversation_id,
             "Second question",
@@ -296,13 +296,13 @@ fn failed_user_turn_is_included_in_the_next_local_reconstruction() {
     ]);
     let data_directory = temporary_data_directory();
     let first_output = configured_command(&server, &data_directory)
-        .args(["turn", "First question"])
+        .args([":turn", "First question"])
         .output()
         .expect("the first turn should run");
     let conversation_id = reported_conversation_id(&first_output.stderr);
     let failed_output = configured_command(&server, &data_directory)
         .args([
-            "turn",
+            ":turn",
             "--conversation",
             &conversation_id,
             "Failed question",
@@ -317,7 +317,7 @@ fn failed_user_turn_is_included_in_the_next_local_reconstruction() {
 
     let recovered_output = configured_command(&server, &data_directory)
         .args([
-            "turn",
+            ":turn",
             "--conversation",
             &conversation_id,
             "Recovery question",
@@ -334,27 +334,25 @@ fn failed_user_turn_is_included_in_the_next_local_reconstruction() {
 
 #[test]
 fn turn_rejects_a_missing_user_prompt() {
-    let command_output = tog_command().arg("turn").output().expect("tog should run");
+    let command_output = tog_command().output().expect("tog should run");
 
     assert!(!command_output.status.success());
-    assert!(
-        String::from_utf8(command_output.stderr)
-            .expect("standard error should be UTF-8")
-            .contains("required")
-    );
+    let standard_error =
+        String::from_utf8(command_output.stderr).expect("standard error should be UTF-8");
+    assert!(standard_error.contains("required"));
+    assert!(standard_error.contains("Usage: tog [:turn] [OPTIONS] <USER_PROMPT>..."));
 }
 
 #[test]
-fn help_lists_the_turn_command() {
+fn help_lists_the_colon_prefixed_turn_command() {
     let command_output = tog_command()
         .arg("--help")
         .output()
         .expect("tog should run");
 
     assert!(command_output.status.success());
-    assert!(
-        String::from_utf8(command_output.stdout)
-            .expect("standard output should be UTF-8")
-            .contains("turn")
-    );
+    let standard_output =
+        String::from_utf8(command_output.stdout).expect("standard output should be UTF-8");
+    assert!(standard_output.contains(":turn"));
+    assert!(!standard_output.contains("\n  help"));
 }

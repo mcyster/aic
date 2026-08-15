@@ -31,28 +31,31 @@ With direnv, you can instead put the export in `.env` or `$HOME/.env.tog`; both 
 Start a conversation without installing the binary:
 
 ```console
-cargo run -- turn "Explain ownership in Rust"
+cargo run -- "Explain ownership in Rust"
 ```
 
 The command writes progress and the conversation ID to standard error. It writes the assistant response to standard output after OpenAI completes the response. Continue the conversation with that ID:
 
 ```console
-cargo run -- turn --conversation conversation_019... "Show an example"
+cargo run -- --conversation conversation_019... "Show an example"
 ```
 
 The default model is `gpt-5.6`. Select another OpenAI model with `--model`:
 
 ```console
-cargo run -- turn --model MODEL_NAME "Explain ownership in Rust"
+cargo run -- --model MODEL_NAME "Explain ownership in Rust"
 ```
 
 Response verbosity defaults to `low` for concise CLI turns. Select `low`, `medium`, or `high` with `--verbosity`:
 
 ```console
-cargo run -- turn --verbosity medium "Explain ownership in Rust"
+cargo run -- --verbosity medium "Explain ownership in Rust"
 ```
 
-Run `cargo run -- --help` or `cargo run -- turn --help` for the complete command-line help.
+`:turn` is the default command when no command is given. Commands are prefixed with a
+colon, so the explicit form is `cargo run -- :turn "Explain ownership in Rust"`.
+Run `cargo run -- --help` or `cargo run -- :turn --help` for the complete command-line
+help.
 
 ## Build
 
@@ -66,7 +69,7 @@ The binary is written to `target/release/tog`. Inside the development environmen
 `target/release` is on `PATH`, so run it as:
 
 ```console
-tog turn "Explain ownership in Rust"
+tog "Explain ownership in Rust"
 ```
 
 Outside the development environment, place the binary in a directory on your `PATH`.
