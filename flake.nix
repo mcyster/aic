@@ -26,6 +26,10 @@
             packageSet.rustc
             packageSet.rustfmt
           ];
+
+          shellHook = ''
+            export PATH="$PWD/target/release:$PATH"
+          '';
         };
       });
     };

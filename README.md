@@ -62,13 +62,14 @@ Build an optimized binary from inside the Nix development environment:
 cargo build --release
 ```
 
-The binary is written to `target/release/tog`. Run it directly:
+The binary is written to `target/release/tog`. Inside the development environment,
+`target/release` is on `PATH`, so run it as:
 
 ```console
-./target/release/tog turn "Explain ownership in Rust"
+tog turn "Explain ownership in Rust"
 ```
 
-To invoke it as `tog` from any directory, place the binary in a directory on your `PATH`.
+Outside the development environment, place the binary in a directory on your `PATH`.
 
 ## Data
 
