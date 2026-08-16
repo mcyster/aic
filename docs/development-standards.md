@@ -20,6 +20,8 @@ The root [`AGENTS.md`](../AGENTS.md) translates these standards into concise ins
 - Represent absence with `Option` and recoverable failure with `Result`.
 - Keep public interfaces minimal.
 - Keep provider-neutral contracts independent of concrete integrations; integrations depend on contracts, never the reverse.
+- Classify values by lifetime before designing an interface: stable values belong to the object, per-operation values are parameters, derived values are not passed twice, and produced values are returned.
+- Prefer direct parameters and return values. Introduce input structs, result wrappers, callbacks, sinks, channels, or streams only when a concrete current requirement justifies them.
 - Prefer concrete implementations until multiple implementations create a demonstrated need for abstraction.
 - Do not use unsafe Rust.
 - Add dependencies only when they provide clear value over the standard library.
@@ -32,6 +34,14 @@ The root [`AGENTS.md`](../AGENTS.md) translates these standards into concise ins
 - Record consequential architectural decisions in `docs/decisions/`.
 - Keep unfinished proposals in `docs/ideas.md` until they are accepted or removed.
 - Introduce a Cargo workspace only when the project has multiple independently useful packages.
+
+## Design Revision
+
+- Treat explored ideas and future possibilities as non-requirements until they are explicitly accepted.
+- Require each nontrivial abstraction to trace to a current requirement or accepted invariant.
+- When feedback changes ownership, lifetime, output hierarchy, or failure semantics, restate the complete boundary before editing further.
+- Remove abstractions that no longer follow from the revised model instead of preserving them through additional wrappers or compatibility layers.
+- When an accepted simplification gives up an earlier property, remove that superseded property from code, tests, and authoritative documentation.
 
 ## Required Checks
 

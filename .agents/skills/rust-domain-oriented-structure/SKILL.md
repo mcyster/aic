@@ -5,7 +5,7 @@ description: Organize Rust code around domain concepts and ownership rather than
 
 # Rust Domain Oriented Structure
 
-Use this skill when adding, moving, or reorganizing Rust types, files, and modules.
+Use this skill when adding, moving, or reorganizing Rust types, files, and modules. Use the `rust-abstraction-design` skill as well when deciding whether a trait, input struct, result wrapper, callback, or sink should exist.
 
 ## Goal
 
@@ -16,15 +16,12 @@ The filesystem and module hierarchy should help explain the architecture of the 
 Prefer structures such as:
 
 ```
+conversation.rs
 conversation/
-  mod.rs
   id.rs
   event.rs
-
-agent_run/
-  mod.rs
-  id.rs
-  event.rs
+model_driver.rs
+openai.rs
 ```
 
 Avoid structures organized primarily by technical category:
@@ -46,13 +43,13 @@ Examples:
 
 * ConversationId belongs to conversation
 * ConversationEventId belongs to conversation
-* AgentRunId belongs to agent_run
-* AgentRunEventId belongs to agent_run
+* ModelEvent belongs to conversation
+* ModelId belongs to the model driver contract
 * ToolCall belongs to the domain abstraction that defines what a tool call means
 
 Do not centralize types merely because they share an implementation characteristic.
 
-ConversationId and AgentRunId may both wrap UUID values, but UUID wrapping is not their architectural relationship.
+ConversationId and ConversationEventId may both wrap UUID values, but UUID wrapping is not their architectural relationship.
 
 ## Before creating or moving a module
 
@@ -90,8 +87,8 @@ conversation.rs
 When the concept becomes substantial, promote it to a module:
 
 ```
+conversation.rs
 conversation/
-  mod.rs
   id.rs
   event.rs
 ```
@@ -153,7 +150,7 @@ anthropic -> model_driver
 model_driver -/-> openai
 ```
 
-A concrete type implementing a neutral trait does not make that integration a child of the neutral module. Do not nest or re export a concrete provider from the contract module merely because it implements the contract. A neutral module must remain usable without knowing which concrete integrations exist.
+A concrete type implementing a neutral trait does not make that integration a child of the neutral module. Do not nest or re-export a concrete provider from the contract module merely because it implements the contract. A neutral module must remain usable without knowing which concrete integrations exist.
 
 Provider specific data may be retained when necessary, but it should not distort the common domain abstraction.
 

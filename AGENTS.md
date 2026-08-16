@@ -21,6 +21,8 @@ The complete development standards are in [`docs/development-standards.md`](docs
 - Use `Option` for absence and `Result` for recoverable failure.
 - Keep public interfaces minimal.
 - Keep provider-neutral contracts independent of concrete integrations; integrations depend on contracts, never the reverse.
+- Classify values by lifetime before designing an API: object-stable values belong to the object, per-operation values are parameters, derived values are not passed twice, and produced values are returned.
+- Prefer direct parameters and return values. Add input structs, result wrappers, callbacks, sinks, or streams only for a concrete current requirement.
 - Prefer concrete implementations. Introduce traits and generic abstractions only when a demonstrated need exists.
 - Do not use unsafe Rust.
 - Prefer the standard library. Add a dependency only when its value justifies its maintenance and security cost.
@@ -38,7 +40,10 @@ The complete development standards are in [`docs/development-standards.md`](docs
 ## Change Discipline
 
 - Make the smallest complete change that satisfies the requirement.
+- Treat exploratory ideas and future possibilities as non-requirements until explicitly accepted.
 - Do not add speculative compatibility, configuration, abstractions, or extension points.
+- When feedback changes ownership, lifetime, output hierarchy, or failure semantics, restate the complete boundary and remove invalid abstractions instead of layering another type onto them.
+- When a simpler accepted direction gives up an earlier property, remove the superseded code, tests, and documentation rather than preserving it implicitly.
 - Preserve existing behavior unless the task explicitly changes it.
 - Add or update tests for observable behavior and validation rules.
 - Do not commit or push unless explicitly requested.
