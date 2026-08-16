@@ -1,9 +1,11 @@
 use std::ffi::OsString;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::agent_run::ResponseVerbosity;
-use crate::conversation::ConversationId;
+use crate::conversation::{ConversationId, ModelEventImportance};
+use crate::model_driver::ModelId;
+use crate::openai::OpenAiModelDriver;
+use crate::persistence::EventStore;
 use crate::turn::{TurnProgress, TurnRequest, TurnResult, TurnResultValue, TurnService};
 
 #[derive(Debug, Parser)]
@@ -37,26 +39,27 @@ impl CommandLine {
         match self.command {
             Command::Turn(arguments) => {
                 let user_prompt = arguments.user_prompt_words.join(" ").parse()?;
-                TurnService::from_environment()?.execute(
+                let verbosity = arguments.verbosity;
+                let turn_service = TurnService::new(
+                    EventStore::from_environment()?,
+                    Box::new(OpenAiModelDriver::from_environment(arguments.model)?),
+                );
+                let mut turn_result = turn_service.execute(
                     TurnRequest {
                         conversation_id: arguments.conversation,
-                        model: arguments.model,
-                        response_verbosity: arguments.response_verbosity,
                         user_prompt,
                     },
                     |conversation_id| eprintln!("#> conversation {conversation_id}"),
                     |progress| match progress {
                         TurnProgress::ModelInvocationStarted { model } => {
-                            eprintln!("## waiting for OpenAI model {model}");
-                        }
-                        TurnProgress::ProviderEventsReceived { count } => {
-                            let event_label = if count == 1 { "event" } else { "events" };
-                            eprintln!(
-                                "## receiving OpenAI response ({count} provider {event_label})"
-                            );
+                            eprintln!("## waiting for model {model}");
                         }
                     },
-                )
+                )?;
+                turn_result
+                    .model_events
+                    .retain(|event| verbosity.includes(event.importance));
+                Ok(turn_result)
             }
         }
     }
@@ -77,11 +80,28 @@ struct TurnArguments {
     conversation: Option<ConversationId>,
 
     #[arg(long, default_value = "gpt-5.6")]
-    model: String,
+    model: ModelId,
 
-    #[arg(long = "verbosity", default_value = "low")]
-    response_verbosity: ResponseVerbosity,
+    #[arg(long, value_enum, default_value = "low")]
+    verbosity: Verbosity,
 
     #[arg(value_name = "USER_PROMPT", num_args = 1.., required = true)]
     user_prompt_words: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Verbosity {
+    Low,
+    Medium,
+    High,
+}
+
+impl Verbosity {
+    fn includes(self, importance: ModelEventImportance) -> bool {
+        match self {
+            Self::Low => importance >= ModelEventImportance::Important,
+            Self::Medium => importance >= ModelEventImportance::Interesting,
+            Self::High => true,
+        }
+    }
 }

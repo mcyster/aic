@@ -20,6 +20,7 @@ The complete development standards are in [`docs/development-standards.md`](docs
 - Normalize external values at boundaries and convert them into validated project types.
 - Use `Option` for absence and `Result` for recoverable failure.
 - Keep public interfaces minimal.
+- Keep provider-neutral contracts independent of concrete integrations; integrations depend on contracts, never the reverse.
 - Prefer concrete implementations. Introduce traits and generic abstractions only when a demonstrated need exists.
 - Do not use unsafe Rust.
 - Prefer the standard library. Add a dependency only when its value justifies its maintenance and security cost.

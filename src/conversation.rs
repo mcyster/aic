@@ -7,7 +7,9 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) use event::{ConversationEvent, ProjectionIdentity, StoredConversationEvent};
+pub(crate) use event::{
+    ConversationEvent, ModelEvent, ModelEventImportance, StoredConversationEvent, UserContent,
+};
 pub(crate) use id::{ConversationEventId, ConversationId};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

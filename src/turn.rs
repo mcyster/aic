@@ -1,46 +1,35 @@
 use std::error::Error;
 
-use serde_json::{Value, json};
-
-use crate::agent_run::{
-    AgentRunEvent, AgentRunEventId, AgentRunId, ModelRequestSnapshot, ResponseVerbosity,
-    StoredAgentRunEvent,
-};
-use crate::conversation::{ConversationEvent, ConversationId, ProjectionIdentity, UserPrompt};
-use crate::openai::{
-    OpenAiClient, OpenAiOutput, OpenAiResponseError, completed_response_text, semantic_input,
-};
+use crate::conversation::{ConversationEvent, ConversationId, ModelEvent, UserContent, UserPrompt};
+use crate::model_driver::ModelDriver;
 use crate::persistence::EventStore;
 
 pub(crate) type TurnResultValue<T> = Result<T, Box<dyn Error>>;
 
 pub(crate) struct TurnRequest {
     pub(crate) conversation_id: Option<ConversationId>,
-    pub(crate) model: String,
-    pub(crate) response_verbosity: ResponseVerbosity,
     pub(crate) user_prompt: UserPrompt,
 }
 
 pub(crate) struct TurnResult {
-    pub(crate) assistant_text: String,
+    pub(crate) model_events: Vec<ModelEvent>,
 }
 
 pub(crate) enum TurnProgress {
     ModelInvocationStarted { model: String },
-    ProviderEventsReceived { count: usize },
 }
 
 pub(crate) struct TurnService {
     event_store: EventStore,
-    openai_client: OpenAiClient,
+    model_driver: Box<dyn ModelDriver>,
 }
 
 impl TurnService {
-    pub(crate) fn from_environment() -> TurnResultValue<Self> {
-        Ok(Self {
-            event_store: EventStore::from_environment()?,
-            openai_client: OpenAiClient::from_environment()?,
-        })
+    pub(crate) fn new(event_store: EventStore, model_driver: Box<dyn ModelDriver>) -> Self {
+        Self {
+            event_store,
+            model_driver,
+        }
     }
 
     pub(crate) fn execute(
@@ -54,257 +43,241 @@ impl TurnService {
             None => self.event_store.create_conversation()?,
         };
         conversation_identified(conversation.id);
-        self.recover_semantic_events(conversation.id)?;
         self.event_store.append_conversation_event(
             conversation.id,
-            ConversationEvent::UserPrompt {
-                text: request.user_prompt.text().to_owned(),
+            ConversationEvent::User {
+                content: vec![UserContent::Text(request.user_prompt.text().to_owned())],
             },
         )?;
 
-        let conversation_events = self.event_store.load_conversation_events(conversation.id)?;
-        let previous_projection =
-            conversation_events
-                .iter()
-                .rev()
-                .nth(1)
-                .and_then(|stored_event| match &stored_event.event {
-                    ConversationEvent::AssistantResponse { projection, .. } => Some(*projection),
-                    ConversationEvent::UserPrompt { .. } => None,
-                });
-        let previous_response_id = previous_projection
-            .map(|projection| self.response_id_for_projection(projection))
-            .transpose()?
-            .flatten();
-        let input = if previous_response_id.is_some() {
-            json!([{ "role": "user", "content": request.user_prompt.text() }])
-        } else {
-            self.semantic_conversation_input(conversation.id)?
-        };
-        let model = request.model;
-        let model_request = ModelRequestSnapshot {
-            provider: "openai".to_owned(),
-            model: model.clone(),
-            response_verbosity: Some(request.response_verbosity),
-            previous_response_id,
-            input,
-        };
-        let invocation_result =
-            self.execute_agent_run(conversation.id, &model_request, &mut report_progress);
-        let (agent_run_id, output) = match invocation_result {
-            Ok(result) => result,
-            Err(error)
-                if model_request.previous_response_id.is_some()
-                    && error
-                        .downcast_ref::<OpenAiResponseError>()
-                        .is_some_and(OpenAiResponseError::permits_local_reconstruction) =>
-            {
-                let reconstruction_request = ModelRequestSnapshot {
-                    provider: "openai".to_owned(),
-                    model,
-                    response_verbosity: Some(request.response_verbosity),
-                    previous_response_id: None,
-                    input: self.semantic_conversation_input(conversation.id)?,
-                };
-                self.execute_agent_run(
-                    conversation.id,
-                    &reconstruction_request,
-                    &mut report_progress,
-                )?
-            }
-            Err(error) => return Err(error),
-        };
-
-        self.event_store.append_conversation_event(
-            conversation.id,
-            ConversationEvent::AssistantResponse {
-                text: output.assistant_text.clone(),
-                projection: ProjectionIdentity {
-                    source_run_id: agent_run_id,
-                    source_run_event_id: output.completion_event_id,
-                    output_index: 0,
-                },
-            },
-        )?;
-        self.event_store.append_agent_run_event(
-            agent_run_id,
-            AgentRunEvent::RunCompleted {
-                response_id: output.response_id,
-            },
-        )?;
-
-        Ok(TurnResult {
-            assistant_text: output.assistant_text,
-        })
-    }
-
-    fn execute_agent_run(
-        &self,
-        conversation_id: ConversationId,
-        model_request: &ModelRequestSnapshot,
-        report_progress: &mut impl FnMut(TurnProgress),
-    ) -> TurnResultValue<(AgentRunId, OpenAiOutput)> {
-        let agent_run = self.event_store.create_agent_run(conversation_id)?;
-        self.event_store.append_agent_run_event(
-            agent_run.id,
-            AgentRunEvent::RunStarted {
-                request: model_request.clone(),
-            },
-        )?;
-
-        report_progress(TurnProgress::ModelInvocationStarted {
-            model: model_request.model.clone(),
-        });
-        let mut provider_event_count = 0_usize;
-        let invocation_result = self.openai_client.invoke(
-            model_request,
-            |event_type, payload| -> TurnResultValue<AgentRunEventId> {
-                let stored_event = self.event_store.append_agent_run_event(
-                    agent_run.id,
-                    AgentRunEvent::ModelProviderEvent {
-                        provider: "openai".to_owned(),
-                        model: model_request.model.clone(),
-                        event_type,
-                        payload,
-                    },
-                )?;
-                provider_event_count = provider_event_count.saturating_add(1);
-                if provider_event_count == 1 || provider_event_count.is_multiple_of(100) {
-                    report_progress(TurnProgress::ProviderEventsReceived {
-                        count: provider_event_count,
-                    });
-                }
-                Ok(stored_event.id)
-            },
-        );
-        let output = match invocation_result {
-            Ok(output) => output,
-            Err(error) => {
-                self.event_store.append_agent_run_event(
-                    agent_run.id,
-                    AgentRunEvent::RunFailed {
-                        message: error.to_string(),
-                    },
-                )?;
-                return Err(error);
-            }
-        };
-        Ok((agent_run.id, output))
-    }
-
-    fn recover_semantic_events(&self, conversation_id: ConversationId) -> TurnResultValue<()> {
-        for agent_run in self.event_store.load_agent_runs(conversation_id)? {
-            let events = self.event_store.load_agent_run_events(agent_run.id)?;
-            if let Some((source_run_event_id, assistant_text)) = project_assistant(&events) {
-                self.event_store.append_conversation_event(
-                    conversation_id,
-                    ConversationEvent::AssistantResponse {
-                        text: assistant_text,
-                        projection: ProjectionIdentity {
-                            source_run_id: agent_run.id,
-                            source_run_event_id,
-                            output_index: 0,
-                        },
-                    },
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    fn response_id_for_projection(
-        &self,
-        projection: ProjectionIdentity,
-    ) -> TurnResultValue<Option<String>> {
-        for stored_event in self
+        let conversation_events = self
             .event_store
-            .load_agent_run_events(projection.source_run_id)?
-        {
-            if stored_event.id != projection.source_run_event_id {
-                continue;
-            }
-            if let AgentRunEvent::ModelProviderEvent {
-                event_type,
-                payload,
-                ..
-            } = stored_event.event
-                && event_type == "response.completed"
-            {
-                return Ok(payload
-                    .get("response")
-                    .and_then(|response| response.get("id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned));
-            }
-        }
-        Ok(None)
-    }
-
-    fn semantic_conversation_input(
-        &self,
-        conversation_id: ConversationId,
-    ) -> TurnResultValue<Value> {
-        let messages = self
-            .event_store
-            .load_conversation_events(conversation_id)?
+            .load_conversation_events(conversation.id)?
             .into_iter()
-            .map(|stored_event| match stored_event.event {
-                ConversationEvent::UserPrompt { text } => ("user".to_owned(), text),
-                ConversationEvent::AssistantResponse { text, .. } => ("assistant".to_owned(), text),
-            });
-        Ok(semantic_input(messages))
+            .map(|stored_event| stored_event.event)
+            .collect::<Vec<_>>();
+        report_progress(TurnProgress::ModelInvocationStarted {
+            model: self.model_driver.model().as_str().to_owned(),
+        });
+        let returned_events = self.model_driver.invoke(&conversation_events)?;
+        let mut model_events = Vec::new();
+        for event in returned_events {
+            if let ConversationEvent::Model { event } = &event {
+                model_events.push(event.clone());
+            }
+            self.event_store
+                .append_conversation_event(conversation.id, event)?;
+        }
+
+        Ok(TurnResult { model_events })
     }
 }
 
-fn project_assistant(events: &[StoredAgentRunEvent]) -> Option<(AgentRunEventId, String)> {
-    let mut streamed_text = String::new();
-    let mut completed_text = None;
-    let mut completion_event_id = None;
-    for stored_event in events {
-        let AgentRunEvent::ModelProviderEvent {
-            event_type,
-            payload,
-            ..
-        } = &stored_event.event
-        else {
-            continue;
-        };
-        match event_type.as_str() {
-            "response.output_text.delta" => {
-                if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
-                    streamed_text.push_str(delta);
-                }
-            }
-            "response.refusal.delta" => {
-                if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
-                    streamed_text.push_str(delta);
-                }
-            }
-            "response.output_text.done" => {
-                completed_text = payload
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-            }
-            "response.refusal.done" => {
-                completed_text = payload
-                    .get("refusal")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-            }
-            "response.completed" => {
-                if completed_text.is_none() {
-                    completed_text = completed_response_text(payload);
-                }
-                completion_event_id = Some(stored_event.id);
-            }
-            _ => {}
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::{Map, Value};
+
+    use super::{TurnRequest, TurnService};
+    use crate::conversation::{
+        ConversationEvent, ModelEvent, ModelEventImportance, UserContent, UserPrompt,
+    };
+    use crate::model_driver::{ModelDriver, ModelDriverError, ModelId};
+    use crate::persistence::EventStore;
+
+    struct RecordingModelDriver {
+        model: ModelId,
+        events: Vec<ConversationEvent>,
+        inputs: Arc<Mutex<Vec<Vec<ConversationEvent>>>>,
+    }
+
+    impl ModelDriver for RecordingModelDriver {
+        fn model(&self) -> &ModelId {
+            &self.model
+        }
+
+        fn invoke(
+            &self,
+            conversation: &[ConversationEvent],
+        ) -> Result<Vec<ConversationEvent>, ModelDriverError> {
+            self.inputs
+                .lock()
+                .expect("the model input list should lock")
+                .push(conversation.to_vec());
+            Ok(self.events.clone())
         }
     }
-    let assistant_text = if streamed_text.is_empty() {
-        completed_text?
-    } else {
-        streamed_text
-    };
-    Some((completion_event_id?, assistant_text))
+
+    struct FailingModelDriver {
+        model: ModelId,
+    }
+
+    impl ModelDriver for FailingModelDriver {
+        fn model(&self) -> &ModelId {
+            &self.model
+        }
+
+        fn invoke(
+            &self,
+            _conversation: &[ConversationEvent],
+        ) -> Result<Vec<ConversationEvent>, ModelDriverError> {
+            Err(ModelDriverError::Provider("failure".to_owned()))
+        }
+    }
+
+    fn model_id() -> ModelId {
+        ModelId::from_str("test-model").expect("the model identifier should be valid")
+    }
+
+    fn model_event(message: &str, importance: ModelEventImportance) -> ConversationEvent {
+        ConversationEvent::Model {
+            event: ModelEvent {
+                message: message.to_owned(),
+                subtype: "test".to_owned(),
+                importance,
+                data: Map::from_iter([("custom".to_owned(), Value::Bool(true))]),
+            },
+        }
+    }
+
+    fn turn_request(
+        conversation_id: crate::conversation::ConversationId,
+        prompt: &str,
+    ) -> TurnRequest {
+        TurnRequest {
+            conversation_id: Some(conversation_id),
+            user_prompt: UserPrompt::from_str(prompt).expect("the user prompt should be valid"),
+        }
+    }
+
+    #[test]
+    fn another_model_driver_continues_from_semantic_conversation_alone() {
+        let root_directory =
+            std::env::temp_dir().join(format!("tog-model-driver-test-{}", uuid::Uuid::now_v7()));
+        let event_store =
+            EventStore::new(root_directory.clone()).expect("the event store should be created");
+        let conversation = event_store
+            .create_conversation()
+            .expect("the conversation should be created");
+        let first_service = TurnService::new(
+            event_store,
+            Box::new(RecordingModelDriver {
+                model: model_id(),
+                events: vec![model_event("First answer", ModelEventImportance::Important)],
+                inputs: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+        first_service
+            .execute(
+                turn_request(conversation.id, "First question"),
+                |_| {},
+                |_| {},
+            )
+            .expect("the first turn should complete");
+
+        let second_inputs = Arc::new(Mutex::new(Vec::new()));
+        let second_service = TurnService::new(
+            EventStore::new(root_directory).expect("the event store should reopen"),
+            Box::new(RecordingModelDriver {
+                model: model_id(),
+                events: vec![model_event(
+                    "Second answer",
+                    ModelEventImportance::Important,
+                )],
+                inputs: Arc::clone(&second_inputs),
+            }),
+        );
+        second_service
+            .execute(
+                turn_request(conversation.id, "Second question"),
+                |_| {},
+                |_| {},
+            )
+            .expect("the second turn should complete");
+
+        let recorded_inputs = second_inputs
+            .lock()
+            .expect("the second model input list should lock");
+        assert_eq!(
+            recorded_inputs[0],
+            [
+                ConversationEvent::User {
+                    content: vec![UserContent::Text("First question".to_owned())]
+                },
+                model_event("First answer", ModelEventImportance::Important),
+                ConversationEvent::User {
+                    content: vec![UserContent::Text("Second question".to_owned())]
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn returned_events_are_persisted_with_importance_and_custom_data() {
+        let root_directory =
+            std::env::temp_dir().join(format!("tog-returned-events-test-{}", uuid::Uuid::now_v7()));
+        let event_store =
+            EventStore::new(root_directory.clone()).expect("the event store should be created");
+        let conversation = event_store
+            .create_conversation()
+            .expect("the conversation should be created");
+        let service = TurnService::new(
+            event_store,
+            Box::new(RecordingModelDriver {
+                model: model_id(),
+                events: vec![
+                    model_event("Thinking", ModelEventImportance::Detailed),
+                    model_event("Answer", ModelEventImportance::Important),
+                ],
+                inputs: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+
+        let result = service
+            .execute(turn_request(conversation.id, "Question"), |_| {}, |_| {})
+            .expect("the turn should complete");
+
+        assert_eq!(result.model_events.len(), 2);
+        let stored_events = EventStore::new(root_directory)
+            .expect("the event store should reopen")
+            .load_conversation_events(conversation.id)
+            .expect("the events should load");
+        assert_eq!(
+            stored_events[1].event,
+            model_event("Thinking", ModelEventImportance::Detailed)
+        );
+        let ConversationEvent::Model { event } = &stored_events[1].event else {
+            panic!("the event should be a model event");
+        };
+        assert_eq!(event.data["custom"], true);
+    }
+
+    #[test]
+    fn failed_invocation_retains_only_the_user_event() {
+        let root_directory = std::env::temp_dir().join(format!(
+            "tog-model-driver-failure-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let event_store =
+            EventStore::new(root_directory).expect("the event store should be created");
+        let conversation = event_store
+            .create_conversation()
+            .expect("the conversation should be created");
+        let service = TurnService::new(
+            event_store,
+            Box::new(FailingModelDriver { model: model_id() }),
+        );
+
+        let result = service.execute(turn_request(conversation.id, "Question"), |_| {}, |_| {});
+
+        assert!(result.is_err());
+        let events = service
+            .event_store
+            .load_conversation_events(conversation.id)
+            .expect("the conversation events should load");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].event, ConversationEvent::User { .. }));
+    }
 }

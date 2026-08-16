@@ -26,6 +26,12 @@ enum MockResponse {
         response_id: &'static str,
         assistant_text: &'static str,
     },
+    SuccessWithReasoning {
+        response_id: &'static str,
+        detailed: &'static str,
+        interesting: &'static str,
+        important: &'static str,
+    },
     Failure {
         status: &'static str,
     },
@@ -116,6 +122,26 @@ fn write_response(stream: &mut TcpStream, response: MockResponse) {
                 response_id, assistant_text, response_id
             ),
         ),
+        MockResponse::SuccessWithReasoning {
+            response_id,
+            detailed,
+            interesting,
+            important,
+        } => (
+            "200 OK",
+            "text/event-stream",
+            format!(
+                concat!(
+                    "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{}\"}}}}\n\n",
+                    "data: {{\"type\":\"response.reasoning_text.delta\",\"delta\":\"{}\"}}\n\n",
+                    "data: {{\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"{}\"}}\n\n",
+                    "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{}\"}}\n\n",
+                    "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{}\"}}}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+                response_id, detailed, interesting, important, response_id
+            ),
+        ),
         MockResponse::Failure { status } => (
             status,
             "application/json",
@@ -169,20 +195,22 @@ fn turn_persists_events_and_prints_semantic_output() {
     let standard_error =
         String::from_utf8(command_output.stderr.clone()).expect("standard error should be UTF-8");
     assert!(reported_conversation_id(&command_output.stderr).starts_with("conversation_"));
-    assert!(standard_error.contains("## waiting for OpenAI model gpt-5.6\n"));
-    assert!(standard_error.contains("## receiving OpenAI response (1 provider event)\n"));
+    assert!(standard_error.contains("## waiting for model gpt-5.6\n"));
+    assert!(!data_directory.join("agent-runs").exists());
     let requests = server.finish();
     assert_eq!(requests[0]["model"], "gpt-5.6");
     assert_eq!(requests[0]["input"][0]["content"], "say hi");
     assert_eq!(requests[0]["stream"], true);
-    assert_eq!(requests[0]["text"]["verbosity"], "low");
+    assert!(requests[0].get("text").is_none());
 }
 
 #[test]
-fn turn_sends_selected_response_verbosity() {
-    let server = MockOpenAiServer::start(vec![MockResponse::Success {
+fn high_verbosity_prints_all_model_event_messages() {
+    let server = MockOpenAiServer::start(vec![MockResponse::SuccessWithReasoning {
         response_id: "resp_verbose",
-        assistant_text: "Detailed answer",
+        detailed: "Detailed thought",
+        interesting: "Reasoning summary",
+        important: "Final answer",
     }]);
     let data_directory = temporary_data_directory();
 
@@ -192,12 +220,38 @@ fn turn_sends_selected_response_verbosity() {
         .expect("tog should run");
 
     assert!(command_output.status.success());
-    let requests = server.finish();
-    assert_eq!(requests[0]["text"]["verbosity"], "high");
+    assert_eq!(
+        String::from_utf8(command_output.stdout).expect("standard output should be UTF-8"),
+        "Detailed thought\nReasoning summary\nFinal answer\n"
+    );
+    server.finish();
 }
 
 #[test]
-fn subsequent_turn_continues_from_the_previous_response() {
+fn medium_verbosity_hides_detailed_model_event_messages() {
+    let server = MockOpenAiServer::start(vec![MockResponse::SuccessWithReasoning {
+        response_id: "resp_verbose",
+        detailed: "Detailed thought",
+        interesting: "Reasoning summary",
+        important: "Final answer",
+    }]);
+    let data_directory = temporary_data_directory();
+
+    let command_output = configured_command(&server, &data_directory)
+        .args(["--verbosity", "medium", "Explain ownership"])
+        .output()
+        .expect("tog should run");
+
+    assert!(command_output.status.success());
+    assert_eq!(
+        String::from_utf8(command_output.stdout).expect("standard output should be UTF-8"),
+        "Reasoning summary\nFinal answer\n"
+    );
+    server.finish();
+}
+
+#[test]
+fn subsequent_turn_reconstructs_semantic_conversation() {
     let server = MockOpenAiServer::start(vec![
         MockResponse::Success {
             response_id: "resp_first",
@@ -232,51 +286,11 @@ fn subsequent_turn_continues_from_the_previous_response() {
         "Second answer\n"
     );
     let requests = server.finish();
-    assert_eq!(requests[1]["previous_response_id"], "resp_first");
-    assert_eq!(requests[1]["input"][0]["content"], "Second question");
-}
-
-#[test]
-fn rejected_continuation_falls_back_to_local_semantic_history() {
-    let server = MockOpenAiServer::start(vec![
-        MockResponse::Success {
-            response_id: "resp_first",
-            assistant_text: "First answer",
-        },
-        MockResponse::Failure {
-            status: "404 Not Found",
-        },
-        MockResponse::Success {
-            response_id: "resp_reconstructed",
-            assistant_text: "Reconstructed answer",
-        },
-    ]);
-    let data_directory = temporary_data_directory();
-    let first_output = configured_command(&server, &data_directory)
-        .args([":turn", "First question"])
-        .output()
-        .expect("the first turn should run");
-    let conversation_id = reported_conversation_id(&first_output.stderr);
-
-    let second_output = configured_command(&server, &data_directory)
-        .args([
-            ":turn",
-            "--conversation",
-            &conversation_id,
-            "Second question",
-        ])
-        .output()
-        .expect("the second turn should run");
-
-    assert!(second_output.status.success());
-    assert_eq!(
-        String::from_utf8(second_output.stdout).expect("standard output should be UTF-8"),
-        "Reconstructed answer\n"
-    );
-    let requests = server.finish();
-    assert_eq!(requests[1]["previous_response_id"], "resp_first");
-    assert!(requests[2].get("previous_response_id").is_none());
-    assert_eq!(requests[2]["input"].as_array().map(Vec::len), Some(3));
+    assert!(requests[1].get("previous_response_id").is_none());
+    assert_eq!(requests[1]["input"].as_array().map(Vec::len), Some(3));
+    assert_eq!(requests[1]["input"][0]["content"], "First question");
+    assert_eq!(requests[1]["input"][1]["content"], "First answer");
+    assert_eq!(requests[1]["input"][2]["content"], "Second question");
 }
 
 #[test]

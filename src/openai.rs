@@ -1,125 +1,128 @@
-use std::error::Error;
-use std::fmt::{Display, Formatter};
-use std::io::{self, BufRead, BufReader};
+use std::io::{BufRead, BufReader};
 
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use serde_json::{Map, Value, json};
 
-use crate::agent_run::AgentRunEventId;
-use crate::agent_run::ModelRequestSnapshot;
+use crate::conversation::{ConversationEvent, ModelEvent, ModelEventImportance, UserContent};
+use crate::model_driver::{ModelDriver, ModelDriverError, ModelId};
 
-pub(crate) type OpenAiResult<T> = Result<T, Box<dyn Error>>;
-
-pub(crate) struct OpenAiClient {
+pub(crate) struct OpenAiModelDriver {
     http_client: Client,
     api_key: String,
     responses_url: String,
+    model: ModelId,
 }
 
-impl OpenAiClient {
-    pub(crate) fn from_environment() -> OpenAiResult<Self> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "OPENAI_API_KEY must be set"))?;
+impl OpenAiModelDriver {
+    pub(crate) fn from_environment(model: ModelId) -> Result<Self, ModelDriverError> {
+        let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
+            ModelDriverError::Authentication("OPENAI_API_KEY must be set".to_owned())
+        })?;
         let base_url = std::env::var("TOG_OPENAI_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_owned());
         Ok(Self {
             http_client: Client::new(),
             api_key,
             responses_url: format!("{}/responses", base_url.trim_end_matches('/')),
+            model,
         })
     }
+}
 
-    pub(crate) fn invoke(
+impl ModelDriver for OpenAiModelDriver {
+    fn model(&self) -> &ModelId {
+        &self.model
+    }
+
+    fn invoke(
         &self,
-        request: &ModelRequestSnapshot,
-        mut persist_provider_event: impl FnMut(String, Value) -> OpenAiResult<AgentRunEventId>,
-    ) -> OpenAiResult<OpenAiOutput> {
+        conversation: &[ConversationEvent],
+    ) -> Result<Vec<ConversationEvent>, ModelDriverError> {
         let mut request_body = Map::new();
-        request_body.insert("model".to_owned(), Value::String(request.model.clone()));
-        request_body.insert("input".to_owned(), request.input.clone());
+        request_body.insert(
+            "model".to_owned(),
+            Value::String(self.model.as_str().to_owned()),
+        );
+        request_body.insert("input".to_owned(), semantic_input(conversation));
         request_body.insert("stream".to_owned(), Value::Bool(true));
         request_body.insert("store".to_owned(), Value::Bool(true));
-        if let Some(response_verbosity) = request.response_verbosity {
-            request_body.insert(
-                "text".to_owned(),
-                json!({ "verbosity": response_verbosity.as_str() }),
-            );
-        }
-        if let Some(previous_response_id) = &request.previous_response_id {
-            request_body.insert(
-                "previous_response_id".to_owned(),
-                Value::String(previous_response_id.clone()),
-            );
-        }
 
         let response = self
             .http_client
             .post(&self.responses_url)
             .bearer_auth(&self.api_key)
             .json(&request_body)
-            .send()?;
+            .send()
+            .map_err(|error| ModelDriverError::Transport(error.to_string()))?;
         let response_status = response.status();
         if !response_status.is_success() {
-            let response_body = response.text()?;
-            return Err(OpenAiResponseError {
-                status: response_status,
-                body: response_body,
-            }
-            .into());
+            let response_body = response
+                .text()
+                .map_err(|error| ModelDriverError::Transport(error.to_string()))?;
+            return Err(classify_response_error(response_status, response_body));
         }
 
-        parse_server_sent_events(BufReader::new(response), |event_type, payload| {
-            persist_provider_event(event_type, payload)
-        })
+        parse_server_sent_events(BufReader::new(response), self.model.as_str())
     }
 }
 
-pub(crate) struct OpenAiOutput {
-    pub(crate) response_id: String,
-    pub(crate) assistant_text: String,
-    pub(crate) completion_event_id: AgentRunEventId,
+fn semantic_input(conversation: &[ConversationEvent]) -> Value {
+    Value::Array(
+        conversation
+            .iter()
+            .map(|event| match event {
+                ConversationEvent::User { content } => {
+                    let text = content
+                        .iter()
+                        .map(|content| match content {
+                            UserContent::Text(text) => text.as_str(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    json!({ "role": "user", "content": text })
+                }
+                ConversationEvent::Model { event } => {
+                    json!({ "role": "assistant", "content": event.message })
+                }
+            })
+            .collect(),
+    )
+}
+
+fn classify_response_error(status: StatusCode, body: String) -> ModelDriverError {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ModelDriverError::Authentication(body),
+        StatusCode::TOO_MANY_REQUESTS => ModelDriverError::RateLimited(body),
+        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::UNPROCESSABLE_ENTITY => {
+            ModelDriverError::InvalidRequest(body)
+        }
+        _ => ModelDriverError::Provider(format!("OpenAI Responses returned {status}: {body}")),
+    }
 }
 
 fn parse_server_sent_events(
     mut reader: impl BufRead,
-    mut persist_provider_event: impl FnMut(String, Value) -> OpenAiResult<AgentRunEventId>,
-) -> OpenAiResult<OpenAiOutput> {
+    model: &str,
+) -> Result<Vec<ConversationEvent>, ModelDriverError> {
     let mut line = String::new();
     let mut event_name = None;
     let mut data_lines = Vec::new();
-    let mut assistant_text = String::new();
-    let mut completed_text = None;
-    let mut response_id = None;
-    let mut completion_event_id = None;
+    let mut response_state = ResponseState::default();
 
     loop {
         line.clear();
-        let bytes_read = reader.read_line(&mut line)?;
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|error| ModelDriverError::Transport(error.to_string()))?;
         if bytes_read == 0 {
-            process_event(
-                &mut event_name,
-                &mut data_lines,
-                &mut assistant_text,
-                &mut completed_text,
-                &mut response_id,
-                &mut completion_event_id,
-                &mut persist_provider_event,
-            )?;
+            process_event(&mut event_name, &mut data_lines, &mut response_state, model)?;
             break;
         }
 
         let normalized_line = line.trim_end_matches(['\r', '\n']);
         if normalized_line.is_empty() {
-            process_event(
-                &mut event_name,
-                &mut data_lines,
-                &mut assistant_text,
-                &mut completed_text,
-                &mut response_id,
-                &mut completion_event_id,
-                &mut persist_provider_event,
-            )?;
+            process_event(&mut event_name, &mut data_lines, &mut response_state, model)?;
         } else if let Some(name) = normalized_line.strip_prefix("event:") {
             event_name = Some(name.trim_start().to_owned());
         } else if let Some(data) = normalized_line.strip_prefix("data:") {
@@ -127,45 +130,32 @@ fn parse_server_sent_events(
         }
     }
 
-    let response_id = response_id.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "response ID was not received")
-    })?;
-    let completion_event_id = completion_event_id.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "response.completed was not received",
-        )
-    })?;
-    if assistant_text.is_empty()
-        && let Some(text) = completed_text
-    {
-        assistant_text = text;
+    if !response_state.completed {
+        return Err(ModelDriverError::InvalidResponse(
+            "response.completed was not received".to_owned(),
+        ));
     }
-    if assistant_text.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "the completed response contained no assistant text",
-        )
-        .into());
-    }
-
-    Ok(OpenAiOutput {
-        response_id,
-        assistant_text,
-        completion_event_id,
-    })
+    Ok(response_state.events)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Default)]
+struct ResponseState {
+    assistant_text: String,
+    completed_assistant_text: Option<String>,
+    reasoning_text: String,
+    completed_reasoning_text: Option<String>,
+    reasoning_summary: String,
+    completed_reasoning_summary: Option<String>,
+    events: Vec<ConversationEvent>,
+    completed: bool,
+}
+
 fn process_event(
     event_name: &mut Option<String>,
     data_lines: &mut Vec<String>,
-    assistant_text: &mut String,
-    completed_text: &mut Option<String>,
-    response_id: &mut Option<String>,
-    completion_event_id: &mut Option<AgentRunEventId>,
-    persist_provider_event: &mut impl FnMut(String, Value) -> OpenAiResult<AgentRunEventId>,
-) -> OpenAiResult<()> {
+    response_state: &mut ResponseState,
+    model: &str,
+) -> Result<(), ModelDriverError> {
     if data_lines.is_empty() {
         *event_name = None;
         return Ok(());
@@ -177,7 +167,8 @@ fn process_event(
         return Ok(());
     }
 
-    let payload: Value = serde_json::from_str(&event_data)?;
+    let payload: Value = serde_json::from_str(&event_data)
+        .map_err(|error| ModelDriverError::InvalidResponse(error.to_string()))?;
     let event_type = payload
         .get("type")
         .and_then(Value::as_str)
@@ -185,61 +176,135 @@ fn process_event(
         .or_else(|| event_name.take())
         .unwrap_or_else(|| "unknown".to_owned());
     *event_name = None;
-    let stored_event_id = persist_provider_event(event_type.clone(), payload.clone())?;
 
     match event_type.as_str() {
-        "response.created" => {
-            *response_id = response_identifier(&payload).map(str::to_owned);
-        }
-        "response.output_text.delta" => {
-            if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
-                assistant_text.push_str(delta);
-            }
-        }
-        "response.refusal.delta" => {
-            if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
-                assistant_text.push_str(delta);
-            }
+        "response.output_text.delta" | "response.refusal.delta" => {
+            append_delta(&payload, &mut response_state.assistant_text);
         }
         "response.output_text.done" => {
-            *completed_text = payload
-                .get("text")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            response_state.completed_assistant_text = text_field(&payload, "text");
         }
         "response.refusal.done" => {
-            *completed_text = payload
-                .get("refusal")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            response_state.completed_assistant_text = text_field(&payload, "refusal");
         }
-        "response.completed" => {
-            if response_id.is_none() {
-                *response_id = response_identifier(&payload).map(str::to_owned);
-            }
-            if completed_text.is_none() {
-                *completed_text = completed_response_text(&payload);
-            }
-            *completion_event_id = Some(stored_event_id);
+        "response.reasoning_text.delta" => {
+            append_delta(&payload, &mut response_state.reasoning_text);
         }
+        "response.reasoning_text.done" => {
+            response_state.completed_reasoning_text = text_field(&payload, "text");
+        }
+        "response.reasoning_summary_text.delta" => {
+            append_delta(&payload, &mut response_state.reasoning_summary);
+        }
+        "response.reasoning_summary_text.done" => {
+            response_state.completed_reasoning_summary = text_field(&payload, "text");
+        }
+        "response.completed" => complete_response(response_state, &payload, model)?,
         "error" | "response.failed" => {
-            return Err(
-                io::Error::other(format!("OpenAI stream emitted {event_type}: {payload}")).into(),
-            );
+            return Err(ModelDriverError::Provider(format!(
+                "OpenAI stream emitted {event_type}: {payload}"
+            )));
         }
         _ => {}
     }
     Ok(())
 }
 
-fn response_identifier(payload: &Value) -> Option<&str> {
-    payload
-        .get("response")
-        .and_then(|response| response.get("id"))
-        .and_then(Value::as_str)
+fn complete_response(
+    response_state: &mut ResponseState,
+    payload: &Value,
+    model: &str,
+) -> Result<(), ModelDriverError> {
+    if response_state.completed {
+        return Err(ModelDriverError::InvalidResponse(
+            "response.completed was received more than once".to_owned(),
+        ));
+    }
+
+    if let Some(reasoning_text) = preferred_text(
+        &response_state.reasoning_text,
+        &response_state.completed_reasoning_text,
+    ) {
+        response_state.events.push(model_event(
+            reasoning_text,
+            "reasoning",
+            ModelEventImportance::Detailed,
+            model,
+        ));
+    }
+    if let Some(reasoning_summary) = preferred_text(
+        &response_state.reasoning_summary,
+        &response_state.completed_reasoning_summary,
+    ) {
+        response_state.events.push(model_event(
+            reasoning_summary,
+            "reasoning_summary",
+            ModelEventImportance::Interesting,
+            model,
+        ));
+    }
+
+    let assistant_text = preferred_text(
+        &response_state.assistant_text,
+        &response_state.completed_assistant_text,
+    )
+    .or_else(|| completed_response_text(payload))
+    .ok_or_else(|| {
+        ModelDriverError::InvalidResponse(
+            "the completed response contained no model message".to_owned(),
+        )
+    })?;
+    response_state.events.push(model_event(
+        assistant_text,
+        "response",
+        ModelEventImportance::Important,
+        model,
+    ));
+    response_state.completed = true;
+    Ok(())
 }
 
-pub(crate) fn completed_response_text(payload: &Value) -> Option<String> {
+fn model_event(
+    message: String,
+    subtype: &str,
+    importance: ModelEventImportance,
+    model: &str,
+) -> ConversationEvent {
+    let mut data = Map::new();
+    data.insert("provider".to_owned(), Value::String("openai".to_owned()));
+    data.insert("model".to_owned(), Value::String(model.to_owned()));
+    ConversationEvent::Model {
+        event: ModelEvent {
+            message,
+            subtype: subtype.to_owned(),
+            importance,
+            data,
+        },
+    }
+}
+
+fn append_delta(payload: &Value, text: &mut String) {
+    if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+        text.push_str(delta);
+    }
+}
+
+fn text_field(payload: &Value, field: &str) -> Option<String> {
+    payload
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn preferred_text(streamed_text: &str, completed_text: &Option<String>) -> Option<String> {
+    if streamed_text.is_empty() {
+        completed_text.clone()
+    } else {
+        Some(streamed_text.to_owned())
+    }
+}
+
+fn completed_response_text(payload: &Value) -> Option<String> {
     let output = payload.get("response")?.get("output")?.as_array()?;
     let mut text = String::new();
     for output_item in output {
@@ -265,46 +330,19 @@ pub(crate) fn completed_response_text(payload: &Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-#[derive(Debug)]
-pub(crate) struct OpenAiResponseError {
-    status: StatusCode,
-    body: String,
-}
-
-impl OpenAiResponseError {
-    pub(crate) fn permits_local_reconstruction(&self) -> bool {
-        matches!(self.status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND)
-    }
-}
-
-impl Display for OpenAiResponseError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "OpenAI Responses request failed with {}: {}",
-            self.status, self.body
-        )
-    }
-}
-
-impl Error for OpenAiResponseError {}
-
-pub(crate) fn semantic_input(messages: impl Iterator<Item = (String, String)>) -> Value {
-    Value::Array(
-        messages
-            .map(|(role, content)| json!({ "role": role, "content": content }))
-            .collect(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
 
-    use super::parse_server_sent_events;
+    use reqwest::StatusCode;
+
+    use crate::conversation::{ConversationEvent, ModelEventImportance};
+    use crate::model_driver::ModelDriverError;
+
+    use super::{classify_response_error, parse_server_sent_events};
 
     #[test]
-    fn streaming_events_are_persisted_before_projection() {
+    fn streaming_response_returns_important_model_event() {
         let stream = concat!(
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n",
@@ -312,40 +350,77 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
             "data: [DONE]\n\n"
         );
-        let mut persisted_types = Vec::new();
 
-        let output = parse_server_sent_events(Cursor::new(stream), |event_type, _| {
-            persisted_types.push(event_type);
-            Ok(crate::agent_run::AgentRunEventId::new())
-        })
-        .expect("the response stream should parse");
+        let events = parse_server_sent_events(Cursor::new(stream), "gpt-test")
+            .expect("the response stream should parse");
 
-        assert_eq!(output.response_id, "resp_1");
-        assert_eq!(output.assistant_text, "Hello");
+        let ConversationEvent::Model { event } = &events[0] else {
+            panic!("the returned event should be a model event");
+        };
+        assert_eq!(event.message, "Hello");
+        assert_eq!(event.subtype, "response");
+        assert_eq!(event.importance, ModelEventImportance::Important);
+        assert_eq!(event.data["model"], "gpt-test");
+    }
+
+    #[test]
+    fn exposed_reasoning_is_aggregated_by_importance() {
+        let stream = concat!(
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"Detailed \"}\n\n",
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"thought\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Summary\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Answer\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+        );
+
+        let events = parse_server_sent_events(Cursor::new(stream), "gpt-test")
+            .expect("the response stream should parse");
+
+        assert_eq!(events.len(), 3);
+        let importances = events.iter().map(|event| match event {
+            ConversationEvent::Model { event } => event.importance,
+            ConversationEvent::User { .. } => panic!("the driver should return model events"),
+        });
         assert_eq!(
-            persisted_types,
+            importances.collect::<Vec<_>>(),
             [
-                "response.created",
-                "response.output_text.delta",
-                "response.output_text.delta",
-                "response.completed"
+                ModelEventImportance::Detailed,
+                ModelEventImportance::Interesting,
+                ModelEventImportance::Important
             ]
         );
     }
 
     #[test]
-    fn refusal_is_projected_as_assistant_text() {
+    fn a_late_stream_failure_discards_model_events() {
         let stream = concat!(
-            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
-            "data: {\"type\":\"response.refusal.delta\",\"delta\":\"I cannot\"}\n\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+            "data: {\"type\":\"error\",\"message\":\"late failure\"}\n\n"
         );
 
-        let output = parse_server_sent_events(Cursor::new(stream), |_, _| {
-            Ok(crate::agent_run::AgentRunEventId::new())
-        })
-        .expect("the refusal stream should parse");
+        let result = parse_server_sent_events(Cursor::new(stream), "gpt-test");
 
-        assert_eq!(output.assistant_text, "I cannot");
+        assert!(matches!(result, Err(ModelDriverError::Provider(_))));
+    }
+
+    #[test]
+    fn response_statuses_map_to_typed_driver_errors() {
+        assert!(matches!(
+            classify_response_error(StatusCode::UNAUTHORIZED, "unauthorized".to_owned()),
+            ModelDriverError::Authentication(_)
+        ));
+        assert!(matches!(
+            classify_response_error(StatusCode::TOO_MANY_REQUESTS, "slow down".to_owned()),
+            ModelDriverError::RateLimited(_)
+        ));
+        assert!(matches!(
+            classify_response_error(StatusCode::BAD_REQUEST, "bad request".to_owned()),
+            ModelDriverError::InvalidRequest(_)
+        ));
+        assert!(matches!(
+            classify_response_error(StatusCode::INTERNAL_SERVER_ERROR, "failed".to_owned()),
+            ModelDriverError::Provider(_)
+        ));
     }
 }

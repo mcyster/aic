@@ -19,6 +19,7 @@ The root [`AGENTS.md`](../AGENTS.md) translates these standards into concise ins
 - Normalize external input at the boundary and represent validated values with dedicated types.
 - Represent absence with `Option` and recoverable failure with `Result`.
 - Keep public interfaces minimal.
+- Keep provider-neutral contracts independent of concrete integrations; integrations depend on contracts, never the reverse.
 - Prefer concrete implementations until multiple implementations create a demonstrated need for abstraction.
 - Do not use unsafe Rust.
 - Add dependencies only when they provide clear value over the standard library.

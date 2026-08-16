@@ -134,9 +134,9 @@ For example:
 
 ```
 conversation/
-model/
-  openai/
-  anthropic/
+model_driver.rs
+openai.rs
+anthropic.rs
 ```
 
 Conversation defines the model independent language of the application.
@@ -144,6 +144,16 @@ Conversation defines the model independent language of the application.
 Provider integrations translate between provider representations and that common language.
 
 Do not let the first provider implementation define the core domain model by accident.
+
+Follow dependency direction when deciding module ownership:
+
+```text
+openai -> model_driver
+anthropic -> model_driver
+model_driver -/-> openai
+```
+
+A concrete type implementing a neutral trait does not make that integration a child of the neutral module. Do not nest or re export a concrete provider from the contract module merely because it implements the contract. A neutral module must remain usable without knowing which concrete integrations exist.
 
 Provider specific data may be retained when necessary, but it should not distort the common domain abstraction.
 

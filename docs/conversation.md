@@ -2,7 +2,7 @@
 
 The conversation is `tog`'s durable semantic history. It records what happened in a conversation without exposing the provider protocol or the mechanics used to invoke a model.
 
-The [Conversation and ModelDriver Architecture](conversation-design.md) supersedes the earlier detailed version of this document. It is authoritative for ModelDriver runs, provider events, projection mechanics, replay strategies, and Phase 1 implementation boundaries. This document summarizes the conversation concepts that should remain stable across those details.
+The [Conversation and ModelDriver Architecture](conversation-design.md) is authoritative for model invocation, provider events, replay strategies, and Phase 1 implementation boundaries. This document summarizes the conversation concepts that should remain stable across those details.
 
 ## Conversation
 
@@ -45,11 +45,9 @@ The intended semantic vocabulary is:
 
 ```text
 User
-ModelNote
+Model
 ToolRequest
 ToolResponse
-AssistantResponse
-ModelSpecific
 Context
 Automation
 Data
@@ -66,13 +64,13 @@ The vocabulary should grow only when a repeated semantic need justifies another 
 
 Large or binary content belongs in a content store and is referenced by a strongly typed durable ID. Conversation events should not embed large payloads directly.
 
-### ModelNote
+### Model
 
-`ModelNote` records model-produced information that is semantically useful but is not the final response. It must not become a copy of every provider event. Whether a note is visible to the user is a presentation decision.
+`Model` records a model-produced event with a message, a driver-defined subtype, importance, and an open object of driver-defined data. Model events are polymorphic without making provider-specific fields part of the universal conversation vocabulary.
 
-### AssistantResponse
+Importance has three ordered levels: `Detailed`, `Interesting`, and `Important`. The producing driver classifies the event; consumers decide which messages to present. The CLI maps low, medium, and high verbosity to progressively broader importance levels.
 
-`AssistantResponse` records the semantic response produced by a model invocation. It is distinct from lower-level output deltas, reasoning events, usage, and lifecycle events.
+Exposed chain-of-thought is aggregated into coherent model events rather than persisting every transport delta. Detailed reasoning is normally `Detailed`, reasoning summaries may be `Interesting`, and final responses are `Important`.
 
 For example, several provider events may project to one response:
 
@@ -80,7 +78,7 @@ For example, several provider events may project to one response:
 text.delta "Hel"
 text.delta "lo"
 output.done
-    -> AssistantResponse("Hello")
+    -> Model(message="Hello", importance=Important)
 ```
 
 ### ToolRequest And ToolResponse
@@ -103,10 +101,6 @@ These events record semantic facts. They do not prescribe whether tools run sequ
 
 `Data` records durable machine-readable metadata such as external IDs, usage summaries, annotations, tags, or diagnostics. It is not model input by default.
 
-### ModelSpecific
-
-`ModelSpecific` is a limited escape hatch for provider-specific information that is semantically useful at the conversation level but does not justify a universal event type. Raw provider protocol events still belong outside the Conversation Log.
-
 ### Error
 
 `Error` records a failure that is semantically relevant to the conversation. It should contain useful conversation-level information without exposing all provider or runtime diagnostics.
@@ -118,8 +112,6 @@ Durable entities and references use strongly typed UUIDv7 identifiers. Distinct 
 ```text
 ConversationId
 ConversationEventId
-ModelDriverRunId
-ModelDriverRunEventId
 ToolCallId
 ImageId
 FileId
@@ -136,11 +128,11 @@ Event positions must not be used as semantic identifiers.
 
 ## Durability And Projection
 
-Events are appended as they happen. A later model or tool failure does not roll back facts that are already durable. For example, a `User` event remains in the conversation if the following model invocation fails.
+User input is appended before model invocation. A failed invocation therefore retains the `User` event but does not persist partial model output.
 
-Conversation events derived from ModelDriver run history retain stable projection provenance. This makes projection reproducible and idempotent: recovery can derive a missing semantic event again without duplicating one that was already stored.
+The `ModelDriver` receives an immutable view of these events and returns zero or more new `ConversationEvent`s. The caller appends returned events in order after a successful invocation.
 
-Provider continuation and semantic replay are separate concerns. Provider-native state may improve same-provider continuation, but the Conversation Log remains the durable semantic representation used for local reconstruction and cross-provider replay.
+Provider-native state may later improve same-provider continuation, but the Conversation Log remains the durable representation used for local reconstruction and cross-provider replay.
 
 ## System Boundary
 

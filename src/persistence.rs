@@ -8,12 +8,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-use crate::agent_run::{AgentRun, AgentRunEvent, AgentRunEventId, AgentRunId, StoredAgentRunEvent};
 use crate::conversation::{
     Conversation, ConversationEvent, ConversationEventId, ConversationId, StoredConversationEvent,
 };
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 3;
 
 pub(crate) struct EventStore {
     root_directory: PathBuf,
@@ -40,7 +39,6 @@ impl EventStore {
     pub(crate) fn new(root_directory: PathBuf) -> io::Result<Self> {
         create_private_directory(&root_directory)?;
         create_private_directory(&root_directory.join("conversations"))?;
-        create_private_directory(&root_directory.join("agent-runs"))?;
         Ok(Self { root_directory })
     }
 
@@ -76,18 +74,6 @@ impl EventStore {
         event: ConversationEvent,
     ) -> io::Result<StoredConversationEvent> {
         let existing_events = self.load_conversation_events(conversation_id)?;
-        if let Some((event_kind, projection_identity)) = event.projection_identity()
-            && let Some(existing_event) = existing_events.iter().find(|stored_event| {
-                stored_event.event.projection_identity().is_some_and(
-                    |(existing_kind, existing_identity)| {
-                        existing_kind == event_kind && existing_identity == projection_identity
-                    },
-                )
-            })
-        {
-            return Ok(existing_event.clone());
-        }
-
         let stored_event = StoredConversationEvent {
             position: next_position(existing_events.last().map(|event| event.position))?,
             id: ConversationEventId::new(),
@@ -118,93 +104,10 @@ impl EventStore {
         Ok(events)
     }
 
-    pub(crate) fn create_agent_run(&self, conversation_id: ConversationId) -> io::Result<AgentRun> {
-        let agent_run = AgentRun {
-            id: AgentRunId::new(),
-            conversation_id,
-            created_at_milliseconds: current_timestamp_milliseconds()?,
-        };
-        let agent_run_directory = self.agent_run_directory(agent_run.id);
-        create_private_directory(&agent_run_directory)?;
-        create_private_directory(&agent_run_directory.join("events"))?;
-        write_json_atomically(&agent_run_directory.join("agent-run.json"), &agent_run)?;
-        Ok(agent_run)
-    }
-
-    pub(crate) fn append_agent_run_event(
-        &self,
-        agent_run_id: AgentRunId,
-        event: AgentRunEvent,
-    ) -> io::Result<StoredAgentRunEvent> {
-        let existing_events = self.load_agent_run_events(agent_run_id)?;
-        let stored_event = StoredAgentRunEvent {
-            position: next_position(existing_events.last().map(|event| event.position))?,
-            id: AgentRunEventId::new(),
-            timestamp_milliseconds: current_timestamp_milliseconds()?,
-            schema_version: SCHEMA_VERSION,
-            event,
-        };
-        let events_directory = self.agent_run_directory(agent_run_id).join("events");
-        write_json_atomically(
-            &event_path(
-                &events_directory,
-                stored_event.position,
-                &stored_event.id.storage_key(),
-            ),
-            &stored_event,
-        )?;
-        Ok(stored_event)
-    }
-
-    pub(crate) fn load_agent_run_events(
-        &self,
-        agent_run_id: AgentRunId,
-    ) -> io::Result<Vec<StoredAgentRunEvent>> {
-        let mut events =
-            read_json_directory(&self.agent_run_directory(agent_run_id).join("events"))?;
-        events.sort_by_key(|event: &StoredAgentRunEvent| event.position);
-        validate_positions(events.iter().map(|event| event.position))?;
-        Ok(events)
-    }
-
-    pub(crate) fn load_agent_runs(
-        &self,
-        conversation_id: ConversationId,
-    ) -> io::Result<Vec<AgentRun>> {
-        let mut agent_runs = Vec::new();
-        for directory_entry in fs::read_dir(self.root_directory.join("agent-runs"))? {
-            let directory_entry = directory_entry?;
-            if !directory_entry.file_type()?.is_dir() {
-                continue;
-            }
-            let metadata_path = directory_entry.path().join("agent-run.json");
-            if !metadata_path.exists() {
-                continue;
-            }
-            let agent_run: AgentRun = read_json(&metadata_path)?;
-            if agent_run.conversation_id == conversation_id {
-                agent_runs.push(agent_run);
-            }
-        }
-        agent_runs.sort_by_key(|agent_run| {
-            (
-                agent_run.created_at_milliseconds,
-                agent_run.id.storage_key(),
-            )
-        });
-        Ok(agent_runs)
-    }
-
     fn conversation_directory(&self, conversation_id: ConversationId) -> PathBuf {
         self.root_directory
             .join("conversations")
             .join(conversation_id.storage_key())
-    }
-
-    fn agent_run_directory(&self, agent_run_id: AgentRunId) -> PathBuf {
-        self.root_directory
-            .join("agent-runs")
-            .join(agent_run_id.storage_key())
     }
 }
 
@@ -286,8 +189,7 @@ fn validate_positions(positions: impl Iterator<Item = u64>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::EventStore;
-    use crate::agent_run::AgentRunEvent;
-    use crate::conversation::{ConversationEvent, ProjectionIdentity};
+    use crate::conversation::{ConversationEvent, UserContent};
 
     fn temporary_store() -> EventStore {
         let directory = std::env::temp_dir().join(format!("tog-test-{}", uuid::Uuid::now_v7()));
@@ -304,16 +206,16 @@ mod tests {
         store
             .append_conversation_event(
                 conversation.id,
-                ConversationEvent::UserPrompt {
-                    text: "first".to_owned(),
+                ConversationEvent::User {
+                    content: vec![UserContent::Text("first".to_owned())],
                 },
             )
             .expect("the first event should be persisted");
         store
             .append_conversation_event(
                 conversation.id,
-                ConversationEvent::UserPrompt {
-                    text: "second".to_owned(),
+                ConversationEvent::User {
+                    content: vec![UserContent::Text("second".to_owned())],
                 },
             )
             .expect("the second event should be persisted");
@@ -323,48 +225,5 @@ mod tests {
             .expect("the events should load");
         assert_eq!(events[0].position, 0);
         assert_eq!(events[1].position, 1);
-    }
-
-    #[test]
-    fn semantic_projection_is_idempotent() {
-        let store = temporary_store();
-        let conversation = store
-            .create_conversation()
-            .expect("the conversation should be created");
-        let agent_run = store
-            .create_agent_run(conversation.id)
-            .expect("the agent run should be created");
-        let source_event = store
-            .append_agent_run_event(
-                agent_run.id,
-                AgentRunEvent::RunCompleted {
-                    response_id: "resp_test".to_owned(),
-                },
-            )
-            .expect("the source event should be persisted");
-        let assistant_event = ConversationEvent::AssistantResponse {
-            text: "hello".to_owned(),
-            projection: ProjectionIdentity {
-                source_run_id: agent_run.id,
-                source_run_event_id: source_event.id,
-                output_index: 0,
-            },
-        };
-
-        let first = store
-            .append_conversation_event(conversation.id, assistant_event.clone())
-            .expect("the first projection should be persisted");
-        let second = store
-            .append_conversation_event(conversation.id, assistant_event)
-            .expect("the repeated projection should resolve");
-
-        assert_eq!(first.id, second.id);
-        assert_eq!(
-            store
-                .load_conversation_events(conversation.id)
-                .expect("the events should load")
-                .len(),
-            1
-        );
     }
 }

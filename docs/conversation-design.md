@@ -1,6 +1,6 @@
 # Conversation and ModelDriver Architecture
 
-**Status:** Phase 1 design  
+**Status:** Phase 1 text milestone implemented
 **Purpose:** Define a simple, durable conversation model and a narrow `ModelDriver` boundary that can be implemented against the OpenAI Responses API now and can support switching models/providers within a conversation.
 
 This design is intentionally incomplete.
@@ -100,11 +100,9 @@ Conceptually:
 ```rust
 enum ConversationEvent {
     User(...),
-    ModelNote(...),
+    Model(ModelEvent),
     ToolRequest(...),
     ToolResponse(...),
-    AssistantResponse(...),
-    ModelSpecific(...),
     Context(...),
     Automation(...),
     Data(...),
@@ -290,21 +288,34 @@ A failed model invocation never removes the already-durable `User` event.
 
 ---
 
-## 9. ModelNote
+## 9. ModelEvent
 
-`ModelNote` records model-produced information that is semantically useful to the conversation but is not the final assistant response.
+`ModelEvent` records model-produced semantic information. It has a required message, a driver-defined subtype, an importance level, and an open object of driver-defined data.
 
-It can support user-facing or model-relevant notes when useful.
+The durable common shape is:
 
-It must not become a copy of every provider transport event.
+```rust
+struct ModelEvent {
+    message: String,
+    subtype: String,
+    importance: ModelEventImportance,
+    data: Map<String, Value>,
+}
 
-Whether a note is displayed is a presentation decision.
+enum ModelEventImportance {
+    Detailed,
+    Interesting,
+    Important,
+}
+```
+
+The subtype and data make model events polymorphic without requiring the conversation model to know every provider-specific field. The message remains the portable cross-driver representation.
 
 ---
 
-## 10. AssistantResponse
+## 10. Reasoning and responses
 
-`AssistantResponse` records the semantic assistant response produced by an invocation.
+Exposed chain-of-thought and final responses are both model events. A driver aggregates provider deltas into coherent messages before returning them.
 
 Provider transport may involve many low-level events:
 
@@ -314,13 +325,13 @@ text.delta "lo"
 output.done
 ```
 
-but the semantic conversation records:
+but the semantic conversation may record:
 
 ```text
-AssistantResponse("Hello")
+Model(message="Hello", subtype="response", importance=Important)
 ```
 
-A ModelDriver may internally use streaming to construct or emit the response, but another ModelDriver does not need to understand that provider's streaming protocol.
+A driver may classify detailed reasoning as `Detailed`, a reasoning summary as `Interesting`, and a final response as `Important`. Consumers such as the CLI choose which messages to present. Another ModelDriver does not need to understand the producing driver's streaming protocol or custom data.
 
 ---
 
@@ -447,15 +458,15 @@ Data is not model input by default.
 
 ---
 
-## 17. ModelSpecific
+## 17. Model-specific data
 
-`ModelSpecific` is a deliberate semantic escape hatch.
+The open `data` object on `ModelEvent` is a deliberate semantic escape hatch.
 
-It represents model/provider-specific information that is useful enough to retain in the semantic conversation but does not yet justify a universal event type.
+It retains model/provider-specific information that is useful enough for the semantic conversation but does not justify a universal field.
 
 It should remain relatively rare.
 
-This lets a ModelDriver preserve something genuinely useful without forcing the conversation model to predict every future provider capability.
+This lets a ModelDriver preserve something genuinely useful without forcing the conversation model to predict every future provider capability. Cross-driver replay must continue to work from the model-event message when custom data is not understood.
 
 Raw provider protocol events still belong in tracing/diagnostics rather than the semantic Conversation Log.
 
@@ -469,15 +480,12 @@ A failed invocation may therefore leave:
 
 ```text
 User(...)
-ModelNote(...)
-ToolRequest(...)
-ToolResponse(...)
 Error(...)
 ```
 
-depending on what happened before the failure.
+if the caller chooses to append a semantic error event. Partial model output is not returned or persisted.
 
-Events that have already been appended are not rolled back.
+Events that were already durable before invocation are not rolled back.
 
 The Error event should contain useful conversation-level information without exposing every provider/runtime diagnostic.
 
@@ -521,7 +529,7 @@ A second driver should be allowed to reshape the abstraction.
 
 ## 20. Cross-driver semantic contract
 
-Every ModelDriver must be able to invoke using only the semantic conversation state supplied in `ModelDriverInput`.
+Every ModelDriver must be able to invoke using only the supplied semantic conversation events.
 
 This is the central portability rule.
 
@@ -529,9 +537,9 @@ For example:
 
 ```text
 User
-OpenAI AssistantResponse
+OpenAI ModelEvent
 User
-Anthropic AssistantResponse
+Anthropic ModelEvent
 ToolRequest
 ToolResponse
 User
@@ -548,27 +556,12 @@ Correctness and model switching are based on semantic ConversationEvents.
 
 ---
 
-## 21. ModelDriverInput
+## 21. ModelDriver input
 
-`ModelDriverInput` is an immutable invocation snapshot.
-
-Conceptually:
+The driver receives an immutable borrowed slice of conversation events:
 
 ```rust
-struct ModelDriverInput {
-    conversation_id: ConversationId,
-    conversation: ConversationSnapshot,
-    model: ModelId,
-    config: ModelConfig,
-}
-```
-
-The precise fields should emerge from implementation.
-
-Passing:
-
-```rust
-&ModelDriverInput
+&[ConversationEvent]
 ```
 
 means the driver cannot mutate ordinary owned data through that reference.
@@ -584,42 +577,36 @@ RefCell
 Atomic*
 ```
 
-can still mutate behind `&T`, so input snapshots should avoid them unless there is a demonstrated need.
+can still mutate behind a shared reference, so conversation events should avoid them unless there is a demonstrated need.
 
 The intended contract is:
 
-> A ModelDriver receives an immutable semantic snapshot and produces new facts rather than mutating historical conversation state.
-
-A `conversation_id` is an identity reference, not mutable access to the stored conversation.
+> A ModelDriver receives immutable semantic history and returns new facts rather than mutating historical conversation state.
 
 ---
 
 ## 22. ModelDriver invocation
 
-The exact `invoke` shape is intentionally still under iteration.
-
-A useful starting point is:
+The Phase 1 text implementation uses:
 
 ```rust
 trait ModelDriver {
-    async fn invoke(
+    fn model(&self) -> &ModelId;
+
+    fn invoke(
         &self,
-        input: &ModelDriverInput,
-        events: &mut ConversationEventSink,
-    ) -> Result<ModelDriverResult, ModelDriverError>;
+        conversation: &[ConversationEvent],
+    ) -> Result<Vec<ConversationEvent>, ModelDriverError>;
 }
 ```
-
-The exact event-emission mechanism may be a callback, sink, stream, iterator, channel, or another idiomatic Rust shape.
 
 The important Phase 1 properties are:
 
 - one call represents one model invocation
 - input is immutable
-- semantic conversation events may be emitted incrementally
-- emitted events can be appended immediately
+- the driver owns and exposes its configured model
+- successful invocation returns zero or more semantic conversation events
 - the caller owns the outer model/tool loop
-- success is strongly typed
 - expected failures are strongly typed
 - provider SDK types do not cross the boundary
 
@@ -627,11 +614,11 @@ We expect to iterate directly on this interface during implementation.
 
 ---
 
-## 23. Immediate event persistence
+## 23. Returned event persistence
 
-Semantic events are appended as they happen.
+User input is appended before model invocation. Events returned by a successful invocation are appended in return order.
 
-A ModelDriver invocation is not a transaction whose partial output disappears if `invoke()` later returns `Err`.
+Provider streaming remains internal to the driver. If invocation fails before returning, partial model output is discarded.
 
 Conceptually:
 
@@ -640,70 +627,41 @@ User already durable
     ↓
 invoke ModelDriver
     ↓
-ModelNote appended
+failure
+    → User remains durable
+    → no model events appended
+
+or
+
+invoke ModelDriver
     ↓
-ToolRequest appended
+Vec<ConversationEvent>
     ↓
-later provider failure
-    ↓
-Error appended
-    ↓
-invoke returns Err
+append returned events in order
 ```
 
-`Result` communicates the outcome of the operation.
-
-It does not define a rollback boundary for conversation history.
-
-This preserves the existing useful guarantee that a failed turn still participates in future reconstruction.
+This deliberately favors a small understandable boundary over partial model-output recovery. An incremental mechanism may be introduced later if a concrete requirement justifies it.
 
 ---
 
-## 24. ModelDriverResult
+## 24. ModelDriver result
 
-Do not use:
-
-```rust
-Result<()>
-```
-
-as the public invocation contract.
-
-The caller should receive a strongly typed result that tells it how the invocation ended at the control-flow level.
-
-Conceptually:
+Successful invocation directly returns semantic facts:
 
 ```rust
-struct ModelDriverResult {
-    status: ModelDriverStatus,
-}
+Vec<ConversationEvent>
 ```
 
-with a small implementation-driven vocabulary, perhaps:
-
-```rust
-enum ModelDriverStatus {
-    Completed,
-    NeedsCallerAction,
-}
-```
-
-The exact variants should be driven by actual OpenAI behavior.
-
-The result should not duplicate detailed semantic facts already represented by ConversationEvents.
-
-For example, tool requests remain events rather than being copied wholesale into `ModelDriverResult`.
-
-The result exists so the caller knows how to react without understanding provider details.
+This supports reasoning, final messages, and future multiple tool requests without a parallel result vocabulary. The caller derives control flow from returned events where needed.
 
 ---
 
-## 25. ModelDriverError
+## 25. ModelDriver errors
 
-Expected invocation failures are explicit in the function type:
+Expected model failures are explicit in the function type:
 
 ```rust
-Result<ModelDriverResult, ModelDriverError>
+Result<Vec<ConversationEvent>, ModelDriverError>
 ```
 
 A small error model might begin with:
@@ -715,17 +673,18 @@ enum ModelDriverError {
     Transport(...),
     InvalidRequest(...),
     Provider(...),
-    Persistence(...),
 }
 ```
 
 The exact taxonomy should remain small and implementation-driven.
 
+These errors are returned as values. ModelDriver does not decide whether they are written to standard error, sent to a remote logger, retried, or otherwise reported.
+
 Rust does not use Java-style checked exceptions or `throws` declarations.
 
 Expected operational failures are represented through `Result<T, E>`.
 
-Unexpected programming failures may panic, but transport, provider, validation, persistence, and similar failures should normally be represented by `ModelDriverError`.
+Unexpected programming failures may panic, but transport, provider, validation, and similar model failures should normally be represented by `ModelDriverError`. Conversation persistence errors belong to the caller.
 
 ---
 
@@ -763,9 +722,9 @@ For example:
 
 ```text
 User
-AssistantResponse produced by OpenAI
+ModelEvent produced by OpenAI
 User
-AssistantResponse produced by another ModelDriver
+ModelEvent produced by another ModelDriver
 User
 ...
 ```
@@ -944,8 +903,9 @@ Support enough to exercise the semantic architecture:
 basic text input/output
 Responses API invocation
 streaming response consumption
-AssistantResponse
-ModelNote where useful
+polymorphic ModelEvents
+aggregated exposed reasoning
+event importance
 function/tool requests
 tool responses
 multiple tool requests
@@ -1051,8 +1011,8 @@ At a high level, an implementation should need to:
 1. translate semantic conversation to provider input
 2. call the provider
 3. interpret provider output
-4. emit semantic ConversationEvents
-5. return a typed outcome/error
+4. return semantic ConversationEvents or a typed error
+5. expose its configured model
 6. optionally emit useful traces
 ```
 
@@ -1255,9 +1215,9 @@ model/provider switching within a conversation
 
 a narrow explicit ModelDriver abstraction
 
-immutable ModelDriverInput snapshots
+immutable ConversationEvent input
 
-strongly typed ModelDriverResult and ModelDriverError
+strongly typed ModelDriverError
 
 strongly typed UUIDv7 identities
 
@@ -1269,7 +1229,7 @@ multiple tool requests without batching policy
 
 typed external references for images/files/blobs
 
-immediate semantic event append
+ordered persistence of successfully returned events
 
 caller-owned orchestration loop
 
@@ -1307,6 +1267,8 @@ These may become useful later, but they should not burden the first ModelDriver 
 
 ## 46. First implementation milestone
 
+The basic text milestone described below is implemented. Tool use, semantic error events, content references, and provider tracing remain follow-up work.
+
 The first coherent implementation should prove:
 
 ```text
@@ -1314,17 +1276,17 @@ CreateConversation
 
 append User("hello")
 
-construct immutable ModelDriverInput from Conversation
+load immutable ConversationEvent history
 
 invoke OpenAiModelDriver
 
 consume OpenAI Responses stream internally
 
-emit AssistantResponse
+return Vec<ConversationEvent>
 
-append AssistantResponse immediately
+append returned ModelEvents in order
 
-return typed ModelDriverResult
+print messages selected by CLI verbosity
 
 reload Conversation
 

@@ -1,35 +1,35 @@
 use serde::{Deserialize, Serialize};
-
-use crate::agent_run::{AgentRunEventId, AgentRunId};
+use serde_json::{Map, Value};
 
 use super::ConversationEventId;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ConversationEvent {
-    UserPrompt {
-        text: String,
-    },
-    AssistantResponse {
-        text: String,
-        projection: ProjectionIdentity,
-    },
+    User { content: Vec<UserContent> },
+    Model { event: ModelEvent },
 }
 
-impl ConversationEvent {
-    pub(crate) fn projection_identity(&self) -> Option<(&'static str, ProjectionIdentity)> {
-        match self {
-            Self::UserPrompt { .. } => None,
-            Self::AssistantResponse { projection, .. } => Some(("assistant", *projection)),
-        }
-    }
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ModelEvent {
+    pub(crate) message: String,
+    pub(crate) subtype: String,
+    pub(crate) importance: ModelEventImportance,
+    pub(crate) data: Map<String, Value>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct ProjectionIdentity {
-    pub(crate) source_run_id: AgentRunId,
-    pub(crate) source_run_event_id: AgentRunEventId,
-    pub(crate) output_index: u32,
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ModelEventImportance {
+    Detailed,
+    Interesting,
+    Important,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub(crate) enum UserContent {
+    Text(String),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

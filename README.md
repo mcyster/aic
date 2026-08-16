@@ -34,7 +34,7 @@ Start a conversation without installing the binary:
 cargo run -- "Explain ownership in Rust"
 ```
 
-The command writes progress and the conversation ID to standard error. It writes the assistant response to standard output after OpenAI completes the response. Continue the conversation with that ID:
+The command writes progress and the conversation ID to standard error. After OpenAI completes, it writes model-event messages admitted by the selected verbosity to standard output. Continue the conversation with that ID:
 
 ```console
 cargo run -- --conversation conversation_019... "Show an example"
@@ -46,7 +46,7 @@ The default model is `gpt-5.6`. Select another OpenAI model with `--model`:
 cargo run -- --model MODEL_NAME "Explain ownership in Rust"
 ```
 
-Response verbosity defaults to `low` for concise CLI turns. Select `low`, `medium`, or `high` with `--verbosity`:
+CLI verbosity defaults to `low`. Model events classify their messages as detailed, interesting, or important. Select `low`, `medium`, or `high` to print progressively more of those messages:
 
 ```console
 cargo run -- --verbosity medium "Explain ownership in Rust"
@@ -76,11 +76,13 @@ Outside the development environment, place the binary in a directory on your `PA
 
 ## Data
 
-Conversations and parsed provider events are stored in the first available location:
+Semantic conversation events are stored in the first available location:
 
 1. `$TOG_DATA_DIR`
 2. `$XDG_DATA_HOME/tog`
 3. `$HOME/.local/share/tog`
+
+The current semantic event schema is a clean break from the earlier agent-run-based prototype. Existing prototype conversations are not migrated.
 
 ## Development
 
