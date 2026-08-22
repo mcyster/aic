@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::ConversationEventId;
+use super::{ConversationEventId, ConversationId};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -34,6 +34,7 @@ pub(crate) enum UserContent {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct StoredConversationEvent {
+    pub(crate) conversation_id: ConversationId,
     pub(crate) position: u64,
     pub(crate) id: ConversationEventId,
     pub(crate) timestamp_milliseconds: u64,

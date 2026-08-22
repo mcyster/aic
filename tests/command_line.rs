@@ -195,9 +195,30 @@ fn turn_persists_events_and_prints_semantic_output() {
     );
     let standard_error =
         String::from_utf8(command_output.stderr.clone()).expect("standard error should be UTF-8");
-    assert!(reported_conversation_id(&command_output.stderr).starts_with("conversation_"));
+    let conversation_id = reported_conversation_id(&command_output.stderr);
+    assert!(conversation_id.starts_with("conversation_"));
     assert!(standard_error.contains("## waiting for model gpt-5.6\n"));
     assert!(!data_directory.join("agent-runs").exists());
+    let conversation_directory = data_directory
+        .join("conversations")
+        .join(conversation_id.trim_start_matches("conversation_"));
+    assert!(!conversation_directory.join("conversation.json").exists());
+    let first_event_path = fs::read_dir(conversation_directory.join("events"))
+        .expect("the persisted events should be readable")
+        .map(|entry| entry.expect("the event entry should be readable").path())
+        .min()
+        .expect("the conversation should contain an event");
+    let first_event: Value = serde_json::from_reader(
+        fs::File::open(first_event_path).expect("the persisted event should open"),
+    )
+    .expect("the persisted event should be JSON");
+    assert_eq!(
+        first_event["conversation_id"]
+            .as_str()
+            .expect("the event should carry its conversation identifier")
+            .replace('-', ""),
+        conversation_id.trim_start_matches("conversation_")
+    );
     let requests = server.finish();
     assert_eq!(requests[0]["model"], "gpt-5.6");
     assert_eq!(requests[0]["input"][0]["content"], "say hi");

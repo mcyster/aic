@@ -34,7 +34,7 @@ Conversation Log
     cross-model / cross-provider contract
 ```
 
-A `ModelDriver` consumes an immutable view of that conversation and produces semantic conversation events:
+A `ModelDriver` consumes an immutable reference to the reconstructed conversation and produces semantic conversation events:
 
 ```text
 Conversation
@@ -58,20 +58,18 @@ Later, concrete benefits may justify making some of that provider-specific infor
 
 ## 2. Conversation
 
-A conversation is a durable entity with an append-only stream of semantic `ConversationEvent`s.
+A conversation begins with its first semantic `ConversationEvent`. The durable event stream is authoritative; `Conversation` is an immutable in-memory projection reconstructed from it.
 
 Conceptually:
 
 ```rust
 struct Conversation {
     id: ConversationId,
-    created_at: DateTime<Utc>,
+    events: Vec<StoredConversationEvent>,
 }
 ```
 
-The event stream begins when something happens.
-
-Phase 1 does not require conversation creation itself to be event zero.
+There is no independently persisted conversation record and no empty persisted conversation. Construction validates that the sequence contains at least one event, all events carry the same `ConversationId`, and positions form a valid order. The projection exposes read-only access to its ID and events.
 
 The Conversation Log answers:
 
@@ -121,7 +119,6 @@ OpenAI Responses events such as `response.created`, text deltas, and function ar
 Commands represent intent:
 
 ```text
-CreateConversation
 PostUserInput
 InvokeModelDriver
 ExecuteTool
@@ -194,6 +191,7 @@ Each stored conversation event has a monotonically increasing position:
 
 ```rust
 struct StoredConversationEvent {
+    conversation_id: ConversationId,
     position: u64,
     id: ConversationEventId,
     timestamp: DateTime<Utc>,
@@ -202,7 +200,8 @@ struct StoredConversationEvent {
 }
 ```
 
-- `id` gives stable identity
+- `conversation_id` identifies the conversation to which the event belongs
+- `id` gives stable event identity
 - `position` gives authoritative replay order
 - `timestamp` records observed wall-clock time
 - `schema_version` permits persisted-format evolution
@@ -529,7 +528,7 @@ A second driver should be allowed to reshape the abstraction.
 
 ## 20. Cross-driver semantic contract
 
-Every ModelDriver must be able to invoke using only the supplied semantic conversation events.
+Every ModelDriver must be able to invoke using only the supplied reconstructed `Conversation`.
 
 This is the central portability rule.
 
@@ -558,13 +557,13 @@ Correctness and model switching are based on semantic ConversationEvents.
 
 ## 21. ModelDriver input
 
-The driver receives an immutable borrowed slice of conversation events:
+The driver receives an immutable reference to a validated `Conversation`:
 
 ```rust
-&[ConversationEvent]
+&Conversation
 ```
 
-means the driver cannot mutate ordinary owned data through that reference.
+The projection provides read-only access to its ID and ordered stored events. The driver cannot mutate ordinary owned data through the shared reference, and `Conversation` provides no mutation methods.
 
 For normal Rust-owned values such as structs, enums, `String`, and `Vec`, that provides the desired deep immutability through the borrowed input.
 
@@ -595,7 +594,7 @@ trait ModelDriver {
 
     fn invoke(
         &self,
-        conversation: &[ConversationEvent],
+        conversation: &Conversation,
     ) -> Result<Vec<ConversationEvent>, ModelDriverError>;
 }
 ```
@@ -603,7 +602,7 @@ trait ModelDriver {
 The important Phase 1 properties are:
 
 - one call represents one model invocation
-- input is immutable
+- input is a complete immutable conversation reconstructed from stored events
 - the driver owns and exposes its configured model
 - successful invocation returns zero or more semantic conversation events
 - the caller owns the outer model/tool loop
@@ -1215,7 +1214,7 @@ model/provider switching within a conversation
 
 a narrow explicit ModelDriver abstraction
 
-immutable ConversationEvent input
+immutable Conversation input
 
 strongly typed ModelDriverError
 
@@ -1272,11 +1271,9 @@ The basic text milestone described below is implemented. Tool use, semantic erro
 The first coherent implementation should prove:
 
 ```text
-CreateConversation
+generate ConversationId and append User("hello") as the first event
 
-append User("hello")
-
-load immutable ConversationEvent history
+reconstruct immutable Conversation from stored events
 
 invoke OpenAiModelDriver
 

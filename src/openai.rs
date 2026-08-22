@@ -4,7 +4,9 @@ use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use serde_json::{Map, Value, json};
 
-use crate::conversation::{ConversationEvent, ModelEvent, ModelEventImportance, UserContent};
+use crate::conversation::{
+    Conversation, ConversationEvent, ModelEvent, ModelEventImportance, UserContent,
+};
 use crate::model_driver::{ModelDriver, ModelDriverError, ModelId};
 
 pub(crate) struct OpenAiModelDriver {
@@ -37,7 +39,7 @@ impl ModelDriver for OpenAiModelDriver {
 
     fn invoke(
         &self,
-        conversation: &[ConversationEvent],
+        conversation: &Conversation,
     ) -> Result<Vec<ConversationEvent>, ModelDriverError> {
         let mut request_body = Map::new();
         request_body.insert(
@@ -67,11 +69,12 @@ impl ModelDriver for OpenAiModelDriver {
     }
 }
 
-fn semantic_input(conversation: &[ConversationEvent]) -> Value {
+fn semantic_input(conversation: &Conversation) -> Value {
     Value::Array(
         conversation
+            .events()
             .iter()
-            .filter_map(|event| match event {
+            .filter_map(|stored_event| match &stored_event.event {
                 ConversationEvent::User { content } => {
                     let text = content
                         .iter()

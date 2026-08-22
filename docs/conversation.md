@@ -1,17 +1,17 @@
 # Conversation Model
 
-The conversation is `tog`'s durable semantic history. It records what happened in a conversation without exposing the provider protocol or the mechanics used to invoke a model.
+The Conversation Log is `tog`'s durable semantic history. It records what happened in a conversation without exposing the provider protocol or the mechanics used to invoke a model.
 
 The [Conversation and ModelDriver Architecture](conversation-design.md) is authoritative for model invocation, provider events, replay strategies, and Phase 1 implementation boundaries. This document summarizes the conversation concepts that should remain stable across those details.
 
 ## Conversation
 
-A conversation is a durable entity with an append-only stream of `ConversationEvent`s:
+A conversation begins with its first `ConversationEvent`. `Conversation` is an immutable in-memory projection reconstructed from the ordered events carrying one `ConversationId`:
 
 ```text
 Conversation
     id
-    created_at
+    events
 
 Conversation Log
     position 0: ConversationEvent
@@ -19,7 +19,7 @@ Conversation Log
     ...
 ```
 
-Conversation creation does not need to be an event unless creation itself becomes semantically meaningful. The event stream begins when something happens.
+There is no independently persisted conversation record and no empty persisted conversation. Construction rejects an empty event sequence, mixed conversation IDs, and invalid event order. The projection exposes read-only access to its ID and events.
 
 The Conversation Log answers:
 
@@ -141,6 +141,7 @@ FileId
 
 Each stored event also has a monotonically increasing stream position. Identity, order, and semantic relationships serve different purposes:
 
+- the conversation ID identifies the conversation to which the event belongs
 - the event ID provides stable identity
 - the position provides authoritative replay order within the conversation
 - the timestamp records observed wall-clock time but does not determine order
@@ -152,7 +153,7 @@ Event positions must not be used as semantic identifiers.
 
 User input is appended before model invocation. A failed invocation therefore retains the `User` event but does not persist partial model output.
 
-The `ModelDriver` receives an immutable view of these events and returns zero or more new `ConversationEvent`s. The caller appends returned events in order after a successful invocation.
+The `ModelDriver` receives an immutable reference to the reconstructed `Conversation` and returns zero or more new `ConversationEvent`s. The caller assigns persistence metadata and appends returned events in order after a successful invocation.
 
 Provider-native state may later improve same-provider continuation, but the Conversation Log remains the durable representation used for local reconstruction and cross-provider replay.
 

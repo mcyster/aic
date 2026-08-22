@@ -5,18 +5,93 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
-
 pub(crate) use event::{
     ConversationEvent, ModelEvent, ModelEventImportance, StoredConversationEvent, UserContent,
 };
 pub(crate) use id::{ConversationEventId, ConversationId};
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Conversation {
-    pub(crate) id: ConversationId,
-    pub(crate) created_at_milliseconds: u64,
+    id: ConversationId,
+    events: Vec<StoredConversationEvent>,
 }
+
+impl Conversation {
+    pub(crate) fn from_events(
+        events: Vec<StoredConversationEvent>,
+    ) -> Result<Self, InvalidConversation> {
+        let conversation_id = events
+            .first()
+            .map(|event| event.conversation_id)
+            .ok_or(InvalidConversation::Empty)?;
+
+        for (expected_position, event) in events.iter().enumerate() {
+            if event.conversation_id != conversation_id {
+                return Err(InvalidConversation::MixedConversationIds {
+                    expected: conversation_id,
+                    found: event.conversation_id,
+                });
+            }
+
+            let expected_position =
+                u64::try_from(expected_position).map_err(|_| InvalidConversation::TooManyEvents)?;
+            if event.position != expected_position {
+                return Err(InvalidConversation::InvalidPosition {
+                    expected: expected_position,
+                    found: event.position,
+                });
+            }
+        }
+
+        Ok(Self {
+            id: conversation_id,
+            events,
+        })
+    }
+
+    pub(crate) fn id(&self) -> ConversationId {
+        self.id
+    }
+
+    pub(crate) fn events(&self) -> &[StoredConversationEvent] {
+        &self.events
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum InvalidConversation {
+    Empty,
+    MixedConversationIds {
+        expected: ConversationId,
+        found: ConversationId,
+    },
+    InvalidPosition {
+        expected: u64,
+        found: u64,
+    },
+    TooManyEvents,
+}
+
+impl Display for InvalidConversation {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(formatter, "a conversation must contain at least one event"),
+            Self::MixedConversationIds { expected, found } => write!(
+                formatter,
+                "conversation event belongs to {found}, expected {expected}"
+            ),
+            Self::InvalidPosition { expected, found } => {
+                write!(
+                    formatter,
+                    "expected conversation event position {expected}, found {found}"
+                )
+            }
+            Self::TooManyEvents => write!(formatter, "conversation contains too many events"),
+        }
+    }
+}
+
+impl Error for InvalidConversation {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UserPrompt(String);
@@ -56,7 +131,84 @@ impl Error for InvalidUserPrompt {}
 mod tests {
     use std::str::FromStr;
 
-    use super::{InvalidUserPrompt, UserPrompt};
+    use super::{
+        Conversation, ConversationEvent, ConversationEventId, ConversationId, InvalidConversation,
+        InvalidUserPrompt, StoredConversationEvent, UserContent, UserPrompt,
+    };
+
+    fn stored_user_event(
+        conversation_id: ConversationId,
+        position: u64,
+    ) -> StoredConversationEvent {
+        StoredConversationEvent {
+            conversation_id,
+            position,
+            id: ConversationEventId::new(),
+            timestamp_milliseconds: position,
+            schema_version: 4,
+            event: ConversationEvent::User {
+                content: vec![UserContent::Text(format!("event {position}"))],
+            },
+        }
+    }
+
+    #[test]
+    fn conversation_requires_an_event() {
+        assert_eq!(
+            Conversation::from_events(Vec::new()),
+            Err(InvalidConversation::Empty)
+        );
+    }
+
+    #[test]
+    fn conversation_rejects_mixed_conversation_ids() {
+        let first_conversation_id = ConversationId::new();
+        let second_conversation_id = ConversationId::new();
+
+        let result = Conversation::from_events(vec![
+            stored_user_event(first_conversation_id, 0),
+            stored_user_event(second_conversation_id, 1),
+        ]);
+
+        assert_eq!(
+            result,
+            Err(InvalidConversation::MixedConversationIds {
+                expected: first_conversation_id,
+                found: second_conversation_id,
+            })
+        );
+    }
+
+    #[test]
+    fn conversation_rejects_invalid_event_order() {
+        let conversation_id = ConversationId::new();
+
+        let result = Conversation::from_events(vec![stored_user_event(conversation_id, 1)]);
+
+        assert_eq!(
+            result,
+            Err(InvalidConversation::InvalidPosition {
+                expected: 0,
+                found: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn conversation_exposes_its_id_and_ordered_events() {
+        let conversation_id = ConversationId::new();
+
+        let conversation = Conversation::from_events(vec![
+            stored_user_event(conversation_id, 0),
+            stored_user_event(conversation_id, 1),
+        ])
+        .expect("the conversation should be valid");
+
+        assert_eq!(conversation.id(), conversation_id);
+        assert_eq!(conversation.events().len(), 2);
+        assert_eq!(conversation.events()[0].position, 0);
+        assert_eq!(conversation.events()[1].position, 1);
+    }
 
     #[test]
     fn user_prompt_rejects_empty_text() {

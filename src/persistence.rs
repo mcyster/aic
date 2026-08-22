@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -12,7 +13,7 @@ use crate::conversation::{
     Conversation, ConversationEvent, ConversationEventId, ConversationId, StoredConversationEvent,
 };
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 pub(crate) struct EventStore {
     root_directory: PathBuf,
@@ -42,30 +43,19 @@ impl EventStore {
         Ok(Self { root_directory })
     }
 
-    pub(crate) fn create_conversation(&self) -> io::Result<Conversation> {
-        let conversation = Conversation {
-            id: ConversationId::new(),
-            created_at_milliseconds: current_timestamp_milliseconds()?,
-        };
-        let conversation_directory = self.conversation_directory(conversation.id);
-        create_private_directory(&conversation_directory)?;
-        create_private_directory(&conversation_directory.join("events"))?;
-        write_json_atomically(
-            &conversation_directory.join("conversation.json"),
-            &conversation,
-        )?;
-        Ok(conversation)
-    }
-
     pub(crate) fn load_conversation(
         &self,
         conversation_id: ConversationId,
     ) -> io::Result<Conversation> {
-        read_json(
-            &self
-                .conversation_directory(conversation_id)
-                .join("conversation.json"),
-        )
+        let events = self.load_stored_conversation_events(conversation_id)?;
+        let conversation = Conversation::from_events(events).map_err(invalid_conversation_data)?;
+        if conversation.id() != conversation_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("loaded {}, expected {conversation_id}", conversation.id()),
+            ));
+        }
+        Ok(conversation)
     }
 
     pub(crate) fn append_conversation_event(
@@ -73,15 +63,32 @@ impl EventStore {
         conversation_id: ConversationId,
         event: ConversationEvent,
     ) -> io::Result<StoredConversationEvent> {
-        let existing_events = self.load_conversation_events(conversation_id)?;
+        let conversation_directory = self.conversation_directory(conversation_id);
+        create_private_directory(&conversation_directory)?;
+        let events_directory = conversation_directory.join("events");
+        create_private_directory(&events_directory)?;
+        let existing_events = self.load_stored_conversation_events(conversation_id)?;
+        let previous_position = if existing_events.is_empty() {
+            None
+        } else {
+            let conversation =
+                Conversation::from_events(existing_events).map_err(invalid_conversation_data)?;
+            if conversation.id() != conversation_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("loaded {}, expected {conversation_id}", conversation.id()),
+                ));
+            }
+            conversation.events().last().map(|event| event.position)
+        };
         let stored_event = StoredConversationEvent {
-            position: next_position(existing_events.last().map(|event| event.position))?,
+            conversation_id,
+            position: next_position(previous_position)?,
             id: ConversationEventId::new(),
             timestamp_milliseconds: current_timestamp_milliseconds()?,
             schema_version: SCHEMA_VERSION,
             event,
         };
-        let events_directory = self.conversation_directory(conversation_id).join("events");
         write_json_atomically(
             &event_path(
                 &events_directory,
@@ -93,14 +100,13 @@ impl EventStore {
         Ok(stored_event)
     }
 
-    pub(crate) fn load_conversation_events(
+    fn load_stored_conversation_events(
         &self,
         conversation_id: ConversationId,
     ) -> io::Result<Vec<StoredConversationEvent>> {
         let mut events =
             read_json_directory(&self.conversation_directory(conversation_id).join("events"))?;
         events.sort_by_key(|event: &StoredConversationEvent| event.position);
-        validate_positions(events.iter().map(|event| event.position))?;
         Ok(events)
     }
 
@@ -173,23 +179,14 @@ fn read_json_directory<T: DeserializeOwned>(directory: &Path) -> io::Result<Vec<
     Ok(values)
 }
 
-fn validate_positions(positions: impl Iterator<Item = u64>) -> io::Result<()> {
-    for (expected_position, position) in positions.enumerate() {
-        let expected_position = u64::try_from(expected_position).map_err(io::Error::other)?;
-        if position != expected_position {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("expected event position {expected_position}, found {position}"),
-            ));
-        }
-    }
-    Ok(())
+fn invalid_conversation_data(error: impl Error + Send + Sync + 'static) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::EventStore;
-    use crate::conversation::{ConversationEvent, UserContent};
+    use crate::conversation::{ConversationEvent, ConversationId, UserContent};
 
     fn temporary_store() -> EventStore {
         let directory = std::env::temp_dir().join(format!("tog-test-{}", uuid::Uuid::now_v7()));
@@ -199,13 +196,11 @@ mod tests {
     #[test]
     fn events_receive_monotonic_positions() {
         let store = temporary_store();
-        let conversation = store
-            .create_conversation()
-            .expect("the conversation should be created");
+        let conversation_id = ConversationId::new();
 
         store
             .append_conversation_event(
-                conversation.id,
+                conversation_id,
                 ConversationEvent::User {
                     content: vec![UserContent::Text("first".to_owned())],
                 },
@@ -213,17 +208,29 @@ mod tests {
             .expect("the first event should be persisted");
         store
             .append_conversation_event(
-                conversation.id,
+                conversation_id,
                 ConversationEvent::User {
                     content: vec![UserContent::Text("second".to_owned())],
                 },
             )
             .expect("the second event should be persisted");
 
-        let events = store
-            .load_conversation_events(conversation.id)
-            .expect("the events should load");
-        assert_eq!(events[0].position, 0);
-        assert_eq!(events[1].position, 1);
+        let conversation = store
+            .load_conversation(conversation_id)
+            .expect("the conversation should load");
+        assert_eq!(conversation.events()[0].position, 0);
+        assert_eq!(conversation.events()[1].position, 1);
+        assert!(
+            conversation
+                .events()
+                .iter()
+                .all(|event| event.conversation_id == conversation_id)
+        );
+        assert!(
+            !store
+                .conversation_directory(conversation_id)
+                .join("conversation.json")
+                .exists()
+        );
     }
 }

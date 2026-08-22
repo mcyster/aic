@@ -2,14 +2,14 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
-use crate::conversation::ConversationEvent;
+use crate::conversation::{Conversation, ConversationEvent};
 
 pub(crate) trait ModelDriver {
     fn model(&self) -> &ModelId;
 
     fn invoke(
         &self,
-        conversation: &[ConversationEvent],
+        conversation: &Conversation,
     ) -> Result<Vec<ConversationEvent>, ModelDriverError>;
 }
 
