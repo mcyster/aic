@@ -49,10 +49,10 @@ impl ModelDriver for OpenAiModelDriver {
         &self.source
     }
 
-    fn invoke<'a>(
-        &'a self,
-        conversation: &'a Conversation,
-    ) -> BoxFuture<'a, Result<ModelEventStream, ModelDriverError>> {
+    fn invoke<'invoke>(
+        &'invoke self,
+        conversation: &'invoke Conversation,
+    ) -> BoxFuture<'invoke, Result<ModelEventStream, ModelDriverError>> {
         let mut request_body = Map::new();
         request_body.insert(
             "model".to_owned(),

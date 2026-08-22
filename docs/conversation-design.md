@@ -610,11 +610,11 @@ type ModelEventStream =
 trait ModelDriver {
     fn source(&self) -> &ModelSource;
 
-    fn invoke<'a>(
-        &'a self,
-        conversation: &'a Conversation,
+    fn invoke<'invoke>(
+        &'invoke self,
+        conversation: &'invoke Conversation,
     ) -> BoxFuture<
-        'a,
+        'invoke,
         Result<ModelEventStream, ModelDriverError>,
     >;
 }
@@ -692,7 +692,7 @@ This supports assistant responses and auxiliary communications without allowing 
 Expected model failures are explicit both while establishing the invocation and while consuming it:
 
 ```rust
-BoxFuture<'a, Result<ModelEventStream, ModelDriverError>>
+BoxFuture<'invoke, Result<ModelEventStream, ModelDriverError>>
 
 BoxStream<'static, Result<ModelEvent, ModelDriverError>>
 ```

@@ -106,10 +106,10 @@ mod tests {
             &self.source
         }
 
-        fn invoke<'a>(
-            &'a self,
-            conversation: &'a Conversation,
-        ) -> BoxFuture<'a, Result<ModelEventStream, ModelDriverError>> {
+        fn invoke<'invoke>(
+            &'invoke self,
+            conversation: &'invoke Conversation,
+        ) -> BoxFuture<'invoke, Result<ModelEventStream, ModelDriverError>> {
             self.inputs
                 .lock()
                 .expect("the model input list should lock")
@@ -128,10 +128,10 @@ mod tests {
             &self.source
         }
 
-        fn invoke<'a>(
-            &'a self,
-            _conversation: &'a Conversation,
-        ) -> BoxFuture<'a, Result<ModelEventStream, ModelDriverError>> {
+        fn invoke<'invoke>(
+            &'invoke self,
+            _conversation: &'invoke Conversation,
+        ) -> BoxFuture<'invoke, Result<ModelEventStream, ModelDriverError>> {
             async { Err(ModelDriverError::Provider("failure".to_owned())) }.boxed()
         }
     }
@@ -146,10 +146,10 @@ mod tests {
             &self.source
         }
 
-        fn invoke<'a>(
-            &'a self,
-            _conversation: &'a Conversation,
-        ) -> BoxFuture<'a, Result<ModelEventStream, ModelDriverError>> {
+        fn invoke<'invoke>(
+            &'invoke self,
+            _conversation: &'invoke Conversation,
+        ) -> BoxFuture<'invoke, Result<ModelEventStream, ModelDriverError>> {
             let completed_event = self.completed_event.clone();
             async move {
                 Ok(stream::iter(vec![

@@ -24,11 +24,11 @@ pub(crate) type ModelEventStream =
 pub(crate) trait ModelDriver {
     fn source(&self) -> &ModelSource;
 
-    fn invoke<'a>(
-        &'a self,
-        conversation: &'a Conversation,
+    fn invoke<'invoke>(
+        &'invoke self,
+        conversation: &'invoke Conversation,
     ) -> BoxFuture<
-        'a,
+        'invoke,
         Result<ModelEventStream, ModelDriverError>,
     >;
 }
