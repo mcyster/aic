@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
 
-use super::{ConversationEventId, ConversationId, ModelSource};
+use super::{ConversationEventId, ConversationId, InvalidModelProblem, ModelProblem, ModelSource};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ConversationEvent {
@@ -62,6 +62,7 @@ impl Error for InvalidConversationEventKind {}
 pub(crate) enum ModelEvent {
     AssistantResponse(AssistantResponse),
     Communication(ModelCommunication),
+    Problem(ModelProblem),
 }
 
 impl ModelEvent {
@@ -69,6 +70,7 @@ impl ModelEvent {
         match self {
             Self::AssistantResponse(response) => response.message(),
             Self::Communication(communication) => communication.message(),
+            Self::Problem(problem) => problem.message(),
         }
     }
 
@@ -76,6 +78,7 @@ impl ModelEvent {
         match self {
             Self::AssistantResponse(_) => ModelEventImportance::Important,
             Self::Communication(communication) => communication.importance(),
+            Self::Problem(_) => ModelEventImportance::Important,
         }
     }
 
@@ -83,25 +86,30 @@ impl ModelEvent {
         match self {
             Self::AssistantResponse(response) => response
                 .ensure_valid()
-                .map_err(InvalidModelEvent::InvalidAssistantResponse),
+                .map_err(InvalidModelEvent::AssistantResponse),
             Self::Communication(communication) => communication
                 .ensure_valid()
-                .map_err(InvalidModelEvent::InvalidModelCommunication),
+                .map_err(InvalidModelEvent::ModelCommunication),
+            Self::Problem(problem) => problem
+                .ensure_valid()
+                .map_err(InvalidModelEvent::ModelProblem),
         }
     }
 }
 
 #[derive(Debug)]
 pub(super) enum InvalidModelEvent {
-    InvalidAssistantResponse(InvalidAssistantResponse),
-    InvalidModelCommunication(InvalidModelCommunication),
+    AssistantResponse(InvalidAssistantResponse),
+    ModelCommunication(InvalidModelCommunication),
+    ModelProblem(InvalidModelProblem),
 }
 
 impl Display for InvalidModelEvent {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidAssistantResponse(error) => Display::fmt(error, formatter),
-            Self::InvalidModelCommunication(error) => Display::fmt(error, formatter),
+            Self::AssistantResponse(error) => Display::fmt(error, formatter),
+            Self::ModelCommunication(error) => Display::fmt(error, formatter),
+            Self::ModelProblem(error) => Display::fmt(error, formatter),
         }
     }
 }
@@ -257,7 +265,8 @@ mod tests {
         InvalidModelCommunication, ModelCommunication, ModelEvent, ModelEventImportance,
     };
     use crate::conversation::{
-        ConversationEventId, ConversationId, ModelId, ModelSource, ProviderId, UserContent,
+        ConversationEventId, ConversationId, ModelId, ModelIssue, ModelProblem, ModelSource,
+        ProviderId, UserContent,
     };
 
     fn extensions() -> Map<String, Value> {
@@ -351,6 +360,33 @@ mod tests {
             AssistantResponse::new(String::new(), Map::new()),
             Err(InvalidAssistantResponse::EmptyMessage)
         );
+    }
+
+    #[test]
+    fn model_problem_uses_the_common_model_event_surface() {
+        let event = ModelEvent::Problem(ModelProblem::Issue(
+            ModelIssue::try_refusal("I cannot comply.".to_owned())
+                .expect("the refusal should be valid"),
+        ));
+
+        let serialized = serde_json::to_value(&event).expect("the problem should serialize");
+        let deserialized: ModelEvent =
+            serde_json::from_value(serialized.clone()).expect("the problem should deserialize");
+
+        assert_eq!(
+            serialized,
+            json!({
+                "type": "problem",
+                "category": "issue",
+                "detail": {
+                    "type": "refusal",
+                    "message": "I cannot comply."
+                }
+            })
+        );
+        assert_eq!(deserialized, event);
+        assert_eq!(event.message(), "I cannot comply.");
+        assert_eq!(event.importance(), ModelEventImportance::Important);
     }
 
     #[test]

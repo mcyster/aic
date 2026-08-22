@@ -109,7 +109,6 @@ enum ConversationEventKind {
     Context(...),
     Automation(...),
     Data(...),
-    Error(...),
 }
 ```
 
@@ -295,7 +294,7 @@ A failed model invocation never removes the already-durable `User` event.
 
 ## 9. ModelEvent
 
-`ModelEvent` records typed model-produced semantic information. Provenance belongs to the enclosing `ConversationEvent`, not to `ModelEvent`.
+`ModelEvent` records typed model-associated semantic information. It may be model output, a meaningful model issue, or a sanitized invocation failure. Provenance belongs to the enclosing `ConversationEvent`, not to `ModelEvent`.
 
 The durable common shape is:
 
@@ -303,6 +302,12 @@ The durable common shape is:
 enum ModelEvent {
     AssistantResponse(AssistantResponse),
     Communication(ModelCommunication),
+    Problem(ModelProblem),
+}
+
+enum ModelProblem {
+    Issue(ModelIssue),
+    Invocation(InvocationError),
 }
 
 enum ModelEventImportance {
@@ -312,7 +317,7 @@ enum ModelEventImportance {
 }
 ```
 
-`AssistantResponse` is the actual response used for portable continuation and is always important. `ModelCommunication` carries auxiliary information with a subtype and importance. Both preserve portable semantic fields and may carry driver-specific extensions.
+`AssistantResponse` is the actual response used for portable continuation and is always important. `ModelCommunication` carries auxiliary information with a subtype and importance. `ModelProblem` carries either a semantic model issue or a sanitized invocation error. Problems expose a common message and retryability decision without a trait hierarchy and are always important.
 
 ---
 
@@ -475,30 +480,32 @@ Raw provider protocol events still belong in tracing/diagnostics rather than the
 
 ---
 
-## 18. Error
+## 18. Model problems
 
-`Error` records a failure that is semantically relevant to the conversation.
+`ModelProblem::Issue` means the driver understood a meaningful limitation, decision, or unsuccessful model outcome. OpenAI refusals and recognized context-limit responses are model issues. A context-limit issue may arrive through an HTTP error response before an SSE stream exists; the driver represents it as a semantic model event rather than a control-flow error.
 
-A failed invocation may therefore leave:
+`ModelProblem::Invocation` means the invocation machinery failed. `ModelDriverError` remains the detailed control-flow error. The turn service sanitizes it, appends the invocation problem under the selected model's source, and returns the original error.
+
+An invocation failure before a stream exists therefore leaves:
 
 ```text
 User(...)
-Error(...)
+Model(source=..., event=Problem(Invocation(...)))
 ```
 
-if the outer invocation future fails before a stream exists and the caller chooses to append a semantic error event. If an established stream fails later, it may instead leave:
+If an established stream fails later, it leaves:
 
 ```text
 User(...)
 Model(...completed semantic event...)
-Error(...)
+Model(source=..., event=Problem(Invocation(...)))
 ```
 
-Completed semantic events already yielded remain valid conversation facts, and events already appended are not rolled back. Incomplete provider deltas that never formed a completed `ModelEvent` are discarded. The caller receives the stream error and decides whether to append the semantic `Error` event.
+Completed semantic events already yielded remain valid conversation facts, and events already appended are not rolled back. Incomplete provider deltas that never formed a completed `ModelEvent` are discarded.
 
 Events that were already durable before invocation are not rolled back.
 
-The Error event should contain useful conversation-level information without exposing every provider/runtime diagnostic.
+Durable problems contain portable sanitized messages, not credentials, raw provider bodies, stack traces, sensitive request data, or provider diagnostics without conversational meaning.
 
 Detailed diagnostics belong in tracing/logging.
 
@@ -642,7 +649,7 @@ A caller that wants batch behavior can collect the stream. No separate batch int
 
 User input is appended before model invocation. The caller combines each completed model event yielded by the stream with the invoked driver's source and canonical envelope metadata, then may display and append the resulting conversation event immediately while the invocation remains active.
 
-Provider protocol events and raw text deltas remain internal to the driver. They are not `ConversationEvent`s and are not persisted merely because they arrived. The driver aggregates those deltas and yields only completed semantic `ModelEvent`s such as `AssistantResponse` and `ModelCommunication`.
+Provider protocol events and raw text deltas remain internal to the driver. They are not `ConversationEvent`s and are not persisted merely because they arrived. The driver aggregates those deltas and yields only completed semantic `ModelEvent`s such as `AssistantResponse`, `ModelCommunication`, and `ModelProblem::Issue`.
 
 Conceptually:
 
@@ -652,8 +659,8 @@ User already durable
 await ModelDriver invocation
     ↓
 setup failure before stream
-    → User remains durable
-    → no model events appended
+    → append sanitized ModelProblem::Invocation
+    → return detailed ModelDriverError
 
 or
 
@@ -668,22 +675,23 @@ completed ModelEvent
 later stream failure
     → completed events remain durable
     → incomplete provider deltas are discarded
-    → caller receives error
+    → append sanitized ModelProblem::Invocation
+    → return detailed ModelDriverError
 ```
 
-This supersedes the previous batch contract, which returned all model events only after the complete invocation succeeded and discarded every model event after a late provider failure. Incremental append does not imply rollback: already appended semantic facts remain durable. The caller decides whether a stream error also becomes a semantic conversation-level `Error` event.
+This supersedes the previous batch contract, which returned all model events only after the complete invocation succeeded and discarded every model event after a late provider failure. Incremental append does not imply rollback: already appended semantic facts remain durable.
 
 ---
 
 ## 24. ModelDriver stream
 
-An established invocation yields typed model-produced semantic facts incrementally:
+An established invocation yields typed model-associated semantic facts incrementally:
 
 ```rust
 Result<ModelEvent, ModelDriverError>
 ```
 
-This supports assistant responses and auxiliary communications without allowing a driver to produce caller-owned conversation events. Additional model-produced concepts require explicit `ModelEvent` variants when implemented. Stream polling supplies demand and natural backpressure at this boundary.
+This supports assistant responses, auxiliary communications, and model issues without allowing a driver to produce caller-owned conversation events. Invocation errors enter the same `ModelEvent::Problem` surface only after caller-owned sanitization. Stream polling supplies demand and natural backpressure at this boundary.
 
 ---
 
@@ -705,6 +713,8 @@ enum ModelDriverError {
     RateLimited(...),
     Transport(...),
     InvalidRequest(...),
+    InvalidResponse(...),
+    StreamInterrupted(...),
     Provider(...),
 }
 ```
@@ -717,7 +727,7 @@ Rust does not use Java-style checked exceptions or `throws` declarations.
 
 Expected operational failures are represented through `Result<T, E>`.
 
-Unexpected programming failures may panic, but transport, provider, validation, and similar model failures should normally be represented by `ModelDriverError`. Conversation persistence errors belong to the caller.
+Unexpected programming failures may panic, but transport, provider, validation, and similar model failures should normally be represented by `ModelDriverError`. The turn service converts those errors into sanitized durable invocation problems before returning them. Conversation persistence errors belong to the caller.
 
 ## Async ecosystem
 
@@ -1311,7 +1321,7 @@ These may become useful later, but they should not burden the first ModelDriver 
 
 ## 46. First implementation milestone
 
-The basic semantic text milestone uses the asynchronous streaming boundary. Tool use, semantic error events, content references, and provider tracing remain follow-up work.
+The basic semantic text milestone uses the asynchronous streaming boundary. Tool use, content references, and provider tracing remain follow-up work.
 
 The asynchronous streaming implementation proves:
 
@@ -1346,7 +1356,6 @@ Then add:
 tool execution
 ToolResponses appended as they arrive
 caller-driven reinvocation
-failure → Error
 content references as concrete use cases require
 useful provider tracing
 ```

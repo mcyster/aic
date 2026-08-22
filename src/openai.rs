@@ -10,8 +10,8 @@ use serde_json::{Map, Value, json};
 
 use crate::conversation::{
     AssistantResponse, Conversation, ConversationEventKind, InvalidAssistantResponse,
-    InvalidModelCommunication, ModelCommunication, ModelEvent, ModelEventImportance, ModelId,
-    ModelSource, ProviderId, UserContent,
+    InvalidModelCommunication, InvalidModelProblem, ModelCommunication, ModelEvent,
+    ModelEventImportance, ModelId, ModelIssue, ModelProblem, ModelSource, ProviderId, UserContent,
 };
 use crate::model_driver::{ModelDriver, ModelDriverError, ModelEventStream};
 
@@ -84,7 +84,10 @@ impl ModelDriver for OpenAiModelDriver {
                     .text()
                     .await
                     .map_err(|error| ModelDriverError::Transport(error.to_string()))?;
-                return Err(classify_response_error(response_status, response_body));
+                return match classify_response_failure(response_status, response_body) {
+                    Ok(issue) => Ok(model_issue_stream(issue)),
+                    Err(error) => Err(error),
+                };
             }
 
             let response_bytes = response
@@ -127,20 +130,48 @@ fn semantic_input(conversation: &Conversation) -> Value {
     )
 }
 
-fn classify_response_error(status: StatusCode, body: String) -> ModelDriverError {
-    match status {
+fn classify_response_failure(
+    status: StatusCode,
+    body: String,
+) -> Result<ModelIssue, ModelDriverError> {
+    if status == StatusCode::BAD_REQUEST && is_context_limit_error(&body) {
+        return ModelIssue::try_context_limit_exceeded(
+            "The model context limit was exceeded.".to_owned(),
+        )
+        .map_err(invalid_model_problem);
+    }
+
+    Err(match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ModelDriverError::Authentication(body),
         StatusCode::TOO_MANY_REQUESTS => ModelDriverError::RateLimited(body),
         StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::UNPROCESSABLE_ENTITY => {
             ModelDriverError::InvalidRequest(body)
         }
         _ => ModelDriverError::Provider(format!("OpenAI Responses returned {status}: {body}")),
-    }
+    })
+}
+
+fn is_context_limit_error(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .is_some_and(|payload| is_context_limit_payload(&payload))
+}
+
+fn is_context_limit_payload(payload: &Value) -> bool {
+    ["/code", "/error/code", "/response/error/code"]
+        .into_iter()
+        .filter_map(|pointer| payload.pointer(pointer).and_then(Value::as_str))
+        .any(|code| matches!(code, "context_length_exceeded" | "context_window_exceeded"))
+}
+
+fn model_issue_stream(issue: ModelIssue) -> ModelEventStream {
+    stream::once(async move { Ok(ModelEvent::Problem(ModelProblem::Issue(issue))) }).boxed()
 }
 
 #[derive(Default)]
 struct ResponseState {
     assistant_outputs: Vec<AccumulatedText>,
+    refusal_outputs: Vec<AccumulatedText>,
     reasoning_outputs: Vec<AccumulatedText>,
     reasoning_summaries: Vec<AccumulatedText>,
     completed: bool,
@@ -234,8 +265,14 @@ struct OpenAiStreamState {
     decoder: ServerSentEventDecoder,
     response: ResponseState,
     model_events: VecDeque<ModelEvent>,
-    response_bytes_finished: bool,
+    response_end: Option<ResponseEnd>,
     terminated: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ResponseEnd {
+    BodyEnded,
+    DoneSentinel,
 }
 
 fn model_event_stream(response_bytes: ResponseByteStream) -> ModelEventStream {
@@ -244,7 +281,7 @@ fn model_event_stream(response_bytes: ResponseByteStream) -> ModelEventStream {
         decoder: ServerSentEventDecoder::default(),
         response: ResponseState::default(),
         model_events: VecDeque::new(),
-        response_bytes_finished: false,
+        response_end: None,
         terminated: false,
     };
 
@@ -263,7 +300,7 @@ fn model_event_stream(response_bytes: ResponseByteStream) -> ModelEventStream {
                     }
                     Ok(ProcessEventResult::Done) => {
                         state.decoder.events.clear();
-                        state.response_bytes_finished = true;
+                        state.response_end = Some(ResponseEnd::DoneSentinel);
                     }
                     Err(error) => {
                         state.terminated = true;
@@ -272,17 +309,20 @@ fn model_event_stream(response_bytes: ResponseByteStream) -> ModelEventStream {
                 }
                 continue;
             }
-            if state.response_bytes_finished {
+            if let Some(response_end) = state.response_end {
                 state.terminated = true;
                 if state.response.completed {
                     return None;
                 }
-                return Some((
-                    Err(ModelDriverError::InvalidResponse(
-                        "response.completed was not received".to_owned(),
-                    )),
-                    state,
-                ));
+                let error = match response_end {
+                    ResponseEnd::BodyEnded => ModelDriverError::StreamInterrupted(
+                        "the response body ended before response.completed".to_owned(),
+                    ),
+                    ResponseEnd::DoneSentinel => ModelDriverError::InvalidResponse(
+                        "response.completed was not received before [DONE]".to_owned(),
+                    ),
+                };
+                return Some((Err(error), state));
             }
 
             match state.response_bytes.next().await {
@@ -301,7 +341,7 @@ fn model_event_stream(response_bytes: ResponseByteStream) -> ModelEventStream {
                         state.terminated = true;
                         return Some((Err(error), state));
                     }
-                    state.response_bytes_finished = true;
+                    state.response_end = Some(ResponseEnd::BodyEnded);
                 }
             }
         }
@@ -357,11 +397,19 @@ fn process_event(
     }
 
     let model_events = match event_type.as_str() {
-        "response.output_text.delta" | "response.refusal.delta" => {
+        "response.output_text.delta" => {
             let key = semantic_output_key(&payload, &["output_index", "content_index"])?;
             append_delta(
                 &payload,
                 accumulated_text(&mut response_state.assistant_outputs, key)?,
+            )?;
+            Vec::new()
+        }
+        "response.refusal.delta" => {
+            let key = semantic_output_key(&payload, &["output_index", "content_index"])?;
+            append_delta(
+                &payload,
+                accumulated_text(&mut response_state.refusal_outputs, key)?,
             )?;
             Vec::new()
         }
@@ -381,9 +429,9 @@ fn process_event(
             complete_text(
                 &payload,
                 "refusal",
-                accumulated_text(&mut response_state.assistant_outputs, key.clone())?,
+                accumulated_text(&mut response_state.refusal_outputs, key.clone())?,
             )?;
-            emit_assistant_response(&mut response_state.assistant_outputs, &key)?
+            emit_refusal(&mut response_state.refusal_outputs, &key)?
                 .into_iter()
                 .collect()
         }
@@ -426,6 +474,10 @@ fn process_event(
                 .collect()
         }
         "response.completed" => complete_response(response_state, &payload)?,
+        "error" | "response.failed" if is_context_limit_payload(&payload) => {
+            response_state.completed = true;
+            vec![model_context_limit_exceeded()?]
+        }
         "error" | "response.failed" => {
             return Err(ModelDriverError::Provider(format!(
                 "OpenAI stream emitted {event_type}: {payload}"
@@ -461,17 +513,41 @@ fn complete_response(
     model_events.extend(emit_remaining_assistant_responses(
         &mut response_state.assistant_outputs,
     )?);
-    if !response_state
+    model_events.extend(emit_remaining_refusals(
+        &mut response_state.refusal_outputs,
+    )?);
+    let completed_content = completed_response_content(payload)?;
+    for completed_output in completed_content.assistant_outputs {
+        if !completed_output_already_emitted(
+            &response_state.assistant_outputs,
+            &completed_output.key,
+        ) {
+            model_events.push(assistant_response(completed_output.text)?);
+        }
+    }
+    for completed_refusal in completed_content.refusals {
+        if !completed_output_already_emitted(
+            &response_state.refusal_outputs,
+            &completed_refusal.key,
+        ) {
+            model_events.push(model_refusal(completed_refusal.text)?);
+        }
+    }
+    let has_completed_model_output = response_state
         .assistant_outputs
         .iter()
+        .chain(&response_state.refusal_outputs)
         .any(|output| output.emitted)
-    {
-        let assistant_text = completed_response_text(payload)?.ok_or_else(|| {
-            ModelDriverError::InvalidResponse(
-                "the completed response contained no model message".to_owned(),
+        || model_events.iter().any(|event| {
+            matches!(
+                event,
+                ModelEvent::AssistantResponse(_) | ModelEvent::Problem(_)
             )
-        })?;
-        model_events.push(assistant_response(assistant_text)?);
+        });
+    if !has_completed_model_output {
+        return Err(ModelDriverError::InvalidResponse(
+            "the completed response contained no model message".to_owned(),
+        ));
     }
     response_state.completed = true;
     Ok(model_events)
@@ -523,6 +599,20 @@ fn emit_assistant_response(
     Ok(Some(model_event))
 }
 
+fn emit_refusal(
+    refusal_outputs: &mut [AccumulatedText],
+    key: &str,
+) -> Result<Option<ModelEvent>, ModelDriverError> {
+    let output = un_emitted_text(refusal_outputs, key)?;
+    let refusal = preferred_text(&output.streamed_text, &output.completed_text);
+    let Some(refusal) = refusal else {
+        return Ok(None);
+    };
+    let model_event = model_refusal(refusal)?;
+    output.emitted = true;
+    Ok(Some(model_event))
+}
+
 fn emit_remaining_reasoning(
     outputs: &mut [AccumulatedText],
 ) -> Result<Vec<ModelEvent>, ModelDriverError> {
@@ -550,10 +640,31 @@ fn emit_remaining_assistant_responses(
         .collect()
 }
 
+fn emit_remaining_refusals(
+    outputs: &mut [AccumulatedText],
+) -> Result<Vec<ModelEvent>, ModelDriverError> {
+    let keys = un_emitted_keys(outputs);
+    keys.into_iter()
+        .filter_map(|key| emit_refusal(outputs, &key).transpose())
+        .collect()
+}
+
 fn assistant_response(message: String) -> Result<ModelEvent, ModelDriverError> {
     AssistantResponse::new(message, Map::new())
         .map(ModelEvent::AssistantResponse)
         .map_err(invalid_assistant_response)
+}
+
+fn model_refusal(message: String) -> Result<ModelEvent, ModelDriverError> {
+    ModelIssue::try_refusal(message)
+        .map(|issue| ModelEvent::Problem(ModelProblem::Issue(issue)))
+        .map_err(invalid_model_problem)
+}
+
+fn model_context_limit_exceeded() -> Result<ModelEvent, ModelDriverError> {
+    ModelIssue::try_context_limit_exceeded("The model context limit was exceeded.".to_owned())
+        .map(|issue| ModelEvent::Problem(ModelProblem::Issue(issue)))
+        .map_err(invalid_model_problem)
 }
 
 fn semantic_output_key(payload: &Value, indexes: &[&str]) -> Result<String, ModelDriverError> {
@@ -668,6 +779,10 @@ fn invalid_model_communication(error: InvalidModelCommunication) -> ModelDriverE
     ModelDriverError::InvalidResponse(error.to_string())
 }
 
+fn invalid_model_problem(error: InvalidModelProblem) -> ModelDriverError {
+    ModelDriverError::InvalidResponse(error.to_string())
+}
+
 fn append_delta(payload: &Value, output: &mut AccumulatedText) -> Result<(), ModelDriverError> {
     if output.emitted {
         return Err(ModelDriverError::InvalidResponse(format!(
@@ -707,20 +822,34 @@ fn preferred_text(streamed_text: &str, completed_text: &Option<String>) -> Optio
         .or_else(|| (!streamed_text.is_empty()).then(|| streamed_text.to_owned()))
 }
 
-fn completed_response_text(payload: &Value) -> Result<Option<String>, ModelDriverError> {
+#[derive(Default)]
+struct CompletedResponseContent {
+    assistant_outputs: Vec<CompletedText>,
+    refusals: Vec<CompletedText>,
+}
+
+struct CompletedText {
+    key: String,
+    text: String,
+}
+
+fn completed_response_content(
+    payload: &Value,
+) -> Result<CompletedResponseContent, ModelDriverError> {
     let Some(output_value) = payload
         .get("response")
         .and_then(|response| response.get("output"))
     else {
-        return Ok(None);
+        return Ok(CompletedResponseContent::default());
     };
     let output = output_value.as_array().ok_or_else(|| {
         ModelDriverError::InvalidResponse(
             "the completed OpenAI response contained non-array output".to_owned(),
         )
     })?;
-    let mut text = String::new();
-    for output_item in output {
+    let mut assistant_outputs = Vec::new();
+    let mut refusals = Vec::new();
+    for (output_index, output_item) in output.iter().enumerate() {
         let Some(content_value) = output_item.get("content") else {
             continue;
         };
@@ -729,7 +858,8 @@ fn completed_response_text(payload: &Value) -> Result<Option<String>, ModelDrive
                 "the completed OpenAI response contained non-array content".to_owned(),
             )
         })?;
-        for content_item in content {
+        for (content_index, content_item) in content.iter().enumerate() {
+            let key = format!("output_index={output_index};content_index={content_index}");
             match content_item.get("type").and_then(Value::as_str) {
                 Some("output_text") => {
                     let content_text = content_item
@@ -740,7 +870,10 @@ fn completed_response_text(payload: &Value) -> Result<Option<String>, ModelDrive
                                 "completed OpenAI output text was not a string".to_owned(),
                             )
                         })?;
-                    text.push_str(content_text);
+                    assistant_outputs.push(CompletedText {
+                        key,
+                        text: content_text.to_owned(),
+                    });
                 }
                 Some("refusal") => {
                     let refusal = content_item
@@ -751,13 +884,25 @@ fn completed_response_text(payload: &Value) -> Result<Option<String>, ModelDrive
                                 "completed OpenAI refusal was not a string".to_owned(),
                             )
                         })?;
-                    text.push_str(refusal);
+                    refusals.push(CompletedText {
+                        key,
+                        text: refusal.to_owned(),
+                    });
                 }
                 _ => {}
             }
         }
     }
-    Ok((!text.is_empty()).then_some(text))
+    Ok(CompletedResponseContent {
+        assistant_outputs,
+        refusals,
+    })
+}
+
+fn completed_output_already_emitted(outputs: &[AccumulatedText], key: &str) -> bool {
+    outputs
+        .iter()
+        .any(|output| output.emitted && (output.key == "default" || output.key == key))
 }
 
 #[cfg(test)]
@@ -776,12 +921,13 @@ mod tests {
     use crate::conversation::{
         AssistantResponse, Conversation, ConversationEvent, ConversationEventId,
         ConversationEventKind, ConversationId, ModelCommunication, ModelEvent,
-        ModelEventImportance, ModelId, ModelSource, ProviderId, UserContent,
+        ModelEventImportance, ModelId, ModelIssue, ModelProblem, ModelSource, ProviderId,
+        UserContent,
     };
     use crate::model_driver::{ModelDriver, ModelDriverError};
 
     use super::{
-        OpenAiModelDriver, ResponseByteStream, classify_response_error, model_communication,
+        OpenAiModelDriver, ResponseByteStream, classify_response_failure, model_communication,
         model_event_stream, semantic_input,
     };
 
@@ -972,6 +1118,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_context_limit_http_response_becomes_a_model_issue_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("the mock server should bind");
+        let address = listener
+            .local_addr()
+            .expect("the mock server address should be available");
+        let server = thread::spawn(move || {
+            let (mut connection, _) = listener.accept().expect("the mock server should accept");
+            read_request(&connection);
+            let body = json!({
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "raw provider details"
+                }
+            })
+            .to_string();
+            write!(
+                connection,
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("the mock response should write");
+        });
+        let driver = OpenAiModelDriver {
+            http_client: reqwest::Client::new(),
+            api_key: "test-key".to_owned(),
+            responses_url: format!("http://{address}/responses"),
+            source: source(),
+        };
+
+        let mut model_events = driver
+            .invoke(&test_conversation())
+            .await
+            .expect("the context-limit outcome should establish a semantic stream");
+        let model_event = model_events
+            .next()
+            .await
+            .expect("the stream should yield a context-limit issue")
+            .expect("the context-limit issue should be valid");
+
+        assert!(matches!(
+            &model_event,
+            ModelEvent::Problem(ModelProblem::Issue(ModelIssue::ContextLimitExceeded { .. }))
+        ));
+        assert_eq!(
+            model_event.message(),
+            "The model context limit was exceeded."
+        );
+        assert!(model_events.next().await.is_none());
+        server.join().expect("the mock server should stop");
+    }
+
+    #[tokio::test]
     async fn arbitrary_byte_boundaries_crlf_multiline_data_and_event_fields_parse() {
         let input = concat!(
             "event: response.output_text.delta\r\n",
@@ -993,6 +1191,29 @@ mod tests {
 
         assert_eq!(model_event.message(), "Hello");
         assert!(model_events.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_completed_refusal_is_a_model_issue_not_an_assistant_response() {
+        let input = concat!(
+            "data: {\"type\":\"response.refusal.delta\",\"delta\":\"I cannot \"}\n\n",
+            "data: {\"type\":\"response.refusal.done\",\"refusal\":\"I cannot comply.\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+        );
+
+        let events = collect_events(input)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("the refusal stream should parse");
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ModelEvent::Problem(ModelProblem::Issue(ModelIssue::Refusal { .. }))
+        ));
+        assert_eq!(events[0].message(), "I cannot comply.");
+        assert_eq!(events[0].importance(), ModelEventImportance::Important);
     }
 
     #[tokio::test]
@@ -1046,6 +1267,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_limit_stream_failure_is_a_model_issue() {
+        let input = concat!(
+            "data: {\"type\":\"error\",\"code\":\"context_length_exceeded\",\"message\":\"raw details\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let events = collect_events(input)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("the context-limit failure should be semantic");
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ModelEvent::Problem(ModelProblem::Issue(ModelIssue::ContextLimitExceeded { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn premature_body_end_is_a_stream_interruption() {
+        let input = "data: {\"type\":\"response.output_text.done\",\"text\":\"Hello\"}\n\n";
+        let mut model_events =
+            model_event_stream(response_byte_stream(vec![input.as_bytes().to_vec()]));
+
+        assert!(matches!(
+            model_events.next().await,
+            Some(Ok(ModelEvent::AssistantResponse(_)))
+        ));
+        assert!(matches!(
+            model_events.next().await,
+            Some(Err(ModelDriverError::StreamInterrupted(_)))
+        ));
+    }
+
+    #[tokio::test]
     async fn missing_response_completed_is_a_stream_error_even_after_done() {
         let input = concat!(
             "data: {\"type\":\"response.output_text.done\",\"text\":\"Hello\"}\n\n",
@@ -1080,6 +1336,24 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].message(), "Answer");
+    }
+
+    #[tokio::test]
+    async fn response_completed_adds_unstreamed_indexed_output_without_duplicates() {
+        let input = concat!(
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"First\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"content\":[{\"type\":\"output_text\",\"text\":\"First\"},{\"type\":\"output_text\",\"text\":\"Second\"}]}]}}\n\n"
+        );
+
+        let events = collect_events(input)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("the completed response fallback should parse");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].message(), "First");
+        assert_eq!(events[1].message(), "Second");
     }
 
     #[tokio::test]
@@ -1170,20 +1444,20 @@ mod tests {
     #[test]
     fn response_statuses_map_to_typed_driver_errors() {
         assert!(matches!(
-            classify_response_error(StatusCode::UNAUTHORIZED, "unauthorized".to_owned()),
-            ModelDriverError::Authentication(_)
+            classify_response_failure(StatusCode::UNAUTHORIZED, "unauthorized".to_owned()),
+            Err(ModelDriverError::Authentication(_))
         ));
         assert!(matches!(
-            classify_response_error(StatusCode::TOO_MANY_REQUESTS, "slow down".to_owned()),
-            ModelDriverError::RateLimited(_)
+            classify_response_failure(StatusCode::TOO_MANY_REQUESTS, "slow down".to_owned()),
+            Err(ModelDriverError::RateLimited(_))
         ));
         assert!(matches!(
-            classify_response_error(StatusCode::BAD_REQUEST, "bad request".to_owned()),
-            ModelDriverError::InvalidRequest(_)
+            classify_response_failure(StatusCode::BAD_REQUEST, "bad request".to_owned()),
+            Err(ModelDriverError::InvalidRequest(_))
         ));
         assert!(matches!(
-            classify_response_error(StatusCode::INTERNAL_SERVER_ERROR, "failed".to_owned()),
-            ModelDriverError::Provider(_)
+            classify_response_failure(StatusCode::INTERNAL_SERVER_ERROR, "failed".to_owned()),
+            Err(ModelDriverError::Provider(_))
         ));
     }
 

@@ -75,7 +75,7 @@ impl CommandLine {
 fn render_model_event(model_event: &ModelEvent) -> io::Result<()> {
     let prefix = match model_event {
         ModelEvent::AssistantResponse(_) => "",
-        ModelEvent::Communication(_) => "### ",
+        ModelEvent::Communication(_) | ModelEvent::Problem(_) => "### ",
     };
     let mut standard_output = io::stdout().lock();
     writeln!(standard_output, "{prefix}{}", model_event.message())?;

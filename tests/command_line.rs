@@ -249,7 +249,7 @@ fn turn_persists_events_and_prints_semantic_output() {
             .replace('-', ""),
         conversation_id.trim_start_matches("conversation_")
     );
-    assert_eq!(first_event["schema_version"], 7);
+    assert_eq!(first_event["schema_version"], 8);
     assert_eq!(first_event["type"], "user");
     assert_eq!(first_event["content"][0]["type"], "text");
     assert_eq!(first_event["content"][0]["value"], "say hi");
@@ -258,7 +258,7 @@ fn turn_persists_events_and_prints_semantic_output() {
         fs::File::open(&event_paths[1]).expect("the persisted model event should open"),
     )
     .expect("the persisted model event should be JSON");
-    assert_eq!(model_event["schema_version"], 7);
+    assert_eq!(model_event["schema_version"], 8);
     assert_eq!(model_event["type"], "model");
     assert_eq!(model_event["source"]["provider"], "openai");
     assert_eq!(model_event["source"]["model"], "gpt-5.6");
@@ -541,6 +541,31 @@ fn failed_user_turn_is_included_in_the_next_local_reconstruction() {
         reported_conversation_id(&failed_output.stderr),
         conversation_id
     );
+    let events_directory = data_directory
+        .join("conversations")
+        .join(conversation_id.trim_start_matches("conversation_"))
+        .join("events");
+    let mut event_paths = fs::read_dir(events_directory)
+        .expect("the persisted events should be readable")
+        .map(|entry| entry.expect("the event entry should be readable").path())
+        .collect::<Vec<_>>();
+    event_paths.sort();
+    let invocation_problem: Value = serde_json::from_reader(
+        fs::File::open(&event_paths[3]).expect("the invocation problem should open"),
+    )
+    .expect("the invocation problem should be JSON");
+    assert_eq!(invocation_problem["type"], "model");
+    assert_eq!(invocation_problem["event"]["type"], "problem");
+    assert_eq!(invocation_problem["event"]["category"], "invocation");
+    assert_eq!(
+        invocation_problem["event"]["detail"]["type"],
+        "provider_failure"
+    );
+    assert_eq!(
+        invocation_problem["event"]["detail"]["message"],
+        "The model provider failed the invocation."
+    );
+    assert!(!invocation_problem.to_string().contains("request rejected"));
 
     let recovered_output = configured_command(&server, &data_directory)
         .args([

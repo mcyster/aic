@@ -24,6 +24,7 @@ pub(crate) enum ModelDriverError {
     Transport(String),
     InvalidRequest(String),
     InvalidResponse(String),
+    StreamInterrupted(String),
     Provider(String),
 }
 
@@ -36,6 +37,12 @@ impl Display for ModelDriverError {
             Self::InvalidRequest(message) => write!(formatter, "invalid model request: {message}"),
             Self::InvalidResponse(message) => {
                 write!(formatter, "invalid model response: {message}")
+            }
+            Self::StreamInterrupted(message) => {
+                write!(
+                    formatter,
+                    "model response stream was interrupted: {message}"
+                )
             }
             Self::Provider(message) => write!(formatter, "model provider failed: {message}"),
         }

@@ -3,9 +3,10 @@ use std::error::Error;
 use futures_util::StreamExt;
 
 use crate::conversation::{
-    ConversationEventKind, ConversationId, ModelEvent, UserContent, UserPrompt,
+    ConversationEventKind, ConversationId, InvalidModelProblem, InvocationError, ModelEvent,
+    ModelProblem, ModelSource, UserContent, UserPrompt,
 };
-use crate::model_driver::ModelDriver;
+use crate::model_driver::{ModelDriver, ModelDriverError};
 use crate::persistence::EventStore;
 
 pub(crate) type TurnResultValue<T> = Result<T, Box<dyn Error>>;
@@ -59,9 +60,31 @@ impl TurnService {
         report_progress(TurnProgress::ModelInvocationStarted {
             model: source.model().as_str().to_owned(),
         })?;
-        let mut model_events = self.model_driver.invoke(&conversation).await?;
+        let mut model_events = match self.model_driver.invoke(&conversation).await {
+            Ok(model_events) => model_events,
+            Err(error) => {
+                self.append_invocation_problem(
+                    conversation_id,
+                    &source,
+                    &error,
+                    InvocationStage::BeforeStream,
+                )?;
+                return Err(Box::new(error));
+            }
+        };
         while let Some(model_event) = model_events.next().await {
-            let model_event = model_event?;
+            let model_event = match model_event {
+                Ok(model_event) => model_event,
+                Err(error) => {
+                    self.append_invocation_problem(
+                        conversation_id,
+                        &source,
+                        &error,
+                        InvocationStage::DuringStream,
+                    )?;
+                    return Err(Box::new(error));
+                }
+            };
             self.event_store.append_conversation_event(
                 conversation_id,
                 ConversationEventKind::Model {
@@ -74,6 +97,65 @@ impl TurnService {
 
         Ok(())
     }
+
+    fn append_invocation_problem(
+        &self,
+        conversation_id: ConversationId,
+        source: &ModelSource,
+        error: &ModelDriverError,
+        stage: InvocationStage,
+    ) -> TurnResultValue<()> {
+        let problem = invocation_problem(error, stage)?;
+        self.event_store.append_conversation_event(
+            conversation_id,
+            ConversationEventKind::Model {
+                source: source.clone(),
+                event: ModelEvent::Problem(problem),
+            },
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InvocationStage {
+    BeforeStream,
+    DuringStream,
+}
+
+fn invocation_problem(
+    error: &ModelDriverError,
+    stage: InvocationStage,
+) -> Result<ModelProblem, InvalidModelProblem> {
+    let invocation_error = match error {
+        ModelDriverError::Authentication(_) => InvocationError::try_authentication(
+            "The model provider could not authenticate the invocation.".to_owned(),
+        )?,
+        ModelDriverError::RateLimited(_) => InvocationError::try_rate_limited(
+            "The model provider rate-limited the invocation.".to_owned(),
+        )?,
+        ModelDriverError::Transport(_) if matches!(stage, InvocationStage::DuringStream) => {
+            InvocationError::try_stream_interrupted(
+                "The model response stream was interrupted.".to_owned(),
+            )?
+        }
+        ModelDriverError::Transport(_) => {
+            InvocationError::try_transport("The model provider could not be reached.".to_owned())?
+        }
+        ModelDriverError::InvalidRequest(_) => InvocationError::try_invalid_request(
+            "The model invocation request was invalid.".to_owned(),
+        )?,
+        ModelDriverError::InvalidResponse(_) => InvocationError::try_invalid_provider_response(
+            "The model provider returned an invalid response.".to_owned(),
+        )?,
+        ModelDriverError::StreamInterrupted(_) => InvocationError::try_stream_interrupted(
+            "The model response stream was interrupted.".to_owned(),
+        )?,
+        ModelDriverError::Provider(_) => InvocationError::try_provider_failure(
+            "The model provider failed the invocation.".to_owned(),
+        )?,
+    };
+    Ok(ModelProblem::Invocation(invocation_error))
 }
 
 #[cfg(test)]
@@ -88,9 +170,9 @@ mod tests {
 
     use super::{TurnProgress, TurnRequest, TurnService};
     use crate::conversation::{
-        AssistantResponse, Conversation, ConversationEventKind, ConversationId, ModelCommunication,
-        ModelEvent, ModelEventImportance, ModelId, ModelSource, ProviderId, UserContent,
-        UserPrompt,
+        AssistantResponse, Conversation, ConversationEventKind, ConversationId, InvocationError,
+        ModelCommunication, ModelEvent, ModelEventImportance, ModelId, ModelProblem, ModelSource,
+        ProviderId, UserContent, UserPrompt,
     };
     use crate::model_driver::{ModelDriver, ModelDriverError, ModelEventStream};
     use crate::persistence::EventStore;
@@ -154,7 +236,7 @@ mod tests {
             async move {
                 Ok(stream::iter(vec![
                     Ok(completed_event),
-                    Err(ModelDriverError::Provider("late failure".to_owned())),
+                    Err(ModelDriverError::Transport("late failure".to_owned())),
                 ])
                 .boxed())
             }
@@ -362,7 +444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_invocation_retains_only_the_user_event() {
+    async fn failed_invocation_persists_a_sanitized_problem() {
         let root_directory = std::env::temp_dir().join(format!(
             "tog-model-driver-failure-test-{}",
             uuid::Uuid::now_v7()
@@ -392,10 +474,26 @@ mod tests {
             .event_store
             .load_conversation(conversation_id.expect("the turn should identify its conversation"))
             .expect("the conversation should load");
-        assert_eq!(conversation.events().len(), 1);
+        assert_eq!(conversation.events().len(), 2);
         assert!(matches!(
             conversation.events()[0].kind,
             ConversationEventKind::User { .. }
+        ));
+        let ConversationEventKind::Model {
+            source,
+            event: ModelEvent::Problem(problem),
+        } = &conversation.events()[1].kind
+        else {
+            panic!("the second event should be an invocation problem");
+        };
+        assert_eq!(source, service.model_driver.source());
+        assert_eq!(
+            problem.message(),
+            "The model provider failed the invocation."
+        );
+        assert!(matches!(
+            problem,
+            ModelProblem::Invocation(InvocationError::ProviderFailure { .. })
         ));
     }
 
@@ -427,7 +525,7 @@ mod tests {
             .event_store
             .load_conversation(conversation_id.expect("the turn should identify its conversation"))
             .expect("the conversation should load");
-        assert_eq!(conversation.events().len(), 2);
+        assert_eq!(conversation.events().len(), 3);
         assert_eq!(
             conversation.events()[1].kind,
             conversation_model_event_kind(
@@ -435,6 +533,15 @@ mod tests {
                 assistant_response("Completed answer")
             )
         );
+        assert!(matches!(
+            conversation.events()[2].kind,
+            ConversationEventKind::Model {
+                event: ModelEvent::Problem(ModelProblem::Invocation(
+                    InvocationError::StreamInterrupted { .. }
+                )),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

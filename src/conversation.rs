@@ -1,6 +1,7 @@
 mod event;
 mod id;
 mod model;
+mod model_problem;
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -12,6 +13,7 @@ pub(crate) use event::{
 };
 pub(crate) use id::{ConversationEventId, ConversationId};
 pub(crate) use model::{ModelId, ModelSource, ProviderId};
+pub(crate) use model_problem::{InvalidModelProblem, InvocationError, ModelIssue, ModelProblem};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Conversation {
@@ -291,6 +293,41 @@ mod tests {
             Err(InvalidConversation::InvalidEvent {
                 position: 0,
                 reason: "model communication subtype must not be empty".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn conversation_rejects_invalid_deserialized_model_problems() {
+        let conversation_id = ConversationId::new();
+        let event_id = ConversationEventId::new();
+        let conversation_event: ConversationEvent = serde_json::from_value(json!({
+            "conversation_id": conversation_id,
+            "position": 0,
+            "id": event_id,
+            "timestamp": "2026-08-22T18:42:31.482Z",
+            "schema_version": 8,
+            "type": "model",
+            "source": {
+                "provider": "openai",
+                "model": "gpt-5.6"
+            },
+            "event": {
+                "type": "problem",
+                "category": "issue",
+                "detail": {
+                    "type": "refusal",
+                    "message": "   "
+                }
+            }
+        }))
+        .expect("derived deserialization should construct the conversation event");
+
+        assert_eq!(
+            Conversation::from_events(vec![conversation_event]),
+            Err(InvalidConversation::InvalidEvent {
+                position: 0,
+                reason: "model problem message must not be empty".to_owned(),
             })
         );
     }
