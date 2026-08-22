@@ -33,6 +33,14 @@ The Conversation Log must be self-contained with respect to model-visible semant
 
 Executable tool implementations, provider credentials, transport configuration, retry policy, and orchestration remain external. Their model-visible descriptions and schemas do not: those must be recorded or immutably referenced so a compatible `ModelDriver` can construct its request from the conversation alone.
 
+## Event-Sourced State
+
+The Conversation Log event-sources the semantic conversation domain. It is the authoritative source of semantic conversation state, and its events record durable semantic facts. The current state or view of a conversation is derived by replaying the log and resolving any immutable content it references; it must not depend on a separately mutable representation.
+
+New semantic state is introduced by appending events, never by modifying earlier events. Derived projections, indexes, summaries, and provider requests may be rebuilt from the log and its immutable references.
+
+This does not mean that all of `tog` is event-sourced. Commands, provider transport events, raw streaming deltas, retries, diagnostics, and execution mechanics are not automatically conversation events. Tracing or a separate operational log may capture those details without making them part of the canonical Conversation Log.
+
 ## Events Are Facts
 
 Conversation events describe facts, not intent:
@@ -61,6 +69,14 @@ Error
 ```
 
 The vocabulary should grow only when a repeated semantic need justifies another event type.
+
+## Layered Semantic Representation
+
+Conversation events define a universal semantic minimum and permit lossless enrichment beyond that minimum. Every compatible `ModelDriver` must understand the minimum, may interpret recognized enrichment for richer or more efficient continuation, and must safely ignore enrichment it does not understand. The conversation is therefore portable without being restricted to the lowest common denominator.
+
+Driver-specific data enriches portable semantics; it must not replace them. The portable representation must contain enough information for another compatible driver to continue meaningfully, and semantically important structured concepts remain structured. For example, a tool request retains its portable call ID, tool name, and arguments even if it also contains a provider-specific call ID.
+
+Driver-specific details remain immutable parts of the Conversation Log. Extensions should identify their owning driver or namespace and schema version when interpretation could otherwise be ambiguous. Raw provider transport events do not become semantic conversation events merely because they are provider-specific.
 
 ## Event Meanings
 
