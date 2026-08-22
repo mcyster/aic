@@ -50,6 +50,7 @@ impl ModelDriver for OpenAiModelDriver {
             Value::String(self.source.model().as_str().to_owned()),
         );
         request_body.insert("input".to_owned(), semantic_input(conversation));
+        request_body.insert("reasoning".to_owned(), json!({ "summary": "auto" }));
         request_body.insert("stream".to_owned(), Value::Bool(true));
         request_body.insert("store".to_owned(), Value::Bool(true));
 

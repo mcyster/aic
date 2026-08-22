@@ -229,6 +229,7 @@ fn turn_persists_events_and_prints_semantic_output() {
     let requests = server.finish();
     assert_eq!(requests[0]["model"], "gpt-5.6");
     assert_eq!(requests[0]["input"][0]["content"], "say hi");
+    assert_eq!(requests[0]["reasoning"]["summary"], "auto");
     assert_eq!(requests[0]["stream"], true);
     assert!(requests[0].get("text").is_none());
 }
@@ -251,7 +252,7 @@ fn high_verbosity_prints_all_model_event_messages() {
     assert!(command_output.status.success());
     assert_eq!(
         String::from_utf8(command_output.stdout).expect("standard output should be UTF-8"),
-        "Detailed thought\nReasoning summary\nFinal answer\n"
+        "### Detailed thought\n### Reasoning summary\nFinal answer\n"
     );
     server.finish();
 }
@@ -303,7 +304,7 @@ fn reasoning_events_are_persisted_and_printed_but_not_replayed_as_assistant_mess
     assert!(first_output.status.success());
     assert_eq!(
         String::from_utf8(first_output.stdout).expect("standard output should be UTF-8"),
-        "Detailed thought\nReasoning summary\nFinal answer\n"
+        "### Detailed thought\n### Reasoning summary\nFinal answer\n"
     );
     let conversation_id = reported_conversation_id(&first_output.stderr);
     let events_directory = data_directory
@@ -385,7 +386,7 @@ fn medium_verbosity_hides_detailed_model_event_messages() {
     assert!(command_output.status.success());
     assert_eq!(
         String::from_utf8(command_output.stdout).expect("standard output should be UTF-8"),
-        "Reasoning summary\nFinal answer\n"
+        "### Reasoning summary\nFinal answer\n"
     );
     server.finish();
 }
