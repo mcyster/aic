@@ -1,5 +1,7 @@
 use std::error::Error;
 
+use futures_util::StreamExt;
+
 use crate::conversation::{
     ConversationEventKind, ConversationId, ModelEvent, UserContent, UserPrompt,
 };
@@ -13,12 +15,9 @@ pub(crate) struct TurnRequest {
     pub(crate) user_prompt: UserPrompt,
 }
 
-pub(crate) struct TurnResult {
-    pub(crate) model_events: Vec<ModelEvent>,
-}
-
 pub(crate) enum TurnProgress {
     ModelInvocationStarted { model: String },
+    ModelEventCompleted { event: ModelEvent },
 }
 
 pub(crate) struct TurnService {
@@ -34,12 +33,12 @@ impl TurnService {
         }
     }
 
-    pub(crate) fn execute(
+    pub(crate) async fn execute(
         &self,
         request: TurnRequest,
         conversation_identified: impl FnOnce(ConversationId),
-        mut report_progress: impl FnMut(TurnProgress),
-    ) -> TurnResultValue<TurnResult> {
+        mut report_progress: impl FnMut(TurnProgress) -> TurnResultValue<()>,
+    ) -> TurnResultValue<()> {
         let conversation_id = match request.conversation_id {
             Some(conversation_id) => {
                 self.event_store.load_conversation(conversation_id)?;
@@ -59,9 +58,10 @@ impl TurnService {
         let source = self.model_driver.source().clone();
         report_progress(TurnProgress::ModelInvocationStarted {
             model: source.model().as_str().to_owned(),
-        });
-        let model_events = self.model_driver.invoke(&conversation)?;
-        for model_event in &model_events {
+        })?;
+        let mut model_events = self.model_driver.invoke(&conversation).await?;
+        while let Some(model_event) = model_events.next().await {
+            let model_event = model_event?;
             self.event_store.append_conversation_event(
                 conversation_id,
                 ConversationEventKind::Model {
@@ -69,9 +69,10 @@ impl TurnService {
                     event: model_event.clone(),
                 },
             )?;
+            report_progress(TurnProgress::ModelEventCompleted { event: model_event })?;
         }
 
-        Ok(TurnResult { model_events })
+        Ok(())
     }
 }
 
@@ -80,15 +81,18 @@ mod tests {
     use std::str::FromStr;
     use std::sync::{Arc, Mutex};
 
+    use futures_util::future::BoxFuture;
+    use futures_util::stream;
+    use futures_util::{FutureExt, StreamExt};
     use serde_json::{Map, Value};
 
-    use super::{TurnRequest, TurnService};
+    use super::{TurnProgress, TurnRequest, TurnService};
     use crate::conversation::{
         AssistantResponse, Conversation, ConversationEventKind, ConversationId, ModelCommunication,
         ModelEvent, ModelEventImportance, ModelId, ModelSource, ProviderId, UserContent,
         UserPrompt,
     };
-    use crate::model_driver::{ModelDriver, ModelDriverError};
+    use crate::model_driver::{ModelDriver, ModelDriverError, ModelEventStream};
     use crate::persistence::EventStore;
 
     struct RecordingModelDriver {
@@ -102,12 +106,16 @@ mod tests {
             &self.source
         }
 
-        fn invoke(&self, conversation: &Conversation) -> Result<Vec<ModelEvent>, ModelDriverError> {
+        fn invoke<'a>(
+            &'a self,
+            conversation: &'a Conversation,
+        ) -> BoxFuture<'a, Result<ModelEventStream, ModelDriverError>> {
             self.inputs
                 .lock()
                 .expect("the model input list should lock")
                 .push(conversation.clone());
-            Ok(self.events.clone())
+            let events = self.events.clone();
+            async move { Ok(stream::iter(events.into_iter().map(Ok)).boxed()) }.boxed()
         }
     }
 
@@ -120,11 +128,37 @@ mod tests {
             &self.source
         }
 
-        fn invoke(
-            &self,
-            _conversation: &Conversation,
-        ) -> Result<Vec<ModelEvent>, ModelDriverError> {
-            Err(ModelDriverError::Provider("failure".to_owned()))
+        fn invoke<'a>(
+            &'a self,
+            _conversation: &'a Conversation,
+        ) -> BoxFuture<'a, Result<ModelEventStream, ModelDriverError>> {
+            async { Err(ModelDriverError::Provider("failure".to_owned())) }.boxed()
+        }
+    }
+
+    struct LateFailingModelDriver {
+        source: ModelSource,
+        completed_event: ModelEvent,
+    }
+
+    impl ModelDriver for LateFailingModelDriver {
+        fn source(&self) -> &ModelSource {
+            &self.source
+        }
+
+        fn invoke<'a>(
+            &'a self,
+            _conversation: &'a Conversation,
+        ) -> BoxFuture<'a, Result<ModelEventStream, ModelDriverError>> {
+            let completed_event = self.completed_event.clone();
+            async move {
+                Ok(stream::iter(vec![
+                    Ok(completed_event),
+                    Err(ModelDriverError::Provider("late failure".to_owned())),
+                ])
+                .boxed())
+            }
+            .boxed()
         }
     }
 
@@ -171,8 +205,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn another_model_driver_continues_from_semantic_conversation_alone() {
+    #[tokio::test]
+    async fn another_model_driver_continues_from_semantic_conversation_alone() {
         let root_directory =
             std::env::temp_dir().join(format!("tog-model-driver-test-{}", uuid::Uuid::now_v7()));
         let event_store =
@@ -193,8 +227,9 @@ mod tests {
                 |identified_conversation_id| {
                     conversation_id = Some(identified_conversation_id);
                 },
-                |_| {},
+                |_| Ok(()),
             )
+            .await
             .expect("the first turn should complete");
         let conversation_id =
             conversation_id.expect("the first turn should identify its conversation");
@@ -212,8 +247,9 @@ mod tests {
             .execute(
                 turn_request(Some(conversation_id), "Second question"),
                 |_| {},
-                |_| {},
+                |_| Ok(()),
             )
+            .await
             .expect("the second turn should complete");
 
         let recorded_inputs = second_inputs
@@ -239,8 +275,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn turn_service_assigns_source_to_every_returned_model_event() {
+    #[tokio::test]
+    async fn completed_events_are_persisted_before_they_are_reported() {
         let root_directory =
             std::env::temp_dir().join(format!("tog-returned-events-test-{}", uuid::Uuid::now_v7()));
         let event_store =
@@ -258,19 +294,52 @@ mod tests {
             }),
         );
 
-        let mut conversation_id = None;
-        let result = service
+        let identified_conversation_id = Arc::new(Mutex::new(None));
+        let identification = Arc::clone(&identified_conversation_id);
+        let report_conversation_id = Arc::clone(&identified_conversation_id);
+        let reported_event_counts = Arc::new(Mutex::new(Vec::new()));
+        let report_counts = Arc::clone(&reported_event_counts);
+        let report_root_directory = root_directory.clone();
+        service
             .execute(
                 turn_request(None, "Question"),
-                |identified_conversation_id| {
-                    conversation_id = Some(identified_conversation_id);
+                move |conversation_id| {
+                    *identification
+                        .lock()
+                        .expect("the conversation identification should lock") =
+                        Some(conversation_id);
                 },
-                |_| {},
+                move |progress| {
+                    if let TurnProgress::ModelEventCompleted { .. } = progress {
+                        let conversation_id = report_conversation_id
+                            .lock()
+                            .expect("the conversation identification should lock")
+                            .expect("the turn should identify its conversation");
+                        let event_count = EventStore::new(report_root_directory.clone())?
+                            .load_conversation(conversation_id)?
+                            .events()
+                            .len();
+                        report_counts
+                            .lock()
+                            .expect("the report count list should lock")
+                            .push(event_count);
+                    }
+                    Ok(())
+                },
             )
+            .await
             .expect("the turn should complete");
-        let conversation_id = conversation_id.expect("the turn should identify its conversation");
+        let conversation_id = identified_conversation_id
+            .lock()
+            .expect("the conversation identification should lock")
+            .expect("the turn should identify its conversation");
 
-        assert_eq!(result.model_events.len(), 2);
+        assert_eq!(
+            *reported_event_counts
+                .lock()
+                .expect("the report count list should lock"),
+            [2, 3]
+        );
         let conversation = EventStore::new(root_directory)
             .expect("the event store should reopen")
             .load_conversation(conversation_id)
@@ -292,8 +361,8 @@ mod tests {
         assert_eq!(event_source, &source);
     }
 
-    #[test]
-    fn failed_invocation_retains_only_the_user_event() {
+    #[tokio::test]
+    async fn failed_invocation_retains_only_the_user_event() {
         let root_directory = std::env::temp_dir().join(format!(
             "tog-model-driver-failure-test-{}",
             uuid::Uuid::now_v7()
@@ -308,13 +377,15 @@ mod tests {
         );
 
         let mut conversation_id = None;
-        let result = service.execute(
-            turn_request(None, "Question"),
-            |identified_conversation_id| {
-                conversation_id = Some(identified_conversation_id);
-            },
-            |_| {},
-        );
+        let result = service
+            .execute(
+                turn_request(None, "Question"),
+                |identified_conversation_id| {
+                    conversation_id = Some(identified_conversation_id);
+                },
+                |_| Ok(()),
+            )
+            .await;
 
         assert!(result.is_err());
         let conversation = service
@@ -328,8 +399,46 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn nonexistent_conversation_is_not_created_by_a_turn() {
+    #[tokio::test]
+    async fn late_stream_failure_preserves_the_completed_model_event() {
+        let root_directory = std::env::temp_dir().join(format!(
+            "tog-late-model-driver-failure-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let service = TurnService::new(
+            EventStore::new(root_directory).expect("the event store should be created"),
+            Box::new(LateFailingModelDriver {
+                source: model_source("test-provider", "test-model"),
+                completed_event: assistant_response("Completed answer"),
+            }),
+        );
+
+        let mut conversation_id = None;
+        let result = service
+            .execute(
+                turn_request(None, "Question"),
+                |identified_conversation_id| conversation_id = Some(identified_conversation_id),
+                |_| Ok(()),
+            )
+            .await;
+
+        assert!(result.is_err());
+        let conversation = service
+            .event_store
+            .load_conversation(conversation_id.expect("the turn should identify its conversation"))
+            .expect("the conversation should load");
+        assert_eq!(conversation.events().len(), 2);
+        assert_eq!(
+            conversation.events()[1].kind,
+            conversation_model_event_kind(
+                service.model_driver.source(),
+                assistant_response("Completed answer")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn nonexistent_conversation_is_not_created_by_a_turn() {
         let root_directory = std::env::temp_dir().join(format!(
             "tog-missing-conversation-test-{}",
             uuid::Uuid::now_v7()
@@ -347,11 +456,13 @@ mod tests {
             }),
         );
 
-        let result = service.execute(
-            turn_request(Some(conversation_id), "Question"),
-            |_| {},
-            |_| {},
-        );
+        let result = service
+            .execute(
+                turn_request(Some(conversation_id), "Question"),
+                |_| {},
+                |_| Ok(()),
+            )
+            .await;
 
         assert!(result.is_err());
         assert!(

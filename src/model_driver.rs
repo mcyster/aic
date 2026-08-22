@@ -1,12 +1,20 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+use futures_util::future::BoxFuture;
+use futures_util::stream::BoxStream;
+
 use crate::conversation::{Conversation, ModelEvent, ModelSource};
+
+pub(crate) type ModelEventStream = BoxStream<'static, Result<ModelEvent, ModelDriverError>>;
 
 pub(crate) trait ModelDriver {
     fn source(&self) -> &ModelSource;
 
-    fn invoke(&self, conversation: &Conversation) -> Result<Vec<ModelEvent>, ModelDriverError>;
+    fn invoke<'a>(
+        &'a self,
+        conversation: &'a Conversation,
+    ) -> BoxFuture<'a, Result<ModelEventStream, ModelDriverError>>;
 }
 
 #[derive(Debug, Eq, PartialEq)]

@@ -1,11 +1,12 @@
 use std::ffi::OsString;
+use std::io::{self, Write};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::conversation::{ConversationId, ModelEventImportance, ModelId};
+use crate::conversation::{ConversationId, ModelEvent, ModelEventImportance, ModelId};
 use crate::openai::OpenAiModelDriver;
 use crate::persistence::EventStore;
-use crate::turn::{TurnProgress, TurnRequest, TurnResult, TurnResultValue, TurnService};
+use crate::turn::{TurnProgress, TurnRequest, TurnResultValue, TurnService};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,7 +35,7 @@ impl CommandLine {
         Self::parse_from(arguments)
     }
 
-    pub(crate) fn execute(self) -> TurnResultValue<TurnResult> {
+    pub(crate) async fn execute(self) -> TurnResultValue<()> {
         match self.command {
             Command::Turn(arguments) => {
                 let user_prompt = arguments.user_prompt_words.join(" ").parse()?;
@@ -43,25 +44,42 @@ impl CommandLine {
                     EventStore::from_environment()?,
                     Box::new(OpenAiModelDriver::from_environment(arguments.model)?),
                 );
-                let mut turn_result = turn_service.execute(
-                    TurnRequest {
-                        conversation_id: arguments.conversation,
-                        user_prompt,
-                    },
-                    |conversation_id| eprintln!("#> conversation {conversation_id}"),
-                    |progress| match progress {
-                        TurnProgress::ModelInvocationStarted { model } => {
-                            eprintln!("## waiting for model {model}");
-                        }
-                    },
-                )?;
-                turn_result
-                    .model_events
-                    .retain(|event| verbosity.includes(event.importance()));
-                Ok(turn_result)
+                turn_service
+                    .execute(
+                        TurnRequest {
+                            conversation_id: arguments.conversation,
+                            user_prompt,
+                        },
+                        |conversation_id| eprintln!("#> conversation {conversation_id}"),
+                        |progress| {
+                            match progress {
+                                TurnProgress::ModelInvocationStarted { model } => {
+                                    eprintln!("## waiting for model {model}");
+                                }
+                                TurnProgress::ModelEventCompleted { event }
+                                    if verbosity.includes(event.importance()) =>
+                                {
+                                    render_model_event(&event)?;
+                                }
+                                TurnProgress::ModelEventCompleted { .. } => {}
+                            }
+                            Ok(())
+                        },
+                    )
+                    .await
             }
         }
     }
+}
+
+fn render_model_event(model_event: &ModelEvent) -> io::Result<()> {
+    let prefix = match model_event {
+        ModelEvent::AssistantResponse(_) => "",
+        ModelEvent::Communication(_) => "### ",
+    };
+    let mut standard_output = io::stdout().lock();
+    writeln!(standard_output, "{prefix}{}", model_event.message())?;
+    standard_output.flush()
 }
 
 #[derive(Debug, Subcommand)]

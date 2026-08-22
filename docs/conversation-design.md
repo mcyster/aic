@@ -1,6 +1,6 @@
 # Conversation and ModelDriver Architecture
 
-**Status:** Phase 1 semantic text milestone implemented; asynchronous streaming `ModelDriver` implementation pending
+**Status:** Phase 1 asynchronous streaming text milestone implemented
 **Purpose:** Define a simple, durable conversation model and a narrow `ModelDriver` boundary that can be implemented against the OpenAI Responses API now and can support switching models/providers within a conversation.
 
 This design is intentionally incomplete.
@@ -634,7 +634,7 @@ The important Phase 1 properties are:
 - expected failures are strongly typed
 - provider SDK types do not cross the boundary
 
-A caller that wants batch behavior can collect the stream. No separate batch interface is required. We expect to iterate directly on this interface during implementation.
+A caller that wants batch behavior can collect the stream. No separate batch interface is required. Later implementation experience may still pressure the interface.
 
 ---
 
@@ -1311,9 +1311,9 @@ These may become useful later, but they should not burden the first ModelDriver 
 
 ## 46. First implementation milestone
 
-The basic semantic text milestone is implemented with the superseded batch boundary. Moving that implementation to the accepted asynchronous streaming boundary is the next architectural implementation step. Tool use, semantic error events, content references, and provider tracing remain follow-up work.
+The basic semantic text milestone uses the asynchronous streaming boundary. Tool use, semantic error events, content references, and provider tracing remain follow-up work.
 
-The asynchronous streaming implementation should prove:
+The asynchronous streaming implementation proves:
 
 ```text
 generate ConversationId and append User("hello") as the first event

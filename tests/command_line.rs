@@ -2,7 +2,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -35,6 +36,11 @@ enum MockResponse {
     },
     Failure {
         status: &'static str,
+    },
+    Incremental {
+        first_events: &'static str,
+        remaining_events: &'static str,
+        continue_response: Receiver<()>,
     },
 }
 
@@ -106,6 +112,29 @@ fn read_request(stream: &TcpStream) -> Value {
 }
 
 fn write_response(stream: &mut TcpStream, response: MockResponse) {
+    if let MockResponse::Incremental {
+        first_events,
+        remaining_events,
+        continue_response,
+    } = response
+    {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{first_events}"
+        )
+        .expect("the first mock response events should write");
+        stream
+            .flush()
+            .expect("the first mock response events should flush");
+        continue_response
+            .recv()
+            .expect("the test should permit the response to continue");
+        stream
+            .write_all(remaining_events.as_bytes())
+            .expect("the remaining mock response events should write");
+        return;
+    }
+
     let (status, content_type, response_body) = match response {
         MockResponse::Success {
             response_id,
@@ -148,6 +177,7 @@ fn write_response(stream: &mut TcpStream, response: MockResponse) {
             "application/json",
             "{\"error\":{\"message\":\"request rejected\"}}".to_owned(),
         ),
+        MockResponse::Incremental { .. } => unreachable!("handled before the response match"),
     };
     write!(
         stream,
@@ -262,7 +292,59 @@ fn high_verbosity_prints_all_model_event_messages() {
         String::from_utf8(command_output.stdout).expect("standard output should be UTF-8"),
         "### Detailed thought\n### Reasoning summary\nFinal answer\n"
     );
-    server.finish();
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn cli_output_is_incremental_and_not_duplicated() {
+    let (continue_response, response_permission) = mpsc::channel();
+    let server = MockOpenAiServer::start(vec![MockResponse::Incremental {
+        first_events: concat!(
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"Detailed thought\"}\n\n",
+            "data: {\"type\":\"response.reasoning_text.done\",\"text\":\"Detailed thought\"}\n\n"
+        ),
+        remaining_events: concat!(
+            "data: {\"type\":\"response.output_text.done\",\"text\":\"Final answer\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+            "data: [DONE]\n\n"
+        ),
+        continue_response: response_permission,
+    }]);
+    let data_directory = temporary_data_directory();
+    let mut command = configured_command(&server, &data_directory);
+    let mut child = command
+        .args(["--verbosity", "high", "Explain ownership"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("tog should start");
+    let mut standard_output = BufReader::new(
+        child
+            .stdout
+            .take()
+            .expect("tog standard output should be captured"),
+    );
+    let mut first_line = String::new();
+
+    standard_output
+        .read_line(&mut first_line)
+        .expect("the first semantic event should be readable");
+
+    assert_eq!(first_line, "### Detailed thought\n");
+    continue_response
+        .send(())
+        .expect("the mock response should continue");
+    let mut remaining_output = String::new();
+    standard_output
+        .read_to_string(&mut remaining_output)
+        .expect("the remaining semantic events should be readable");
+    let output = child.wait_with_output().expect("tog should stop");
+
+    assert!(output.status.success());
+    assert_eq!(remaining_output, "Final answer\n");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
 }
 
 #[test]

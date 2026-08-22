@@ -48,4 +48,4 @@ The application owns and starts the runtime; reusable components must not secret
 
 Callers can present and persist completed semantic output with stream backpressure before an invocation finishes, and late failures no longer invalidate earlier completed facts. Drivers must distinguish setup failures from failures after stream establishment and must retain incomplete protocol aggregation privately until it forms a complete semantic event.
 
-The model boundary joins the Rust async ecosystem and requires `futures-util`, Tokio, and asynchronous Reqwest support when implemented. Dependency versions, exact Tokio feature flags, persistence asyncness, orchestration, cancellation, timeouts, retries, raw token streaming, background requests, and provider-native response continuation remain implementation-pressure decisions.
+The model boundary uses `futures-util`, Tokio, and asynchronous Reqwest support. Dependency versions, exact Tokio feature flags, persistence asyncness, orchestration, cancellation, timeouts, retries, raw token streaming, background requests, and provider-native response continuation remain implementation-pressure decisions.

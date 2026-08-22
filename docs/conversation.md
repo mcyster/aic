@@ -88,7 +88,7 @@ Large or binary content belongs in a content store and is referenced by a strong
 
 ### Model
 
-`Model` combines a typed model-produced `ModelEvent` with the `ModelSource` that produced it. `ModelSource` contains validated provider and model identities. Provenance belongs to the canonical `ConversationEvent`, not the `ModelEvent`, because the caller knows which driver it invoked and records that source on every returned event. Full invocation configuration is not repeated on each event.
+`Model` combines a typed model-produced `ModelEvent` with the `ModelSource` that produced it. `ModelSource` contains validated provider and model identities. Provenance belongs to the canonical `ConversationEvent`, not the `ModelEvent`, because the caller knows which driver it invoked and records that source on every yielded event. Full invocation configuration is not repeated on each event.
 
 `AssistantResponse` is the model's actual response to the conversation. It participates in portable continuation and is always `Important`. `ModelCommunication` records auxiliary model-produced information such as detailed reasoning, reasoning summaries, status, or emerging concepts that do not yet justify another typed variant. Communications are persisted but are not automatically replayed as assistant responses.
 
