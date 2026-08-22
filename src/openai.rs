@@ -1,19 +1,21 @@
 use std::io::{BufRead, BufReader};
+use std::str::FromStr;
 
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use serde_json::{Map, Value, json};
 
 use crate::conversation::{
-    Conversation, ConversationEvent, ModelEvent, ModelEventImportance, UserContent,
+    AssistantResponse, Conversation, ConversationEvent, ModelCommunication, ModelEvent,
+    ModelEventImportance, ModelId, ModelSource, ProviderId, UserContent,
 };
-use crate::model_driver::{ModelDriver, ModelDriverError, ModelId};
+use crate::model_driver::{ModelDriver, ModelDriverError};
 
 pub(crate) struct OpenAiModelDriver {
     http_client: Client,
     api_key: String,
     responses_url: String,
-    model: ModelId,
+    source: ModelSource,
 }
 
 impl OpenAiModelDriver {
@@ -27,24 +29,25 @@ impl OpenAiModelDriver {
             http_client: Client::new(),
             api_key,
             responses_url: format!("{}/responses", base_url.trim_end_matches('/')),
-            model,
+            source: ModelSource::new(
+                ProviderId::from_str("openai")
+                    .expect("the OpenAI provider identifier should be valid"),
+                model,
+            ),
         })
     }
 }
 
 impl ModelDriver for OpenAiModelDriver {
-    fn model(&self) -> &ModelId {
-        &self.model
+    fn source(&self) -> &ModelSource {
+        &self.source
     }
 
-    fn invoke(
-        &self,
-        conversation: &Conversation,
-    ) -> Result<Vec<ConversationEvent>, ModelDriverError> {
+    fn invoke(&self, conversation: &Conversation) -> Result<Vec<ModelEvent>, ModelDriverError> {
         let mut request_body = Map::new();
         request_body.insert(
             "model".to_owned(),
-            Value::String(self.model.as_str().to_owned()),
+            Value::String(self.source.model().as_str().to_owned()),
         );
         request_body.insert("input".to_owned(), semantic_input(conversation));
         request_body.insert("stream".to_owned(), Value::Bool(true));
@@ -65,7 +68,7 @@ impl ModelDriver for OpenAiModelDriver {
             return Err(classify_response_error(response_status, response_body));
         }
 
-        parse_server_sent_events(BufReader::new(response), self.model.as_str())
+        parse_server_sent_events(BufReader::new(response))
     }
 }
 
@@ -85,9 +88,10 @@ fn semantic_input(conversation: &Conversation) -> Value {
                         .join("\n");
                     Some(json!({ "role": "user", "content": text }))
                 }
-                ConversationEvent::Model { event } if event.subtype == "response" => {
-                    Some(json!({ "role": "assistant", "content": event.message }))
-                }
+                ConversationEvent::Model {
+                    event: ModelEvent::AssistantResponse(response),
+                    ..
+                } => Some(json!({ "role": "assistant", "content": response.message() })),
                 ConversationEvent::Model { .. } => None,
             })
             .collect(),
@@ -105,10 +109,7 @@ fn classify_response_error(status: StatusCode, body: String) -> ModelDriverError
     }
 }
 
-fn parse_server_sent_events(
-    mut reader: impl BufRead,
-    model: &str,
-) -> Result<Vec<ConversationEvent>, ModelDriverError> {
+fn parse_server_sent_events(mut reader: impl BufRead) -> Result<Vec<ModelEvent>, ModelDriverError> {
     let mut line = String::new();
     let mut event_name = None;
     let mut data_lines = Vec::new();
@@ -120,13 +121,13 @@ fn parse_server_sent_events(
             .read_line(&mut line)
             .map_err(|error| ModelDriverError::Transport(error.to_string()))?;
         if bytes_read == 0 {
-            process_event(&mut event_name, &mut data_lines, &mut response_state, model)?;
+            process_event(&mut event_name, &mut data_lines, &mut response_state)?;
             break;
         }
 
         let normalized_line = line.trim_end_matches(['\r', '\n']);
         if normalized_line.is_empty() {
-            process_event(&mut event_name, &mut data_lines, &mut response_state, model)?;
+            process_event(&mut event_name, &mut data_lines, &mut response_state)?;
         } else if let Some(name) = normalized_line.strip_prefix("event:") {
             event_name = Some(name.trim_start().to_owned());
         } else if let Some(data) = normalized_line.strip_prefix("data:") {
@@ -150,7 +151,7 @@ struct ResponseState {
     completed_reasoning_text: Option<String>,
     reasoning_summary: String,
     completed_reasoning_summary: Option<String>,
-    events: Vec<ConversationEvent>,
+    events: Vec<ModelEvent>,
     completed: bool,
 }
 
@@ -158,7 +159,6 @@ fn process_event(
     event_name: &mut Option<String>,
     data_lines: &mut Vec<String>,
     response_state: &mut ResponseState,
-    model: &str,
 ) -> Result<(), ModelDriverError> {
     if data_lines.is_empty() {
         *event_name = None;
@@ -203,7 +203,7 @@ fn process_event(
         "response.reasoning_summary_text.done" => {
             response_state.completed_reasoning_summary = text_field(&payload, "text");
         }
-        "response.completed" => complete_response(response_state, &payload, model)?,
+        "response.completed" => complete_response(response_state, &payload)?,
         "error" | "response.failed" => {
             return Err(ModelDriverError::Provider(format!(
                 "OpenAI stream emitted {event_type}: {payload}"
@@ -217,7 +217,6 @@ fn process_event(
 fn complete_response(
     response_state: &mut ResponseState,
     payload: &Value,
-    model: &str,
 ) -> Result<(), ModelDriverError> {
     if response_state.completed {
         return Err(ModelDriverError::InvalidResponse(
@@ -229,22 +228,20 @@ fn complete_response(
         &response_state.reasoning_text,
         &response_state.completed_reasoning_text,
     ) {
-        response_state.events.push(model_event(
+        response_state.events.push(model_communication(
             reasoning_text,
             "reasoning",
             ModelEventImportance::Detailed,
-            model,
         ));
     }
     if let Some(reasoning_summary) = preferred_text(
         &response_state.reasoning_summary,
         &response_state.completed_reasoning_summary,
     ) {
-        response_state.events.push(model_event(
+        response_state.events.push(model_communication(
             reasoning_summary,
             "reasoning_summary",
             ModelEventImportance::Interesting,
-            model,
         ));
     }
 
@@ -258,33 +255,27 @@ fn complete_response(
             "the completed response contained no model message".to_owned(),
         )
     })?;
-    response_state.events.push(model_event(
-        assistant_text,
-        "response",
-        ModelEventImportance::Important,
-        model,
-    ));
+    response_state
+        .events
+        .push(ModelEvent::AssistantResponse(AssistantResponse::new(
+            assistant_text,
+            Map::new(),
+        )));
     response_state.completed = true;
     Ok(())
 }
 
-fn model_event(
+fn model_communication(
     message: String,
     subtype: &str,
     importance: ModelEventImportance,
-    model: &str,
-) -> ConversationEvent {
-    let mut data = Map::new();
-    data.insert("provider".to_owned(), Value::String("openai".to_owned()));
-    data.insert("model".to_owned(), Value::String(model.to_owned()));
-    ConversationEvent::Model {
-        event: ModelEvent {
-            message,
-            subtype: subtype.to_owned(),
-            importance,
-            data,
-        },
-    }
+) -> ModelEvent {
+    ModelEvent::Communication(ModelCommunication::new(
+        message,
+        importance,
+        subtype.to_owned(),
+        Map::new(),
+    ))
 }
 
 fn append_delta(payload: &Value, text: &mut String) {
@@ -339,14 +330,15 @@ mod tests {
     use std::io::Cursor;
 
     use reqwest::StatusCode;
+    use serde_json::Map;
 
-    use crate::conversation::{ConversationEvent, ModelEventImportance};
+    use crate::conversation::{ModelCommunication, ModelEvent, ModelEventImportance};
     use crate::model_driver::ModelDriverError;
 
     use super::{classify_response_error, parse_server_sent_events};
 
     #[test]
-    fn streaming_response_returns_important_model_event() {
+    fn streaming_response_returns_assistant_response() {
         let stream = concat!(
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n",
@@ -355,16 +347,14 @@ mod tests {
             "data: [DONE]\n\n"
         );
 
-        let events = parse_server_sent_events(Cursor::new(stream), "gpt-test")
+        let events = parse_server_sent_events(Cursor::new(stream))
             .expect("the response stream should parse");
 
-        let ConversationEvent::Model { event } = &events[0] else {
-            panic!("the returned event should be a model event");
+        let ModelEvent::AssistantResponse(response) = &events[0] else {
+            panic!("the returned event should be an assistant response");
         };
-        assert_eq!(event.message, "Hello");
-        assert_eq!(event.subtype, "response");
-        assert_eq!(event.importance, ModelEventImportance::Important);
-        assert_eq!(event.data["model"], "gpt-test");
+        assert_eq!(response.message(), "Hello");
+        assert_eq!(events[0].importance(), ModelEventImportance::Important);
     }
 
     #[test]
@@ -377,22 +367,43 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
         );
 
-        let events = parse_server_sent_events(Cursor::new(stream), "gpt-test")
+        let events = parse_server_sent_events(Cursor::new(stream))
             .expect("the response stream should parse");
 
         assert_eq!(events.len(), 3);
-        let importances = events.iter().map(|event| match event {
-            ConversationEvent::Model { event } => event.importance,
-            ConversationEvent::User { .. } => panic!("the driver should return model events"),
-        });
         assert_eq!(
-            importances.collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(ModelEvent::importance)
+                .collect::<Vec<_>>(),
             [
                 ModelEventImportance::Detailed,
                 ModelEventImportance::Interesting,
                 ModelEventImportance::Important
             ]
         );
+        assert_eq!(
+            events[0],
+            ModelEvent::Communication(ModelCommunication::new(
+                "Detailed thought".to_owned(),
+                ModelEventImportance::Detailed,
+                "reasoning".to_owned(),
+                Map::new(),
+            ))
+        );
+        assert_eq!(
+            events[1],
+            ModelEvent::Communication(ModelCommunication::new(
+                "Summary".to_owned(),
+                ModelEventImportance::Interesting,
+                "reasoning_summary".to_owned(),
+                Map::new(),
+            ))
+        );
+        let ModelEvent::AssistantResponse(response) = &events[2] else {
+            panic!("the final event should be an assistant response");
+        };
+        assert_eq!(response.message(), "Answer");
     }
 
     #[test]
@@ -403,7 +414,7 @@ mod tests {
             "data: {\"type\":\"error\",\"message\":\"late failure\"}\n\n"
         );
 
-        let result = parse_server_sent_events(Cursor::new(stream), "gpt-test");
+        let result = parse_server_sent_events(Cursor::new(stream));
 
         assert!(matches!(result, Err(ModelDriverError::Provider(_))));
     }

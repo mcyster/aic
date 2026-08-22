@@ -1,14 +1,17 @@
 mod event;
 mod id;
+mod model;
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
 pub(crate) use event::{
-    ConversationEvent, ModelEvent, ModelEventImportance, StoredConversationEvent, UserContent,
+    AssistantResponse, ConversationEvent, ModelCommunication, ModelEvent, ModelEventImportance,
+    StoredConversationEvent, UserContent,
 };
 pub(crate) use id::{ConversationEventId, ConversationId};
+pub(crate) use model::{ModelId, ModelSource, ProviderId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Conversation {
@@ -145,7 +148,7 @@ mod tests {
             position,
             id: ConversationEventId::new(),
             timestamp_milliseconds: position,
-            schema_version: 4,
+            schema_version: 5,
             event: ConversationEvent::User {
                 content: vec![UserContent::Text(format!("event {position}"))],
             },

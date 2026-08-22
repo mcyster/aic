@@ -1,49 +1,13 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::str::FromStr;
 
-use crate::conversation::{Conversation, ConversationEvent};
+use crate::conversation::{Conversation, ModelEvent, ModelSource};
 
 pub(crate) trait ModelDriver {
-    fn model(&self) -> &ModelId;
+    fn source(&self) -> &ModelSource;
 
-    fn invoke(
-        &self,
-        conversation: &Conversation,
-    ) -> Result<Vec<ConversationEvent>, ModelDriverError>;
+    fn invoke(&self, conversation: &Conversation) -> Result<Vec<ModelEvent>, ModelDriverError>;
 }
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ModelId(String);
-
-impl ModelId {
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl FromStr for ModelId {
-    type Err = InvalidModelId;
-
-    fn from_str(unvalidated_value: &str) -> Result<Self, Self::Err> {
-        let normalized_value = unvalidated_value.trim();
-        if normalized_value.is_empty() {
-            return Err(InvalidModelId);
-        }
-        Ok(Self(normalized_value.to_owned()))
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct InvalidModelId;
-
-impl Display for InvalidModelId {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "model identifier must not be empty")
-    }
-}
-
-impl Error for InvalidModelId {}
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ModelDriverError {

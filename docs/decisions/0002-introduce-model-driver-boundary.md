@@ -12,7 +12,7 @@ This is the concrete requirement anticipated by ADR 0001's restriction on specul
 
 ## Decision
 
-Introduce a narrow `ModelDriver` boundary. A configured driver exposes its model, receives an immutable view of the semantic Conversation Log, and returns zero or more semantic `ConversationEvent`s or a typed model error.
+Introduce a narrow `ModelDriver` boundary. A configured driver exposes its typed provider/model source, receives an immutable view of the semantic Conversation Log, and returns zero or more typed `ModelEvent`s or a typed model error. The caller records the driver's source when it converts returned model events into canonical `ConversationEvent`s.
 
 OpenAI request types, streaming events, response IDs, and transport errors remain inside the OpenAI implementation. The Conversation Log is the only durable history required for correctness. Provider-native continuation may be added later only as an optional optimization.
 

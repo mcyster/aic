@@ -13,7 +13,7 @@ use crate::conversation::{
     Conversation, ConversationEvent, ConversationEventId, ConversationId, StoredConversationEvent,
 };
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 pub(crate) struct EventStore {
     root_directory: PathBuf,

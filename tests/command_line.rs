@@ -203,15 +203,15 @@ fn turn_persists_events_and_prints_semantic_output() {
         .join("conversations")
         .join(conversation_id.trim_start_matches("conversation_"));
     assert!(!conversation_directory.join("conversation.json").exists());
-    let first_event_path = fs::read_dir(conversation_directory.join("events"))
+    let mut event_paths = fs::read_dir(conversation_directory.join("events"))
         .expect("the persisted events should be readable")
         .map(|entry| entry.expect("the event entry should be readable").path())
-        .min()
-        .expect("the conversation should contain an event");
+        .collect::<Vec<_>>();
+    event_paths.sort();
     let first_event: Value = serde_json::from_reader(
-        fs::File::open(first_event_path).expect("the persisted event should open"),
+        fs::File::open(&event_paths[0]).expect("the persisted user event should open"),
     )
-    .expect("the persisted event should be JSON");
+    .expect("the persisted user event should be JSON");
     assert_eq!(
         first_event["conversation_id"]
             .as_str()
@@ -219,6 +219,13 @@ fn turn_persists_events_and_prints_semantic_output() {
             .replace('-', ""),
         conversation_id.trim_start_matches("conversation_")
     );
+    let model_event: Value = serde_json::from_reader(
+        fs::File::open(&event_paths[1]).expect("the persisted model event should open"),
+    )
+    .expect("the persisted model event should be JSON");
+    assert_eq!(model_event["event"]["source"]["provider"], "openai");
+    assert_eq!(model_event["event"]["source"]["model"], "gpt-5.6");
+    assert_eq!(model_event["event"]["event"]["type"], "assistant_response");
     let requests = server.finish();
     assert_eq!(requests[0]["model"], "gpt-5.6");
     assert_eq!(requests[0]["input"][0]["content"], "say hi");
@@ -245,6 +252,29 @@ fn high_verbosity_prints_all_model_event_messages() {
     assert_eq!(
         String::from_utf8(command_output.stdout).expect("standard output should be UTF-8"),
         "Detailed thought\nReasoning summary\nFinal answer\n"
+    );
+    server.finish();
+}
+
+#[test]
+fn low_verbosity_prints_only_the_assistant_response() {
+    let server = MockOpenAiServer::start(vec![MockResponse::SuccessWithReasoning {
+        response_id: "resp_low",
+        detailed: "Detailed thought",
+        interesting: "Reasoning summary",
+        important: "Final answer",
+    }]);
+    let data_directory = temporary_data_directory();
+
+    let command_output = configured_command(&server, &data_directory)
+        .args(["--verbosity", "low", "Explain ownership"])
+        .output()
+        .expect("tog should run");
+
+    assert!(command_output.status.success());
+    assert_eq!(
+        String::from_utf8(command_output.stdout).expect("standard output should be UTF-8"),
+        "Final answer\n"
     );
     server.finish();
 }
@@ -295,12 +325,20 @@ fn reasoning_events_are_persisted_and_printed_but_not_replayed_as_assistant_mess
         })
         .collect::<Vec<_>>();
     assert_eq!(
+        persisted_events[1]["event"]["event"]["type"],
+        "communication"
+    );
+    assert_eq!(
         persisted_events[1]["event"]["event"]["subtype"],
         "reasoning"
     );
     assert_eq!(
         persisted_events[1]["event"]["event"]["message"],
         "Detailed thought"
+    );
+    assert_eq!(
+        persisted_events[2]["event"]["event"]["type"],
+        "communication"
     );
     assert_eq!(
         persisted_events[2]["event"]["event"]["subtype"],

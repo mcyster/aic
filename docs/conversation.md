@@ -88,11 +88,13 @@ Large or binary content belongs in a content store and is referenced by a strong
 
 ### Model
 
-`Model` records a model-produced event with a message, a driver-defined subtype, importance, and an open object of driver-defined data. Model events are polymorphic without making provider-specific fields part of the universal conversation vocabulary.
+`Model` combines a typed model-produced `ModelEvent` with the `ModelSource` that produced it. `ModelSource` contains validated provider and model identities. Provenance belongs to the canonical `ConversationEvent`, not the `ModelEvent`, because the caller knows which driver it invoked and records that source on every returned event. Full invocation configuration is not repeated on each event.
 
-Importance has three ordered levels: `Detailed`, `Interesting`, and `Important`. The producing driver classifies the event; consumers decide which messages to present. The CLI maps low, medium, and high verbosity to progressively broader importance levels.
+`AssistantResponse` is the model's actual response to the conversation. It participates in portable continuation and is always `Important`. `ModelCommunication` records auxiliary model-produced information such as detailed reasoning, reasoning summaries, status, or emerging concepts that do not yet justify another typed variant. Communications are persisted but are not automatically replayed as assistant responses.
 
-Exposed chain-of-thought is aggregated into coherent model events rather than persisting every transport delta. Detailed reasoning is normally `Detailed`, reasoning summaries may be `Interesting`, and final responses are `Important`.
+Communication importance has three ordered levels: `Detailed`, `Interesting`, and `Important`. Consumers decide which messages to present, and the CLI maps low, medium, and high verbosity to progressively broader levels. Repeated cross-driver concepts may later be promoted from `ModelCommunication` into explicit `ModelEvent` variants.
+
+Both typed variants retain meaningful portable messages and may carry extensions. Extensions provide driver-specific enrichment but do not replace the portable contract and may be ignored when not understood. Exposed reasoning is aggregated into coherent communications rather than persisting every transport delta.
 
 For example, several provider events may project to one response:
 
@@ -100,7 +102,7 @@ For example, several provider events may project to one response:
 text.delta "Hel"
 text.delta "lo"
 output.done
-    -> Model(message="Hello", importance=Important)
+    -> Model(source=..., event=AssistantResponse(message="Hello"))
 ```
 
 ### ToolRequest And ToolResponse
@@ -153,7 +155,7 @@ Event positions must not be used as semantic identifiers.
 
 User input is appended before model invocation. A failed invocation therefore retains the `User` event but does not persist partial model output.
 
-The `ModelDriver` receives an immutable reference to the reconstructed `Conversation` and returns zero or more new `ConversationEvent`s. The caller assigns persistence metadata and appends returned events in order after a successful invocation.
+The `ModelDriver` receives an immutable reference to the reconstructed `Conversation` and returns zero or more typed `ModelEvent`s. The caller combines each with the invoked driver's `ModelSource`, assigns persistence metadata, and appends the resulting `ConversationEvent`s in order after a successful invocation.
 
 Provider-native state may later improve same-provider continuation, but the Conversation Log remains the durable representation used for local reconstruction and cross-provider replay.
 

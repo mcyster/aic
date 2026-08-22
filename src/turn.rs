@@ -54,17 +54,19 @@ impl TurnService {
         conversation_identified(conversation_id);
 
         let conversation = self.event_store.load_conversation(conversation_id)?;
+        let source = self.model_driver.source().clone();
         report_progress(TurnProgress::ModelInvocationStarted {
-            model: self.model_driver.model().as_str().to_owned(),
+            model: source.model().as_str().to_owned(),
         });
-        let returned_events = self.model_driver.invoke(&conversation)?;
-        let mut model_events = Vec::new();
-        for event in returned_events {
-            if let ConversationEvent::Model { event } = &event {
-                model_events.push(event.clone());
-            }
-            self.event_store
-                .append_conversation_event(conversation_id, event)?;
+        let model_events = self.model_driver.invoke(&conversation)?;
+        for model_event in &model_events {
+            self.event_store.append_conversation_event(
+                conversation_id,
+                ConversationEvent::Model {
+                    source: source.clone(),
+                    event: model_event.clone(),
+                },
+            )?;
         }
 
         Ok(TurnResult { model_events })
@@ -80,27 +82,25 @@ mod tests {
 
     use super::{TurnRequest, TurnService};
     use crate::conversation::{
-        Conversation, ConversationEvent, ConversationId, ModelEvent, ModelEventImportance,
-        UserContent, UserPrompt,
+        AssistantResponse, Conversation, ConversationEvent, ConversationId, ModelCommunication,
+        ModelEvent, ModelEventImportance, ModelId, ModelSource, ProviderId, UserContent,
+        UserPrompt,
     };
-    use crate::model_driver::{ModelDriver, ModelDriverError, ModelId};
+    use crate::model_driver::{ModelDriver, ModelDriverError};
     use crate::persistence::EventStore;
 
     struct RecordingModelDriver {
-        model: ModelId,
-        events: Vec<ConversationEvent>,
+        source: ModelSource,
+        events: Vec<ModelEvent>,
         inputs: Arc<Mutex<Vec<Conversation>>>,
     }
 
     impl ModelDriver for RecordingModelDriver {
-        fn model(&self) -> &ModelId {
-            &self.model
+        fn source(&self) -> &ModelSource {
+            &self.source
         }
 
-        fn invoke(
-            &self,
-            conversation: &Conversation,
-        ) -> Result<Vec<ConversationEvent>, ModelDriverError> {
+        fn invoke(&self, conversation: &Conversation) -> Result<Vec<ModelEvent>, ModelDriverError> {
             self.inputs
                 .lock()
                 .expect("the model input list should lock")
@@ -110,34 +110,46 @@ mod tests {
     }
 
     struct FailingModelDriver {
-        model: ModelId,
+        source: ModelSource,
     }
 
     impl ModelDriver for FailingModelDriver {
-        fn model(&self) -> &ModelId {
-            &self.model
+        fn source(&self) -> &ModelSource {
+            &self.source
         }
 
         fn invoke(
             &self,
             _conversation: &Conversation,
-        ) -> Result<Vec<ConversationEvent>, ModelDriverError> {
+        ) -> Result<Vec<ModelEvent>, ModelDriverError> {
             Err(ModelDriverError::Provider("failure".to_owned()))
         }
     }
 
-    fn model_id() -> ModelId {
-        ModelId::from_str("test-model").expect("the model identifier should be valid")
+    fn model_source(provider: &str, model: &str) -> ModelSource {
+        ModelSource::new(
+            ProviderId::from_str(provider).expect("the provider identifier should be valid"),
+            ModelId::from_str(model).expect("the model identifier should be valid"),
+        )
     }
 
-    fn model_event(message: &str, importance: ModelEventImportance) -> ConversationEvent {
+    fn assistant_response(message: &str) -> ModelEvent {
+        ModelEvent::AssistantResponse(AssistantResponse::new(message.to_owned(), Map::new()))
+    }
+
+    fn communication(message: &str, importance: ModelEventImportance) -> ModelEvent {
+        ModelEvent::Communication(ModelCommunication::new(
+            message.to_owned(),
+            importance,
+            "test".to_owned(),
+            Map::from_iter([("custom".to_owned(), Value::Bool(true))]),
+        ))
+    }
+
+    fn conversation_model_event(source: &ModelSource, event: ModelEvent) -> ConversationEvent {
         ConversationEvent::Model {
-            event: ModelEvent {
-                message: message.to_owned(),
-                subtype: "test".to_owned(),
-                importance,
-                data: Map::from_iter([("custom".to_owned(), Value::Bool(true))]),
-            },
+            source: source.clone(),
+            event,
         }
     }
 
@@ -154,11 +166,12 @@ mod tests {
             std::env::temp_dir().join(format!("tog-model-driver-test-{}", uuid::Uuid::now_v7()));
         let event_store =
             EventStore::new(root_directory.clone()).expect("the event store should be created");
+        let first_source = model_source("first-provider", "first-model");
         let first_service = TurnService::new(
             event_store,
             Box::new(RecordingModelDriver {
-                model: model_id(),
-                events: vec![model_event("First answer", ModelEventImportance::Important)],
+                source: first_source.clone(),
+                events: vec![assistant_response("First answer")],
                 inputs: Arc::new(Mutex::new(Vec::new())),
             }),
         );
@@ -179,11 +192,8 @@ mod tests {
         let second_service = TurnService::new(
             EventStore::new(root_directory).expect("the event store should reopen"),
             Box::new(RecordingModelDriver {
-                model: model_id(),
-                events: vec![model_event(
-                    "Second answer",
-                    ModelEventImportance::Important,
-                )],
+                source: model_source("second-provider", "second-model"),
+                events: vec![assistant_response("Second answer")],
                 inputs: Arc::clone(&second_inputs),
             }),
         );
@@ -210,7 +220,7 @@ mod tests {
                 ConversationEvent::User {
                     content: vec![UserContent::Text("First question".to_owned())]
                 },
-                model_event("First answer", ModelEventImportance::Important),
+                conversation_model_event(&first_source, assistant_response("First answer")),
                 ConversationEvent::User {
                     content: vec![UserContent::Text("Second question".to_owned())]
                 }
@@ -219,18 +229,19 @@ mod tests {
     }
 
     #[test]
-    fn returned_events_are_persisted_with_importance_and_custom_data() {
+    fn turn_service_assigns_source_to_every_returned_model_event() {
         let root_directory =
             std::env::temp_dir().join(format!("tog-returned-events-test-{}", uuid::Uuid::now_v7()));
         let event_store =
             EventStore::new(root_directory.clone()).expect("the event store should be created");
+        let source = model_source("test-provider", "test-model");
         let service = TurnService::new(
             event_store,
             Box::new(RecordingModelDriver {
-                model: model_id(),
+                source: source.clone(),
                 events: vec![
-                    model_event("Thinking", ModelEventImportance::Detailed),
-                    model_event("Answer", ModelEventImportance::Important),
+                    communication("Thinking", ModelEventImportance::Detailed),
+                    assistant_response("Answer"),
                 ],
                 inputs: Arc::new(Mutex::new(Vec::new())),
             }),
@@ -255,12 +266,19 @@ mod tests {
             .expect("the conversation should load");
         assert_eq!(
             conversation.events()[1].event,
-            model_event("Thinking", ModelEventImportance::Detailed)
+            conversation_model_event(
+                &source,
+                communication("Thinking", ModelEventImportance::Detailed)
+            )
         );
-        let ConversationEvent::Model { event } = &conversation.events()[1].event else {
-            panic!("the event should be a model event");
+        let ConversationEvent::Model {
+            source: stored_source,
+            event: ModelEvent::AssistantResponse(_),
+        } = &conversation.events()[2].event
+        else {
+            panic!("the event should be an assistant response");
         };
-        assert_eq!(event.data["custom"], true);
+        assert_eq!(stored_source, &source);
     }
 
     #[test]
@@ -273,7 +291,9 @@ mod tests {
             EventStore::new(root_directory).expect("the event store should be created");
         let service = TurnService::new(
             event_store,
-            Box::new(FailingModelDriver { model: model_id() }),
+            Box::new(FailingModelDriver {
+                source: model_source("test-provider", "test-model"),
+            }),
         );
 
         let mut conversation_id = None;
@@ -310,7 +330,7 @@ mod tests {
         let service = TurnService::new(
             event_store,
             Box::new(RecordingModelDriver {
-                model: model_id(),
+                source: model_source("test-provider", "test-model"),
                 events: Vec::new(),
                 inputs: Arc::clone(&inputs),
             }),

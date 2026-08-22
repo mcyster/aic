@@ -2,8 +2,7 @@ use std::ffi::OsString;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::conversation::{ConversationId, ModelEventImportance};
-use crate::model_driver::ModelId;
+use crate::conversation::{ConversationId, ModelEventImportance, ModelId};
 use crate::openai::OpenAiModelDriver;
 use crate::persistence::EventStore;
 use crate::turn::{TurnProgress, TurnRequest, TurnResult, TurnResultValue, TurnService};
@@ -58,7 +57,7 @@ impl CommandLine {
                 )?;
                 turn_result
                     .model_events
-                    .retain(|event| verbosity.includes(event.importance));
+                    .retain(|event| verbosity.includes(event.importance()));
                 Ok(turn_result)
             }
         }

@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let turn_result = command_line.execute()?;
 
     for model_event in turn_result.model_events {
-        println!("{}", model_event.message);
+        println!("{}", model_event.message());
     }
     Ok(())
 }

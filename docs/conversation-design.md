@@ -34,16 +34,16 @@ Conversation Log
     cross-model / cross-provider contract
 ```
 
-A `ModelDriver` consumes an immutable reference to the reconstructed conversation and produces semantic conversation events:
+A `ModelDriver` consumes an immutable reference to the reconstructed conversation and produces typed model events:
 
 ```text
 Conversation
     ↓
 ModelDriver.invoke(...)
     ↓
-ConversationEvents
+ModelEvents
     ↓
-append to Conversation
+caller adds ModelSource and appends ConversationEvents
 ```
 
 Provider-specific details such as OpenAI Responses events, response IDs, token timing, reasoning protocol state, and HTTP diagnostics are **not part of the Phase 1 semantic replay contract**.
@@ -289,16 +289,14 @@ A failed model invocation never removes the already-durable `User` event.
 
 ## 9. ModelEvent
 
-`ModelEvent` records model-produced semantic information. It has a required message, a driver-defined subtype, an importance level, and an open object of driver-defined data.
+`ModelEvent` records typed model-produced semantic information. Provenance belongs to the enclosing `ConversationEvent`, not to `ModelEvent`.
 
 The durable common shape is:
 
 ```rust
-struct ModelEvent {
-    message: String,
-    subtype: String,
-    importance: ModelEventImportance,
-    data: Map<String, Value>,
+enum ModelEvent {
+    AssistantResponse(AssistantResponse),
+    Communication(ModelCommunication),
 }
 
 enum ModelEventImportance {
@@ -308,13 +306,13 @@ enum ModelEventImportance {
 }
 ```
 
-The subtype and data make model events polymorphic without requiring the conversation model to know every provider-specific field. The message remains the portable cross-driver representation.
+`AssistantResponse` is the actual response used for portable continuation and is always important. `ModelCommunication` carries auxiliary information with a subtype and importance. Both preserve portable semantic fields and may carry driver-specific extensions.
 
 ---
 
 ## 10. Reasoning and responses
 
-Exposed chain-of-thought and final responses are both model events. A driver aggregates provider deltas into coherent messages before returning them.
+Exposed chain-of-thought and final responses are distinct typed model events. A driver aggregates provider deltas into coherent messages before returning them.
 
 Provider transport may involve many low-level events:
 
@@ -327,10 +325,10 @@ output.done
 but the semantic conversation may record:
 
 ```text
-Model(message="Hello", subtype="response", importance=Important)
+Model(source=..., event=AssistantResponse(message="Hello"))
 ```
 
-A driver may classify detailed reasoning as `Detailed`, a reasoning summary as `Interesting`, and a final response as `Important`. Consumers such as the CLI choose which messages to present. Another ModelDriver does not need to understand the producing driver's streaming protocol or custom data.
+A driver emits detailed reasoning as a detailed communication, a reasoning summary as an interesting communication, and final output as an assistant response. Consumers such as the CLI choose which communications to present. Only assistant responses are replayed as assistant history.
 
 ---
 
@@ -459,13 +457,13 @@ Data is not model input by default.
 
 ## 17. Model-specific data
 
-The open `data` object on `ModelEvent` is a deliberate semantic escape hatch.
+The `extensions` object on typed model events is a deliberate semantic escape hatch.
 
 It retains model/provider-specific information that is useful enough for the semantic conversation but does not justify a universal field.
 
 It should remain relatively rare.
 
-This lets a ModelDriver preserve something genuinely useful without forcing the conversation model to predict every future provider capability. Cross-driver replay must continue to work from the model-event message when custom data is not understood.
+This lets a ModelDriver preserve something genuinely useful without forcing the conversation model to predict every future provider capability. Cross-driver replay must continue to work from portable fields when extensions are not understood.
 
 Raw provider protocol events still belong in tracing/diagnostics rather than the semantic Conversation Log.
 
@@ -590,12 +588,12 @@ The Phase 1 text implementation uses:
 
 ```rust
 trait ModelDriver {
-    fn model(&self) -> &ModelId;
+    fn source(&self) -> &ModelSource;
 
     fn invoke(
         &self,
         conversation: &Conversation,
-    ) -> Result<Vec<ConversationEvent>, ModelDriverError>;
+    ) -> Result<Vec<ModelEvent>, ModelDriverError>;
 }
 ```
 
@@ -603,8 +601,8 @@ The important Phase 1 properties are:
 
 - one call represents one model invocation
 - input is a complete immutable conversation reconstructed from stored events
-- the driver owns and exposes its configured model
-- successful invocation returns zero or more semantic conversation events
+- the driver owns and exposes its stable provider/model source
+- successful invocation returns zero or more typed model events
 - the caller owns the outer model/tool loop
 - expected failures are strongly typed
 - provider SDK types do not cross the boundary
@@ -615,7 +613,7 @@ We expect to iterate directly on this interface during implementation.
 
 ## 23. Returned event persistence
 
-User input is appended before model invocation. Events returned by a successful invocation are appended in return order.
+User input is appended before model invocation. The caller combines each returned model event with the invoked driver's source and appends the resulting conversation events in return order.
 
 Provider streaming remains internal to the driver. If invocation fails before returning, partial model output is discarded.
 
@@ -634,9 +632,9 @@ or
 
 invoke ModelDriver
     ↓
-Vec<ConversationEvent>
+Vec<ModelEvent>
     ↓
-append returned events in order
+add ModelSource and append ConversationEvents in order
 ```
 
 This deliberately favors a small understandable boundary over partial model-output recovery. An incremental mechanism may be introduced later if a concrete requirement justifies it.
@@ -645,13 +643,13 @@ This deliberately favors a small understandable boundary over partial model-outp
 
 ## 24. ModelDriver result
 
-Successful invocation directly returns semantic facts:
+Successful invocation directly returns typed model-produced semantic facts:
 
 ```rust
-Vec<ConversationEvent>
+Vec<ModelEvent>
 ```
 
-This supports reasoning, final messages, and future multiple tool requests without a parallel result vocabulary. The caller derives control flow from returned events where needed.
+This supports assistant responses and auxiliary communications without allowing a driver to return caller-owned conversation events. Additional model-produced concepts require explicit `ModelEvent` variants when implemented.
 
 ---
 
@@ -660,7 +658,7 @@ This supports reasoning, final messages, and future multiple tool requests witho
 Expected model failures are explicit in the function type:
 
 ```rust
-Result<Vec<ConversationEvent>, ModelDriverError>
+Result<Vec<ModelEvent>, ModelDriverError>
 ```
 
 A small error model might begin with:
@@ -890,7 +888,7 @@ provider errors
 
 No OpenAI SDK/API type crosses the ModelDriver boundary.
 
-The implementation emits semantic conversation events rather than exposing raw OpenAI protocol events to the caller.
+The implementation emits typed model events rather than exposing raw OpenAI protocol events or assigning canonical conversation provenance.
 
 ---
 
@@ -1010,8 +1008,8 @@ At a high level, an implementation should need to:
 1. translate semantic conversation to provider input
 2. call the provider
 3. interpret provider output
-4. return semantic ConversationEvents or a typed error
-5. expose its configured model
+4. return typed ModelEvents or a typed error
+5. expose its configured provider/model source
 6. optionally emit useful traces
 ```
 
@@ -1279,9 +1277,9 @@ invoke OpenAiModelDriver
 
 consume OpenAI Responses stream internally
 
-return Vec<ConversationEvent>
+return Vec<ModelEvent>
 
-append returned ModelEvents in order
+add ModelSource and append resulting ConversationEvents in order
 
 print messages selected by CLI verbosity
 
