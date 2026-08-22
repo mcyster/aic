@@ -30,8 +30,11 @@ The complete development standards are in [`docs/development-standards.md`](docs
 - Prefer direct parameters and return values. Add input structs, result wrappers, callbacks, sinks, or streams only for a concrete current requirement.
 - Prefer concrete implementations. Introduce traits and generic abstractions only when a demonstrated need exists.
 - Do not use unsafe Rust.
-- Prefer the standard library. Add a dependency only when its value justifies its maintenance and security cost.
-- Follow idiomatic Rust unless it conflicts with an explicit repository standard.
+- Prefer conventional, idiomatic Rust and standard-library facilities when they adequately represent the problem.
+- Do not create custom types, abstractions, utilities, or implementations merely to avoid a normal standard-library facility. Domain types must enforce a genuine distinction or invariant.
+- Do not recreate established library functionality solely to avoid a dependency.
+- Before adding a dependency, explain what the standard library lacks, identify the conventional crate, compare its maintenance and security cost with reasonable standard-library or local implementations, and discuss the choice.
+- Use conventional representations unless a requirement forces a specialized one. Document persistent or external unit, encoding, precision, or compatibility requirements before introducing a custom type or dependency for them.
 
 ## Structure
 

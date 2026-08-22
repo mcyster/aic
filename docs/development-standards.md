@@ -24,7 +24,17 @@ The root [`AGENTS.md`](../AGENTS.md) translates these standards into concise ins
 - Prefer direct parameters and return values. Introduce input structs, result wrappers, callbacks, sinks, channels, or streams only when a concrete current requirement justifies them.
 - Prefer concrete implementations until multiple implementations create a demonstrated need for abstraction.
 - Do not use unsafe Rust.
-- Add dependencies only when they provide clear value over the standard library.
+
+## Conventional Solutions
+
+- Prefer conventional, idiomatic Rust that is readily understood by other Rust developers.
+- Use standard-library types, traits, and functions when they adequately represent the problem. Standard-library facilities do not require prior design discussion.
+- Do not introduce a custom type, abstraction, utility, or implementation merely to avoid a normal standard-library facility.
+- Use strong domain types when they enforce a genuine domain distinction or invariant, not when they duplicate an established general-purpose type.
+- Do not recreate established library functionality solely to avoid a dependency.
+- Before adding a dependency, explain the capability missing from the standard library, identify the conventional crate, describe its maintenance and security cost, compare it with reasonable standard-library or local implementations, and discuss the choice.
+- When requirements do not force a specialized representation, use the conventional representation.
+- Document any persistent or external requirement for a specific unit, encoding, precision, or compatibility contract before introducing a custom type or dependency for it.
 
 ## Domain Types
 
