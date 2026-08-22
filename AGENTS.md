@@ -17,7 +17,12 @@ The complete development standards are in [`docs/development-standards.md`](docs
 - Do not use project-defined abbreviations or single-letter names.
 - Standard Rust and domain terminology such as `std`, `str`, `Ok`, `Err`, `Self`, and `tog` is allowed.
 - Do not add comments to Rust source files. Extract complexity into well-named entities instead.
-- Normalize external values at boundaries and convert them into validated project types.
+- Make domain values valid by construction: keep fields private, enforce invariants in constructors, and return typed errors rather than panicking or asserting for invalid external input.
+- Treat deserialized values as untrusted. If derived deserialization bypasses constructors, validate them when reconstructing the containing domain object.
+- Preserve valid external values exactly unless normalization is part of the domain contract; validation may inspect a normalized form without changing the value.
+- Use `From` and `from_*` only for infallible conversions; use `TryFrom`, `try_*`, or another clearly fallible constructor when conversion can fail.
+- Put conversions on the containing or destination type rather than making inner domain types depend on outer systems.
+- Expose contractually readable state through immutable typed accessors, including extension data intended for compatible consumers; do not expose mutation for convenience.
 - Use `Option` for absence and `Result` for recoverable failure.
 - Keep public interfaces minimal.
 - Keep provider-neutral contracts independent of concrete integrations; integrations depend on contracts, never the reverse.

@@ -16,7 +16,7 @@ The root [`AGENTS.md`](../AGENTS.md) translates these standards into concise ins
 - Avoid abbreviations in project-defined names.
 - Prefer standard Rust terminology where it is part of the language or ecosystem.
 - Express intent through names and small, focused entities rather than source comments.
-- Normalize external input at the boundary and represent validated values with dedicated types.
+- Validate external input at the boundary and represent valid values with dedicated types.
 - Represent absence with `Option` and recoverable failure with `Result`.
 - Keep public interfaces minimal.
 - Keep provider-neutral contracts independent of concrete integrations; integrations depend on contracts, never the reverse.
@@ -25,6 +25,20 @@ The root [`AGENTS.md`](../AGENTS.md) translates these standards into concise ins
 - Prefer concrete implementations until multiple implementations create a demonstrated need for abstraction.
 - Do not use unsafe Rust.
 - Add dependencies only when they provide clear value over the standard library.
+
+## Domain Types
+
+- Make invalid domain values unrepresentable through normal construction.
+- Keep domain fields private and provide constructors that enforce all invariants.
+- Use `Result` and typed errors when construction can fail.
+- Do not panic or assert when rejecting invalid external input.
+- Preserve valid external values exactly unless normalization is explicitly part of the domain contract. Validation may inspect a normalized form, such as trimming to detect blank text, without changing a valid value.
+- Treat deserialized data as untrusted. When derived Serde deserialization bypasses constructors, validate values while reconstructing the containing domain object.
+- Use `From` and `from_*` only for infallible conversions. Use `TryFrom`, `try_*`, or another clearly fallible constructor for conversions that can fail.
+- Put conversion knowledge on the containing or destination type. Inner domain types must not depend on outer systems that contain, persist, or transport them.
+- Expose every contractually readable value through typed, immutable accessors. Do not add mutable accessors merely for convenience.
+- Keep extension data readable to compatible consumers while preventing mutation.
+- Test constructor invariants, persistence round trips, and reconstruction boundaries.
 
 ## Project Structure
 
