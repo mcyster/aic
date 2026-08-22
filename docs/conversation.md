@@ -27,6 +27,12 @@ The Conversation Log answers:
 
 It is the stable source for semantic replay and consumers such as the CLI, automation, search, and future user interfaces.
 
+## Completeness
+
+The Conversation Log must be self-contained with respect to model-visible semantic state. Everything visible to a model, including content, instructions, context, model-visible tool descriptions and schemas, tool requests and responses, and referenced files or images, must be present in the log or immutably referenced by it.
+
+Executable tool implementations, provider credentials, transport configuration, retry policy, and orchestration remain external. Their model-visible descriptions and schemas do not: those must be recorded or immutably referenced so a compatible `ModelDriver` can construct its request from the conversation alone.
+
 ## Events Are Facts
 
 Conversation events describe facts, not intent:
