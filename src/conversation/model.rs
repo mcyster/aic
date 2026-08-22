@@ -19,11 +19,23 @@ impl ModelSource {
     pub(crate) fn model(&self) -> &ModelId {
         &self.model
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn provider(&self) -> &ProviderId {
+        &self.provider
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub(crate) struct ProviderId(String);
+
+impl ProviderId {
+    #[allow(dead_code)]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 impl FromStr for ProviderId {
     type Err = InvalidProviderId;
@@ -135,6 +147,7 @@ mod tests {
             serde_json::json!({ "provider": "openai", "model": "gpt-5.6" })
         );
         assert_eq!(deserialized_source, source);
+        assert_eq!(source.provider().as_str(), "openai");
         assert_eq!(source.model().as_str(), "gpt-5.6");
     }
 }

@@ -6,8 +6,9 @@ use reqwest::blocking::Client;
 use serde_json::{Map, Value, json};
 
 use crate::conversation::{
-    AssistantResponse, Conversation, ConversationEvent, ModelCommunication, ModelEvent,
-    ModelEventImportance, ModelId, ModelSource, ProviderId, UserContent,
+    AssistantResponse, Conversation, ConversationEvent, InvalidAssistantResponse,
+    InvalidModelCommunication, ModelCommunication, ModelEvent, ModelEventImportance, ModelId,
+    ModelSource, ProviderId, UserContent,
 };
 use crate::model_driver::{ModelDriver, ModelDriverError};
 
@@ -233,7 +234,7 @@ fn complete_response(
             reasoning_text,
             "reasoning",
             ModelEventImportance::Detailed,
-        ));
+        )?);
     }
     if let Some(reasoning_summary) = preferred_text(
         &response_state.reasoning_summary,
@@ -243,7 +244,7 @@ fn complete_response(
             reasoning_summary,
             "reasoning_summary",
             ModelEventImportance::Interesting,
-        ));
+        )?);
     }
 
     let assistant_text = preferred_text(
@@ -256,12 +257,11 @@ fn complete_response(
             "the completed response contained no model message".to_owned(),
         )
     })?;
+    let assistant_response =
+        AssistantResponse::new(assistant_text, Map::new()).map_err(invalid_assistant_response)?;
     response_state
         .events
-        .push(ModelEvent::AssistantResponse(AssistantResponse::new(
-            assistant_text,
-            Map::new(),
-        )));
+        .push(ModelEvent::AssistantResponse(assistant_response));
     response_state.completed = true;
     Ok(())
 }
@@ -270,13 +270,18 @@ fn model_communication(
     message: String,
     subtype: &str,
     importance: ModelEventImportance,
-) -> ModelEvent {
-    ModelEvent::Communication(ModelCommunication::new(
-        message,
-        importance,
-        subtype.to_owned(),
-        Map::new(),
-    ))
+) -> Result<ModelEvent, ModelDriverError> {
+    ModelCommunication::new(message, importance, subtype.to_owned(), Map::new())
+        .map(ModelEvent::Communication)
+        .map_err(invalid_model_communication)
+}
+
+fn invalid_assistant_response(error: InvalidAssistantResponse) -> ModelDriverError {
+    ModelDriverError::InvalidResponse(error.to_string())
+}
+
+fn invalid_model_communication(error: InvalidModelCommunication) -> ModelDriverError {
+    ModelDriverError::InvalidResponse(error.to_string())
 }
 
 fn append_delta(payload: &Value, text: &mut String) {
@@ -336,7 +341,7 @@ mod tests {
     use crate::conversation::{ModelCommunication, ModelEvent, ModelEventImportance};
     use crate::model_driver::ModelDriverError;
 
-    use super::{classify_response_error, parse_server_sent_events};
+    use super::{classify_response_error, model_communication, parse_server_sent_events};
 
     #[test]
     fn streaming_response_returns_assistant_response() {
@@ -385,21 +390,27 @@ mod tests {
         );
         assert_eq!(
             events[0],
-            ModelEvent::Communication(ModelCommunication::new(
-                "Detailed thought".to_owned(),
-                ModelEventImportance::Detailed,
-                "reasoning".to_owned(),
-                Map::new(),
-            ))
+            ModelEvent::Communication(
+                ModelCommunication::new(
+                    "Detailed thought".to_owned(),
+                    ModelEventImportance::Detailed,
+                    "reasoning".to_owned(),
+                    Map::new(),
+                )
+                .expect("the detailed communication should be valid")
+            )
         );
         assert_eq!(
             events[1],
-            ModelEvent::Communication(ModelCommunication::new(
-                "Summary".to_owned(),
-                ModelEventImportance::Interesting,
-                "reasoning_summary".to_owned(),
-                Map::new(),
-            ))
+            ModelEvent::Communication(
+                ModelCommunication::new(
+                    "Summary".to_owned(),
+                    ModelEventImportance::Interesting,
+                    "reasoning_summary".to_owned(),
+                    Map::new(),
+                )
+                .expect("the reasoning summary should be valid")
+            )
         );
         let ModelEvent::AssistantResponse(response) = &events[2] else {
             panic!("the final event should be an assistant response");
@@ -418,6 +429,41 @@ mod tests {
         let result = parse_server_sent_events(Cursor::new(stream));
 
         assert!(matches!(result, Err(ModelDriverError::Provider(_))));
+    }
+
+    #[test]
+    fn invalid_assistant_response_maps_to_invalid_response() {
+        let stream = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"   \"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+        );
+
+        let result = parse_server_sent_events(Cursor::new(stream));
+
+        assert!(matches!(result, Err(ModelDriverError::InvalidResponse(_))));
+    }
+
+    #[test]
+    fn invalid_model_communication_maps_to_invalid_response() {
+        let empty_message = model_communication(
+            "   ".to_owned(),
+            "reasoning",
+            ModelEventImportance::Detailed,
+        );
+        let empty_subtype = model_communication(
+            "reasoning".to_owned(),
+            "   ",
+            ModelEventImportance::Detailed,
+        );
+
+        assert!(matches!(
+            empty_message,
+            Err(ModelDriverError::InvalidResponse(_))
+        ));
+        assert!(matches!(
+            empty_subtype,
+            Err(ModelDriverError::InvalidResponse(_))
+        ));
     }
 
     #[test]

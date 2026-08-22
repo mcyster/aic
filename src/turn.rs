@@ -62,10 +62,7 @@ impl TurnService {
         for model_event in &model_events {
             self.event_store.append_conversation_event(
                 conversation_id,
-                ConversationEvent::Model {
-                    source: source.clone(),
-                    event: model_event.clone(),
-                },
+                ConversationEvent::from_model_event(source.clone(), model_event.clone()),
             )?;
         }
 
@@ -134,23 +131,26 @@ mod tests {
     }
 
     fn assistant_response(message: &str) -> ModelEvent {
-        ModelEvent::AssistantResponse(AssistantResponse::new(message.to_owned(), Map::new()))
+        ModelEvent::AssistantResponse(
+            AssistantResponse::new(message.to_owned(), Map::new())
+                .expect("the assistant response should be valid"),
+        )
     }
 
     fn communication(message: &str, importance: ModelEventImportance) -> ModelEvent {
-        ModelEvent::Communication(ModelCommunication::new(
-            message.to_owned(),
-            importance,
-            "test".to_owned(),
-            Map::from_iter([("custom".to_owned(), Value::Bool(true))]),
-        ))
+        ModelEvent::Communication(
+            ModelCommunication::new(
+                message.to_owned(),
+                importance,
+                "test".to_owned(),
+                Map::from_iter([("custom".to_owned(), Value::Bool(true))]),
+            )
+            .expect("the model communication should be valid"),
+        )
     }
 
     fn conversation_model_event(source: &ModelSource, event: ModelEvent) -> ConversationEvent {
-        ConversationEvent::Model {
-            source: source.clone(),
-            event,
-        }
+        ConversationEvent::from_model_event(source.clone(), event)
     }
 
     fn turn_request(conversation_id: Option<ConversationId>, prompt: &str) -> TurnRequest {
