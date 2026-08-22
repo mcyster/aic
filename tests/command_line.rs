@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -225,6 +226,86 @@ fn high_verbosity_prints_all_model_event_messages() {
         "Detailed thought\nReasoning summary\nFinal answer\n"
     );
     server.finish();
+}
+
+#[test]
+fn reasoning_events_are_persisted_and_printed_but_not_replayed_as_assistant_messages() {
+    let server = MockOpenAiServer::start(vec![
+        MockResponse::SuccessWithReasoning {
+            response_id: "resp_reasoning",
+            detailed: "Detailed thought",
+            interesting: "Reasoning summary",
+            important: "Final answer",
+        },
+        MockResponse::Success {
+            response_id: "resp_follow_up",
+            assistant_text: "Follow-up answer",
+        },
+    ]);
+    let data_directory = temporary_data_directory();
+
+    let first_output = configured_command(&server, &data_directory)
+        .args(["--verbosity", "high", "First question"])
+        .output()
+        .expect("the first turn should run");
+
+    assert!(first_output.status.success());
+    assert_eq!(
+        String::from_utf8(first_output.stdout).expect("standard output should be UTF-8"),
+        "Detailed thought\nReasoning summary\nFinal answer\n"
+    );
+    let conversation_id = reported_conversation_id(&first_output.stderr);
+    let events_directory = data_directory
+        .join("conversations")
+        .join(conversation_id.trim_start_matches("conversation_"))
+        .join("events");
+    let mut event_paths = fs::read_dir(events_directory)
+        .expect("the persisted events should be readable")
+        .map(|entry| entry.expect("the event entry should be readable").path())
+        .collect::<Vec<_>>();
+    event_paths.sort();
+    let persisted_events = event_paths
+        .iter()
+        .map(|path| {
+            serde_json::from_reader::<_, Value>(
+                fs::File::open(path).expect("the persisted event should open"),
+            )
+            .expect("the persisted event should be JSON")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        persisted_events[1]["event"]["event"]["subtype"],
+        "reasoning"
+    );
+    assert_eq!(
+        persisted_events[1]["event"]["event"]["message"],
+        "Detailed thought"
+    );
+    assert_eq!(
+        persisted_events[2]["event"]["event"]["subtype"],
+        "reasoning_summary"
+    );
+    assert_eq!(
+        persisted_events[2]["event"]["event"]["message"],
+        "Reasoning summary"
+    );
+
+    let second_output = configured_command(&server, &data_directory)
+        .args([
+            ":turn",
+            "--conversation",
+            &conversation_id,
+            "Second question",
+        ])
+        .output()
+        .expect("the second turn should run");
+
+    assert!(second_output.status.success());
+    let requests = server.finish();
+    assert_eq!(requests[1]["input"].as_array().map(Vec::len), Some(3));
+    assert_eq!(requests[1]["input"][0]["content"], "First question");
+    assert_eq!(requests[1]["input"][1]["content"], "Final answer");
+    assert_eq!(requests[1]["input"][2]["content"], "Second question");
 }
 
 #[test]

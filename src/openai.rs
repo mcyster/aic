@@ -71,7 +71,7 @@ fn semantic_input(conversation: &[ConversationEvent]) -> Value {
     Value::Array(
         conversation
             .iter()
-            .map(|event| match event {
+            .filter_map(|event| match event {
                 ConversationEvent::User { content } => {
                     let text = content
                         .iter()
@@ -80,11 +80,12 @@ fn semantic_input(conversation: &[ConversationEvent]) -> Value {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    json!({ "role": "user", "content": text })
+                    Some(json!({ "role": "user", "content": text }))
                 }
-                ConversationEvent::Model { event } => {
-                    json!({ "role": "assistant", "content": event.message })
+                ConversationEvent::Model { event } if event.subtype == "response" => {
+                    Some(json!({ "role": "assistant", "content": event.message }))
                 }
+                ConversationEvent::Model { .. } => None,
             })
             .collect(),
     )
