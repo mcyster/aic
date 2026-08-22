@@ -3,17 +3,17 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::conversation::{
     Conversation, ConversationEvent, ConversationEventId, ConversationId, StoredConversationEvent,
 };
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 pub(crate) struct EventStore {
     root_directory: PathBuf,
@@ -85,7 +85,7 @@ impl EventStore {
             conversation_id,
             position: next_position(previous_position)?,
             id: ConversationEventId::new(),
-            timestamp_milliseconds: current_timestamp_milliseconds()?,
+            timestamp: OffsetDateTime::now_utc(),
             schema_version: SCHEMA_VERSION,
             event,
         };
@@ -120,13 +120,6 @@ impl EventStore {
 fn create_private_directory(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-}
-
-fn current_timestamp_milliseconds() -> io::Result<u64> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(io::Error::other)?;
-    u64::try_from(duration.as_millis()).map_err(io::Error::other)
 }
 
 fn next_position(previous_position: Option<u64>) -> io::Result<u64> {

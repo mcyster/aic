@@ -153,6 +153,7 @@ mod tests {
     use std::str::FromStr;
 
     use serde_json::json;
+    use time::OffsetDateTime;
 
     use super::{
         Conversation, ConversationEvent, ConversationEventId, ConversationId, InvalidConversation,
@@ -167,8 +168,8 @@ mod tests {
             conversation_id,
             position,
             id: ConversationEventId::new(),
-            timestamp_milliseconds: position,
-            schema_version: 5,
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            schema_version: 6,
             event: ConversationEvent::User {
                 content: vec![UserContent::Text(format!("event {position}"))],
             },
@@ -241,8 +242,8 @@ mod tests {
             "conversation_id": conversation_id,
             "position": 0,
             "id": event_id,
-            "timestamp_milliseconds": 1,
-            "schema_version": 5,
+            "timestamp": "2026-08-22T18:42:31.482Z",
+            "schema_version": 6,
             "event": {
                 "type": "model",
                 "source": {
@@ -275,8 +276,8 @@ mod tests {
             "conversation_id": conversation_id,
             "position": 0,
             "id": event_id,
-            "timestamp_milliseconds": 1,
-            "schema_version": 5,
+            "timestamp": "2026-08-22T18:42:31.482Z",
+            "schema_version": 6,
             "event": {
                 "type": "model",
                 "source": {

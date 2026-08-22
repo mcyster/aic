@@ -3,6 +3,7 @@ use std::fmt::{Display, Formatter};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use time::OffsetDateTime;
 
 use super::{ConversationEventId, ConversationId, ModelSource};
 
@@ -241,7 +242,8 @@ pub(crate) struct StoredConversationEvent {
     pub(crate) conversation_id: ConversationId,
     pub(crate) position: u64,
     pub(crate) id: ConversationEventId,
-    pub(crate) timestamp_milliseconds: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub(crate) timestamp: OffsetDateTime,
     pub(crate) schema_version: u32,
     pub(crate) event: ConversationEvent,
 }
@@ -251,12 +253,15 @@ mod tests {
     use std::str::FromStr;
 
     use serde_json::{Map, Value, json};
+    use time::{Date, Month, OffsetDateTime};
 
     use super::{
         AssistantResponse, ConversationEvent, InvalidAssistantResponse, InvalidModelCommunication,
-        ModelCommunication, ModelEvent, ModelEventImportance,
+        ModelCommunication, ModelEvent, ModelEventImportance, StoredConversationEvent,
     };
-    use crate::conversation::{ModelId, ModelSource, ProviderId};
+    use crate::conversation::{
+        ConversationEventId, ConversationId, ModelId, ModelSource, ProviderId, UserContent,
+    };
 
     fn extensions() -> Map<String, Value> {
         Map::from_iter([(
@@ -270,6 +275,35 @@ mod tests {
             ProviderId::from_str("openai").expect("the provider identifier should be valid"),
             ModelId::from_str("gpt-5.6").expect("the model identifier should be valid"),
         )
+    }
+
+    fn fixed_timestamp() -> OffsetDateTime {
+        Date::from_calendar_date(2026, Month::August, 22)
+            .expect("the date should be valid")
+            .with_hms_milli(18, 42, 31, 482)
+            .expect("the time should be valid")
+            .assume_utc()
+    }
+
+    #[test]
+    fn stored_conversation_event_timestamp_round_trips_as_rfc3339() {
+        let stored_event = StoredConversationEvent {
+            conversation_id: ConversationId::new(),
+            position: 0,
+            id: ConversationEventId::new(),
+            timestamp: fixed_timestamp(),
+            schema_version: 6,
+            event: ConversationEvent::User {
+                content: vec![UserContent::Text("hello".to_owned())],
+            },
+        };
+
+        let json = serde_json::to_value(&stored_event).expect("the stored event should serialize");
+        let deserialized_event: StoredConversationEvent =
+            serde_json::from_value(json.clone()).expect("the stored event should deserialize");
+
+        assert_eq!(json["timestamp"], json!("2026-08-22T18:42:31.482Z"));
+        assert_eq!(deserialized_event, stored_event);
     }
 
     #[test]

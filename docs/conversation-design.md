@@ -194,7 +194,7 @@ struct StoredConversationEvent {
     conversation_id: ConversationId,
     position: u64,
     id: ConversationEventId,
-    timestamp: DateTime<Utc>,
+    timestamp: OffsetDateTime,
     schema_version: u32,
     event: ConversationEvent,
 }
