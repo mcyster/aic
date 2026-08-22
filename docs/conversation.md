@@ -153,9 +153,11 @@ Event positions must not be used as semantic identifiers.
 
 ## Durability And Projection
 
-User input is appended before model invocation. A failed invocation therefore retains the `User` event but does not persist partial model output.
+User input is appended before model invocation. The asynchronous invocation establishes one provider/model request and returns a stream of completed semantic `ModelEvent`s. The consumer controls demand by polling that stream for its next event; receiving several events from it does not represent several model requests.
 
-The `ModelDriver` receives an immutable reference to the reconstructed `Conversation` and returns zero or more typed `ModelEvent`s. The caller combines each with the invoked driver's `ModelSource`, assigns persistence metadata, and appends the resulting `ConversationEvent`s in order after a successful invocation.
+The caller may combine each yielded event with the invoked driver's `ModelSource`, assign persistence metadata, display it, and append the resulting `ConversationEvent` while the invocation remains active. If the stream later fails, completed semantic events already yielded remain valid conversation facts and appended events are not rolled back. Provider deltas that did not form a completed `ModelEvent` are discarded. The caller receives the stream error and decides whether to append a semantic conversation-level `Error` event.
+
+This supersedes the earlier batch contract in which all model events were returned only after the complete invocation succeeded and all model output was discarded on a late provider failure. A caller that needs batch behavior can collect the stream; no separate batch interface is required.
 
 Provider-native state may later improve same-provider continuation, but the Conversation Log remains the durable representation used for local reconstruction and cross-provider replay.
 

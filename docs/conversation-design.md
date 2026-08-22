@@ -1,6 +1,6 @@
 # Conversation and ModelDriver Architecture
 
-**Status:** Phase 1 text milestone implemented
+**Status:** Phase 1 semantic text milestone implemented; asynchronous streaming `ModelDriver` implementation pending
 **Purpose:** Define a simple, durable conversation model and a narrow `ModelDriver` boundary that can be implemented against the OpenAI Responses API now and can support switching models/providers within a conversation.
 
 This design is intentionally incomplete.
@@ -34,17 +34,17 @@ Conversation Log
     cross-model / cross-provider contract
 ```
 
-A `ModelDriver` consumes an immutable reference to the reconstructed conversation and produces typed model events:
+A `ModelDriver` consumes an immutable reference to the reconstructed conversation. One asynchronous invocation establishes a stream that yields completed typed model events:
 
 ```text
-Conversation
-    ↓
-ModelDriver.invoke(...)
-    ↓
-ModelEvents
-    ↓
-caller adds ModelSource and appends ConversationEvents
+immutable Conversation
+    → asynchronous ModelDriver invocation
+    → stream of completed ModelEvents
+    → caller adds ModelSource and envelope metadata
+    → ConversationEvents appended incrementally
 ```
+
+One invocation is one provider/model invocation. For OpenAI, it is one REST request with one SSE response stream; consuming several semantic events from that stream does not make several model requests.
 
 Provider-specific details such as OpenAI Responses events, response IDs, token timing, reasoning protocol state, and HTTP diagnostics are **not part of the Phase 1 semantic replay contract**.
 
@@ -318,7 +318,7 @@ enum ModelEventImportance {
 
 ## 10. Reasoning and responses
 
-Exposed chain-of-thought and final responses are distinct typed model events. A driver aggregates provider deltas into coherent messages before returning them.
+Exposed chain-of-thought and final responses are distinct typed model events. A driver aggregates provider deltas into coherent messages before yielding them.
 
 Provider transport may involve many low-level events:
 
@@ -486,7 +486,15 @@ User(...)
 Error(...)
 ```
 
-if the caller chooses to append a semantic error event. Partial model output is not returned or persisted.
+if the outer invocation future fails before a stream exists and the caller chooses to append a semantic error event. If an established stream fails later, it may instead leave:
+
+```text
+User(...)
+Model(...completed semantic event...)
+Error(...)
+```
+
+Completed semantic events already yielded remain valid conversation facts, and events already appended are not rolled back. Incomplete provider deltas that never formed a completed `ModelEvent` are discarded. The caller receives the stream error and decides whether to append the semantic `Error` event.
 
 Events that were already durable before invocation are not rolled back.
 
@@ -590,81 +598,103 @@ The intended contract is:
 
 ## 22. ModelDriver invocation
 
-The Phase 1 text implementation uses:
+The intended interface is approximately:
 
 ```rust
+use futures_util::future::BoxFuture;
+use futures_util::stream::BoxStream;
+
+type ModelEventStream =
+    BoxStream<'static, Result<ModelEvent, ModelDriverError>>;
+
 trait ModelDriver {
     fn source(&self) -> &ModelSource;
 
-    fn invoke(
-        &self,
-        conversation: &Conversation,
-    ) -> Result<Vec<ModelEvent>, ModelDriverError>;
+    fn invoke<'a>(
+        &'a self,
+        conversation: &'a Conversation,
+    ) -> BoxFuture<
+        'a,
+        Result<ModelEventStream, ModelDriverError>,
+    >;
 }
 ```
+
+This is conceptually `Future<Stream<ModelEvent>>`, or `Mono<Flux<ModelEvent>>` in Reactor terminology. The outer future establishes the provider invocation and returns its stream. Request construction, authentication, connection, or HTTP failure may prevent a stream from being established. The established stream yields `Result<ModelEvent, ModelDriverError>` because provider invocation may also fail after streaming has begun.
 
 The important Phase 1 properties are:
 
 - one call represents one model invocation
 - input is a complete immutable conversation reconstructed from conversation events
 - the driver owns and exposes its stable provider/model source
-- successful invocation returns zero or more typed model events
+- invocation is asynchronous and stream-first
+- the stream yields zero or more completed typed model events
+- the consumer controls demand by polling for the next event
 - the caller owns the outer model/tool loop
 - expected failures are strongly typed
 - provider SDK types do not cross the boundary
 
-We expect to iterate directly on this interface during implementation.
+A caller that wants batch behavior can collect the stream. No separate batch interface is required. We expect to iterate directly on this interface during implementation.
 
 ---
 
 ## 23. Returned event persistence
 
-User input is appended before model invocation. The caller combines each returned model event with the invoked driver's source and appends the resulting conversation events in return order.
+User input is appended before model invocation. The caller combines each completed model event yielded by the stream with the invoked driver's source and canonical envelope metadata, then may display and append the resulting conversation event immediately while the invocation remains active.
 
-Provider streaming remains internal to the driver. If invocation fails before returning, partial model output is discarded.
+Provider protocol events and raw text deltas remain internal to the driver. They are not `ConversationEvent`s and are not persisted merely because they arrived. The driver aggregates those deltas and yields only completed semantic `ModelEvent`s such as `AssistantResponse` and `ModelCommunication`.
 
 Conceptually:
 
 ```text
 User already durable
     ↓
-invoke ModelDriver
+await ModelDriver invocation
     ↓
-failure
+setup failure before stream
     → User remains durable
     → no model events appended
 
 or
 
-invoke ModelDriver
+await ModelDriver invocation
     ↓
-Vec<ModelEvent>
+poll stream
     ↓
-add ModelSource and append ConversationEvents in order
+completed ModelEvent
+    → add ModelSource and envelope metadata
+    → display and append ConversationEvent
+    ↓
+later stream failure
+    → completed events remain durable
+    → incomplete provider deltas are discarded
+    → caller receives error
 ```
 
-This deliberately favors a small understandable boundary over partial model-output recovery. An incremental mechanism may be introduced later if a concrete requirement justifies it.
+This supersedes the previous batch contract, which returned all model events only after the complete invocation succeeded and discarded every model event after a late provider failure. Incremental append does not imply rollback: already appended semantic facts remain durable. The caller decides whether a stream error also becomes a semantic conversation-level `Error` event.
 
 ---
 
-## 24. ModelDriver result
+## 24. ModelDriver stream
 
-Successful invocation directly returns typed model-produced semantic facts:
+An established invocation yields typed model-produced semantic facts incrementally:
 
 ```rust
-Vec<ModelEvent>
+Result<ModelEvent, ModelDriverError>
 ```
 
-This supports assistant responses and auxiliary communications without allowing a driver to return caller-owned conversation events. Additional model-produced concepts require explicit `ModelEvent` variants when implemented.
+This supports assistant responses and auxiliary communications without allowing a driver to produce caller-owned conversation events. Additional model-produced concepts require explicit `ModelEvent` variants when implemented. Stream polling supplies demand and natural backpressure at this boundary.
 
 ---
 
 ## 25. ModelDriver errors
 
-Expected model failures are explicit in the function type:
+Expected model failures are explicit both while establishing the invocation and while consuming it:
 
 ```rust
-Result<Vec<ModelEvent>, ModelDriverError>
+BoxFuture<'a, Result<ModelEventStream, ModelDriverError>>
+
+BoxStream<'static, Result<ModelEvent, ModelDriverError>>
 ```
 
 A small error model might begin with:
@@ -688,6 +718,14 @@ Rust does not use Java-style checked exceptions or `throws` declarations.
 Expected operational failures are represented through `Result<T, E>`.
 
 Unexpected programming failures may panic, but transport, provider, validation, and similar model failures should normally be represented by `ModelDriverError`. Conversation persistence errors belong to the caller.
+
+## Async ecosystem
+
+Choosing async is intentional because `ModelDriver` is expected to become a reusable first-class abstraction used by command-line applications, servers, user interfaces, concurrent tool execution, and multiple conversations.
+
+Rust standard-library `Future` and async/await provide the language foundation. `futures-util` provides conventional `BoxFuture`, `BoxStream`, and stream adapters. Tokio is the async runtime. Reqwest uses its asynchronous client and streaming response support. The explicit `BoxFuture` signature supports dynamic `Box<dyn ModelDriver>` dispatch, so `async-trait` is not currently required.
+
+Async is the architectural choice; Tokio is the conventional runtime choice after choosing asynchronous networking. The application owns and starts the runtime, and reusable library components must not secretly create private runtimes. Tokio features should be enabled narrowly rather than selecting `full` by default. Blocking work must not run directly on async runtime workers when it can materially delay other tasks.
 
 ---
 
@@ -925,7 +963,6 @@ hosted web search
 file search
 computer use
 image generation
-background execution
 ```
 
 Image/file input may be added when needed through typed content references.
@@ -1014,7 +1051,7 @@ At a high level, an implementation should need to:
 1. translate semantic conversation to provider input
 2. call the provider
 3. interpret provider output
-4. return typed ModelEvents or a typed error
+4. yield completed typed ModelEvents or a typed error
 5. expose its configured provider/model source
 6. optionally emit useful traces
 ```
@@ -1075,14 +1112,18 @@ The invariant should remain:
 
 ## 39. Future event buses
 
-Tracing and semantic emission may later become explicit buses/streams with multiple subscribers.
+The `ModelDriver` semantic event stream has one polling consumer. Additional publication buses or multiple-subscriber observability streams may be introduced later if required.
 
 For example:
 
 ```text
 ModelDriver
-    ├── semantic ConversationEvent stream
-    └── observability/provider event stream
+    → semantic ModelEvent stream
+    → caller adds canonical envelope
+    → optional ConversationEvent publication bus
+
+concrete driver
+    → optional observability/provider event stream
 ```
 
 Potential subscribers:
@@ -1232,7 +1273,7 @@ multiple tool requests without batching policy
 
 typed external references for images/files/blobs
 
-ordered persistence of successfully returned events
+incremental persistence of completed yielded model events
 
 caller-owned orchestration loop
 
@@ -1270,9 +1311,9 @@ These may become useful later, but they should not burden the first ModelDriver 
 
 ## 46. First implementation milestone
 
-The basic text milestone described below is implemented. Tool use, semantic error events, content references, and provider tracing remain follow-up work.
+The basic semantic text milestone is implemented with the superseded batch boundary. Moving that implementation to the accepted asynchronous streaming boundary is the next architectural implementation step. Tool use, semantic error events, content references, and provider tracing remain follow-up work.
 
-The first coherent implementation should prove:
+The asynchronous streaming implementation should prove:
 
 ```text
 generate ConversationId and append User("hello") as the first event
@@ -1281,11 +1322,13 @@ reconstruct immutable Conversation from conversation events
 
 invoke OpenAiModelDriver
 
-consume OpenAI Responses stream internally
+asynchronously establish one OpenAI Responses request and SSE stream
 
-return Vec<ModelEvent>
+yield completed semantic ModelEvents as provider deltas are aggregated
 
-add ModelSource and append resulting ConversationEvents in order
+add ModelSource and append resulting ConversationEvents incrementally
+
+retain appended completed events after a later stream failure
 
 print messages selected by CLI verbosity
 

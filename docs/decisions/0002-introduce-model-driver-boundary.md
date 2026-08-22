@@ -12,10 +12,10 @@ This is the concrete requirement anticipated by ADR 0001's restriction on specul
 
 ## Decision
 
-Introduce a narrow `ModelDriver` boundary. A configured driver exposes its typed provider/model source, receives an immutable view of the semantic Conversation Log, and returns zero or more typed `ModelEvent`s or a typed model error. The caller records the driver's source when it converts returned model events into canonical `ConversationEvent`s.
+Introduce a narrow `ModelDriver` boundary. A configured driver exposes its typed provider/model source, receives an immutable view of the semantic Conversation Log, and produces zero or more typed `ModelEvent`s or a typed model error. The caller records the driver's source when it converts produced model events into canonical `ConversationEvent`s. ADR 0004 supersedes this decision's original batch delivery and failure semantics with asynchronous streaming delivery.
 
 OpenAI request types, streaming events, response IDs, and transport errors remain inside the OpenAI implementation. The Conversation Log is the only durable history required for correctness. Provider-native continuation may be added later only as an optional optimization.
 
 ## Consequences
 
-Turn orchestration and the CLI do not depend on OpenAI protocol concepts. Every invocation currently reconstructs provider input from semantic history, which costs more input tokens than provider-native continuation but proves cross-driver portability. Model-produced events are persisted only after a successful invocation, so partial model output is discarded on failure. The abstraction remains intentionally small and may change when a second production driver provides more evidence.
+Turn orchestration and the CLI do not depend on OpenAI protocol concepts. Every invocation currently reconstructs provider input from semantic history, which costs more input tokens than provider-native continuation but proves cross-driver portability. The abstraction remains intentionally small and may change when a second production driver provides more evidence. ADR 0004 defines incremental persistence and late stream failure behavior.

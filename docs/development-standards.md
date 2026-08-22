@@ -67,6 +67,13 @@ The root [`AGENTS.md`](../AGENTS.md) translates these standards into concise ins
 - Remove abstractions that no longer follow from the revised model instead of preserving them through additional wrappers or compatibility layers.
 - When an accepted simplification gives up an earlier property, remove that superseded property from code, tests, and authoritative documentation.
 
+## Asynchronous Work
+
+- Prefer asynchronous APIs for potentially long-running network operations.
+- Keep async runtime ownership at application boundaries. Reusable library components must not create hidden runtimes.
+- Do not block Tokio worker threads with blocking network operations or substantial CPU or filesystem work that can materially delay other tasks.
+- Use blocking bridges only at explicit synchronous application boundaries.
+
 ## Required Checks
 
 ```console
