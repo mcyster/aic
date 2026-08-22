@@ -10,10 +10,10 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::conversation::{
-    Conversation, ConversationEvent, ConversationEventId, ConversationId, StoredConversationEvent,
+    Conversation, ConversationEvent, ConversationEventId, ConversationEventKind, ConversationId,
 };
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 pub(crate) struct EventStore {
     root_directory: PathBuf,
@@ -47,7 +47,7 @@ impl EventStore {
         &self,
         conversation_id: ConversationId,
     ) -> io::Result<Conversation> {
-        let events = self.load_stored_conversation_events(conversation_id)?;
+        let events = self.load_conversation_events(conversation_id)?;
         let conversation = Conversation::from_events(events).map_err(invalid_conversation_data)?;
         if conversation.id() != conversation_id {
             return Err(io::Error::new(
@@ -61,13 +61,13 @@ impl EventStore {
     pub(crate) fn append_conversation_event(
         &self,
         conversation_id: ConversationId,
-        event: ConversationEvent,
-    ) -> io::Result<StoredConversationEvent> {
+        kind: ConversationEventKind,
+    ) -> io::Result<ConversationEvent> {
         let conversation_directory = self.conversation_directory(conversation_id);
         create_private_directory(&conversation_directory)?;
         let events_directory = conversation_directory.join("events");
         create_private_directory(&events_directory)?;
-        let existing_events = self.load_stored_conversation_events(conversation_id)?;
+        let existing_events = self.load_conversation_events(conversation_id)?;
         let previous_position = if existing_events.is_empty() {
             None
         } else {
@@ -81,32 +81,32 @@ impl EventStore {
             }
             conversation.events().last().map(|event| event.position)
         };
-        let stored_event = StoredConversationEvent {
+        let conversation_event = ConversationEvent {
             conversation_id,
             position: next_position(previous_position)?,
             id: ConversationEventId::new(),
             timestamp: OffsetDateTime::now_utc(),
             schema_version: SCHEMA_VERSION,
-            event,
+            kind,
         };
         write_json_atomically(
             &event_path(
                 &events_directory,
-                stored_event.position,
-                &stored_event.id.storage_key(),
+                conversation_event.position,
+                &conversation_event.id.storage_key(),
             ),
-            &stored_event,
+            &conversation_event,
         )?;
-        Ok(stored_event)
+        Ok(conversation_event)
     }
 
-    fn load_stored_conversation_events(
+    fn load_conversation_events(
         &self,
         conversation_id: ConversationId,
-    ) -> io::Result<Vec<StoredConversationEvent>> {
+    ) -> io::Result<Vec<ConversationEvent>> {
         let mut events =
             read_json_directory(&self.conversation_directory(conversation_id).join("events"))?;
-        events.sort_by_key(|event: &StoredConversationEvent| event.position);
+        events.sort_by_key(|event: &ConversationEvent| event.position);
         Ok(events)
     }
 
@@ -178,8 +178,10 @@ fn invalid_conversation_data(error: impl Error + Send + Sync + 'static) -> io::E
 
 #[cfg(test)]
 mod tests {
+    use time::OffsetDateTime;
+
     use super::EventStore;
-    use crate::conversation::{ConversationEvent, ConversationId, UserContent};
+    use crate::conversation::{ConversationEventKind, ConversationId, UserContent};
 
     fn temporary_store() -> EventStore {
         let directory = std::env::temp_dir().join(format!("tog-test-{}", uuid::Uuid::now_v7()));
@@ -187,26 +189,36 @@ mod tests {
     }
 
     #[test]
-    fn events_receive_monotonic_positions() {
+    fn event_store_assigns_canonical_envelope_metadata() {
         let store = temporary_store();
         let conversation_id = ConversationId::new();
 
-        store
+        let first_event = store
             .append_conversation_event(
                 conversation_id,
-                ConversationEvent::User {
+                ConversationEventKind::User {
                     content: vec![UserContent::Text("first".to_owned())],
                 },
             )
             .expect("the first event should be persisted");
-        store
+        let second_event = store
             .append_conversation_event(
                 conversation_id,
-                ConversationEvent::User {
+                ConversationEventKind::User {
                     content: vec![UserContent::Text("second".to_owned())],
                 },
             )
             .expect("the second event should be persisted");
+
+        assert_eq!(first_event.conversation_id, conversation_id);
+        assert_eq!(first_event.position, 0);
+        assert_eq!(first_event.schema_version, 7);
+        assert_ne!(first_event.timestamp, OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(second_event.conversation_id, conversation_id);
+        assert_eq!(second_event.position, 1);
+        assert_eq!(second_event.schema_version, 7);
+        assert_ne!(second_event.timestamp, OffsetDateTime::UNIX_EPOCH);
+        assert_ne!(second_event.id, first_event.id);
 
         let conversation = store
             .load_conversation(conversation_id)

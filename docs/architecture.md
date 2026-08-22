@@ -10,7 +10,7 @@ The ordered events in the Conversation Log form an immutable, append-only semant
 
 ### ConversationEvent And Conversation
 
-`ConversationEvent` is the canonical durable semantic fact and the unit persisted, published, and carried on an event bus. Every event carries its `ConversationId`. A conversation begins with its first event; there is no independently persisted mutable conversation record. Reconstructing the ordered events sharing a `ConversationId` reconstructs the conversation.
+`ConversationEvent` is the canonical durable semantic fact and the unit persisted, published, and carried on an event bus. Its `ConversationEventKind` defines which semantic fact occurred, while the event carries canonical identity, conversation membership, ordering, timestamp, and schema metadata. A conversation begins with its first event; there is no independently persisted mutable conversation record. Reconstructing the ordered events sharing a `ConversationId` reconstructs the conversation.
 
 `Conversation` is an immutable in-memory projection of those ordered events, not a separate aggregate or source of truth. It may expose its ID and a vector or read-only sequence of events for convenient consumption, but all of its state is derived from the events. Construction validates that every event has the same `ConversationId` and that the sequence is in a valid order.
 

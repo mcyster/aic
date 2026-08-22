@@ -8,8 +8,20 @@ use time::OffsetDateTime;
 use super::{ConversationEventId, ConversationId, ModelSource};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ConversationEvent {
+    pub(crate) conversation_id: ConversationId,
+    pub(crate) position: u64,
+    pub(crate) id: ConversationEventId,
+    #[serde(with = "time::serde::rfc3339")]
+    pub(crate) timestamp: OffsetDateTime,
+    pub(crate) schema_version: u32,
+    #[serde(flatten)]
+    pub(crate) kind: ConversationEventKind,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ConversationEvent {
+pub(crate) enum ConversationEventKind {
     User {
         content: Vec<UserContent>,
     },
@@ -19,27 +31,23 @@ pub(crate) enum ConversationEvent {
     },
 }
 
-impl ConversationEvent {
-    pub(crate) fn from_model_event(source: ModelSource, event: ModelEvent) -> Self {
-        Self::Model { source, event }
-    }
-
-    pub(super) fn ensure_valid(&self) -> Result<(), InvalidConversationEvent> {
+impl ConversationEventKind {
+    pub(super) fn ensure_valid(&self) -> Result<(), InvalidConversationEventKind> {
         match self {
             Self::User { .. } => Ok(()),
             Self::Model { event, .. } => event
                 .ensure_valid()
-                .map_err(InvalidConversationEvent::InvalidModelEvent),
+                .map_err(InvalidConversationEventKind::InvalidModelEvent),
         }
     }
 }
 
 #[derive(Debug)]
-pub(super) enum InvalidConversationEvent {
+pub(super) enum InvalidConversationEventKind {
     InvalidModelEvent(InvalidModelEvent),
 }
 
-impl Display for InvalidConversationEvent {
+impl Display for InvalidConversationEventKind {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidModelEvent(error) => Display::fmt(error, formatter),
@@ -47,7 +55,7 @@ impl Display for InvalidConversationEvent {
     }
 }
 
-impl Error for InvalidConversationEvent {}
+impl Error for InvalidConversationEventKind {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -237,17 +245,6 @@ pub(crate) enum UserContent {
     Text(String),
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct StoredConversationEvent {
-    pub(crate) conversation_id: ConversationId,
-    pub(crate) position: u64,
-    pub(crate) id: ConversationEventId,
-    #[serde(with = "time::serde::rfc3339")]
-    pub(crate) timestamp: OffsetDateTime,
-    pub(crate) schema_version: u32,
-    pub(crate) event: ConversationEvent,
-}
-
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -256,8 +253,8 @@ mod tests {
     use time::{Date, Month, OffsetDateTime};
 
     use super::{
-        AssistantResponse, ConversationEvent, InvalidAssistantResponse, InvalidModelCommunication,
-        ModelCommunication, ModelEvent, ModelEventImportance, StoredConversationEvent,
+        AssistantResponse, ConversationEvent, ConversationEventKind, InvalidAssistantResponse,
+        InvalidModelCommunication, ModelCommunication, ModelEvent, ModelEventImportance,
     };
     use crate::conversation::{
         ConversationEventId, ConversationId, ModelId, ModelSource, ProviderId, UserContent,
@@ -286,24 +283,38 @@ mod tests {
     }
 
     #[test]
-    fn stored_conversation_event_timestamp_round_trips_as_rfc3339() {
-        let stored_event = StoredConversationEvent {
-            conversation_id: ConversationId::new(),
+    fn canonical_user_event_round_trips_with_flattened_kind() {
+        let conversation_id = ConversationId::new();
+        let event_id = ConversationEventId::new();
+        let conversation_event = ConversationEvent {
+            conversation_id,
             position: 0,
-            id: ConversationEventId::new(),
+            id: event_id,
             timestamp: fixed_timestamp(),
-            schema_version: 6,
-            event: ConversationEvent::User {
-                content: vec![UserContent::Text("hello".to_owned())],
+            schema_version: 7,
+            kind: ConversationEventKind::User {
+                content: vec![UserContent::Text("Hello".to_owned())],
             },
         };
 
-        let json = serde_json::to_value(&stored_event).expect("the stored event should serialize");
-        let deserialized_event: StoredConversationEvent =
-            serde_json::from_value(json.clone()).expect("the stored event should deserialize");
+        let json = serde_json::to_value(&conversation_event)
+            .expect("the conversation event should serialize");
+        let deserialized_event: ConversationEvent = serde_json::from_value(json.clone())
+            .expect("the conversation event should deserialize");
 
-        assert_eq!(json["timestamp"], json!("2026-08-22T18:42:31.482Z"));
-        assert_eq!(deserialized_event, stored_event);
+        assert_eq!(
+            json,
+            json!({
+                "conversation_id": conversation_id,
+                "position": 0,
+                "id": event_id,
+                "timestamp": "2026-08-22T18:42:31.482Z",
+                "schema_version": 7,
+                "type": "user",
+                "content": [{ "type": "text", "value": "Hello" }]
+            })
+        );
+        assert_eq!(deserialized_event, conversation_event);
     }
 
     #[test]
@@ -444,21 +455,39 @@ mod tests {
     }
 
     #[test]
-    fn conversation_model_event_round_trip_preserves_source() {
+    fn canonical_model_event_round_trip_preserves_source_and_metadata() {
+        let conversation_id = ConversationId::new();
+        let event_id = ConversationEventId::new();
         let source = source();
         let model_event = ModelEvent::AssistantResponse(
             AssistantResponse::new("The answer is 42.".to_owned(), Map::new())
                 .expect("the assistant response should be valid"),
         );
-        let event = ConversationEvent::from_model_event(source.clone(), model_event.clone());
+        let conversation_event = ConversationEvent {
+            conversation_id,
+            position: 1,
+            id: event_id,
+            timestamp: fixed_timestamp(),
+            schema_version: 7,
+            kind: ConversationEventKind::Model {
+                source: source.clone(),
+                event: model_event.clone(),
+            },
+        };
 
-        let json = serde_json::to_value(&event).expect("the conversation event should serialize");
+        let json = serde_json::to_value(&conversation_event)
+            .expect("the conversation event should serialize");
         let deserialized_event: ConversationEvent = serde_json::from_value(json.clone())
             .expect("the conversation event should deserialize");
 
         assert_eq!(
             json,
             json!({
+                "conversation_id": conversation_id,
+                "position": 1,
+                "id": event_id,
+                "timestamp": "2026-08-22T18:42:31.482Z",
+                "schema_version": 7,
                 "type": "model",
                 "source": { "provider": "openai", "model": "gpt-5.6" },
                 "event": {
@@ -468,10 +497,10 @@ mod tests {
                 }
             })
         );
-        assert_eq!(deserialized_event, event);
+        assert_eq!(deserialized_event, conversation_event);
         assert_eq!(
-            event,
-            ConversationEvent::Model {
+            conversation_event.kind,
+            ConversationEventKind::Model {
                 source,
                 event: model_event,
             }

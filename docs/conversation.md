@@ -141,7 +141,7 @@ ImageId
 FileId
 ```
 
-Each stored event also has a monotonically increasing stream position. Identity, order, and semantic relationships serve different purposes:
+Each conversation event also has a monotonically increasing stream position. Identity, order, and semantic relationships serve different purposes:
 
 - the conversation ID identifies the conversation to which the event belongs
 - the event ID provides stable identity

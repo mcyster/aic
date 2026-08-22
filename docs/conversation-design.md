@@ -65,7 +65,7 @@ Conceptually:
 ```rust
 struct Conversation {
     id: ConversationId,
-    events: Vec<StoredConversationEvent>,
+    events: Vec<ConversationEvent>,
 }
 ```
 
@@ -89,16 +89,21 @@ future UIs
 
 ---
 
-## 3. ConversationEvent
+## 3. ConversationEvent and ConversationEventKind
 
-Conversation events describe facts, not provider transport mechanics.
+`ConversationEvent` is the complete canonical fact persisted, replayed, or published. `ConversationEventKind` defines its semantic content, which describes facts rather than provider transport mechanics.
 
 Conceptually:
 
 ```rust
-enum ConversationEvent {
-    User(...),
-    Model(ModelEvent),
+enum ConversationEventKind {
+    User {
+        content: Vec<UserContent>,
+    },
+    Model {
+        source: ModelSource,
+        event: ModelEvent,
+    },
     ToolRequest(...),
     ToolResponse(...),
     Context(...),
@@ -187,16 +192,17 @@ UUIDv7 ordering is useful for locality and diagnostics but is not authoritative 
 
 Identity and ordering solve different problems.
 
-Each stored conversation event has a monotonically increasing position:
+Each conversation event has a monotonically increasing position:
 
 ```rust
-struct StoredConversationEvent {
+struct ConversationEvent {
     conversation_id: ConversationId,
     position: u64,
     id: ConversationEventId,
     timestamp: OffsetDateTime,
     schema_version: u32,
-    event: ConversationEvent,
+    #[serde(flatten)]
+    kind: ConversationEventKind,
 }
 ```
 
@@ -212,7 +218,7 @@ We do not need locks, distributed sequencing, compare-and-append, or a global ev
 
 The invariant is simply:
 
-> Replay the Conversation Log in stored position order.
+> Replay the Conversation Log in position order.
 
 Future persistence implementations may strengthen atomic allocation without changing the semantic model.
 
@@ -561,7 +567,7 @@ The driver receives an immutable reference to a validated `Conversation`:
 &Conversation
 ```
 
-The projection provides read-only access to its ID and ordered stored events. The driver cannot mutate ordinary owned data through the shared reference, and `Conversation` provides no mutation methods.
+The projection provides read-only access to its ID and ordered conversation events. The driver cannot mutate ordinary owned data through the shared reference, and `Conversation` provides no mutation methods.
 
 For normal Rust-owned values such as structs, enums, `String`, and `Vec`, that provides the desired deep immutability through the borrowed input.
 
@@ -600,7 +606,7 @@ trait ModelDriver {
 The important Phase 1 properties are:
 
 - one call represents one model invocation
-- input is a complete immutable conversation reconstructed from stored events
+- input is a complete immutable conversation reconstructed from conversation events
 - the driver owns and exposes its stable provider/model source
 - successful invocation returns zero or more typed model events
 - the caller owns the outer model/tool loop
@@ -1271,7 +1277,7 @@ The first coherent implementation should prove:
 ```text
 generate ConversationId and append User("hello") as the first event
 
-reconstruct immutable Conversation from stored events
+reconstruct immutable Conversation from conversation events
 
 invoke OpenAiModelDriver
 

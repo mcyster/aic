@@ -219,13 +219,21 @@ fn turn_persists_events_and_prints_semantic_output() {
             .replace('-', ""),
         conversation_id.trim_start_matches("conversation_")
     );
+    assert_eq!(first_event["schema_version"], 7);
+    assert_eq!(first_event["type"], "user");
+    assert_eq!(first_event["content"][0]["type"], "text");
+    assert_eq!(first_event["content"][0]["value"], "say hi");
+    assert!(first_event.get("kind").is_none());
     let model_event: Value = serde_json::from_reader(
         fs::File::open(&event_paths[1]).expect("the persisted model event should open"),
     )
     .expect("the persisted model event should be JSON");
-    assert_eq!(model_event["event"]["source"]["provider"], "openai");
-    assert_eq!(model_event["event"]["source"]["model"], "gpt-5.6");
-    assert_eq!(model_event["event"]["event"]["type"], "assistant_response");
+    assert_eq!(model_event["schema_version"], 7);
+    assert_eq!(model_event["type"], "model");
+    assert_eq!(model_event["source"]["provider"], "openai");
+    assert_eq!(model_event["source"]["model"], "gpt-5.6");
+    assert_eq!(model_event["event"]["type"], "assistant_response");
+    assert!(model_event.get("kind").is_none());
     let requests = server.finish();
     assert_eq!(requests[0]["model"], "gpt-5.6");
     assert_eq!(requests[0]["input"][0]["content"], "say hi");
@@ -325,30 +333,12 @@ fn reasoning_events_are_persisted_and_printed_but_not_replayed_as_assistant_mess
             .expect("the persisted event should be JSON")
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        persisted_events[1]["event"]["event"]["type"],
-        "communication"
-    );
-    assert_eq!(
-        persisted_events[1]["event"]["event"]["subtype"],
-        "reasoning"
-    );
-    assert_eq!(
-        persisted_events[1]["event"]["event"]["message"],
-        "Detailed thought"
-    );
-    assert_eq!(
-        persisted_events[2]["event"]["event"]["type"],
-        "communication"
-    );
-    assert_eq!(
-        persisted_events[2]["event"]["event"]["subtype"],
-        "reasoning_summary"
-    );
-    assert_eq!(
-        persisted_events[2]["event"]["event"]["message"],
-        "Reasoning summary"
-    );
+    assert_eq!(persisted_events[1]["event"]["type"], "communication");
+    assert_eq!(persisted_events[1]["event"]["subtype"], "reasoning");
+    assert_eq!(persisted_events[1]["event"]["message"], "Detailed thought");
+    assert_eq!(persisted_events[2]["event"]["type"], "communication");
+    assert_eq!(persisted_events[2]["event"]["subtype"], "reasoning_summary");
+    assert_eq!(persisted_events[2]["event"]["message"], "Reasoning summary");
 
     let second_output = configured_command(&server, &data_directory)
         .args([

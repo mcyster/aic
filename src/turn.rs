@@ -1,6 +1,8 @@
 use std::error::Error;
 
-use crate::conversation::{ConversationEvent, ConversationId, ModelEvent, UserContent, UserPrompt};
+use crate::conversation::{
+    ConversationEventKind, ConversationId, ModelEvent, UserContent, UserPrompt,
+};
 use crate::model_driver::ModelDriver;
 use crate::persistence::EventStore;
 
@@ -47,7 +49,7 @@ impl TurnService {
         };
         self.event_store.append_conversation_event(
             conversation_id,
-            ConversationEvent::User {
+            ConversationEventKind::User {
                 content: vec![UserContent::Text(request.user_prompt.text().to_owned())],
             },
         )?;
@@ -62,7 +64,10 @@ impl TurnService {
         for model_event in &model_events {
             self.event_store.append_conversation_event(
                 conversation_id,
-                ConversationEvent::from_model_event(source.clone(), model_event.clone()),
+                ConversationEventKind::Model {
+                    source: source.clone(),
+                    event: model_event.clone(),
+                },
             )?;
         }
 
@@ -79,7 +84,7 @@ mod tests {
 
     use super::{TurnRequest, TurnService};
     use crate::conversation::{
-        AssistantResponse, Conversation, ConversationEvent, ConversationId, ModelCommunication,
+        AssistantResponse, Conversation, ConversationEventKind, ConversationId, ModelCommunication,
         ModelEvent, ModelEventImportance, ModelId, ModelSource, ProviderId, UserContent,
         UserPrompt,
     };
@@ -149,8 +154,14 @@ mod tests {
         )
     }
 
-    fn conversation_model_event(source: &ModelSource, event: ModelEvent) -> ConversationEvent {
-        ConversationEvent::from_model_event(source.clone(), event)
+    fn conversation_model_event_kind(
+        source: &ModelSource,
+        event: ModelEvent,
+    ) -> ConversationEventKind {
+        ConversationEventKind::Model {
+            source: source.clone(),
+            event,
+        }
     }
 
     fn turn_request(conversation_id: Option<ConversationId>, prompt: &str) -> TurnRequest {
@@ -212,16 +223,16 @@ mod tests {
         let recorded_events = recorded_inputs[0]
             .events()
             .iter()
-            .map(|stored_event| stored_event.event.clone())
+            .map(|conversation_event| conversation_event.kind.clone())
             .collect::<Vec<_>>();
         assert_eq!(
             recorded_events,
             [
-                ConversationEvent::User {
+                ConversationEventKind::User {
                     content: vec![UserContent::Text("First question".to_owned())]
                 },
-                conversation_model_event(&first_source, assistant_response("First answer")),
-                ConversationEvent::User {
+                conversation_model_event_kind(&first_source, assistant_response("First answer")),
+                ConversationEventKind::User {
                     content: vec![UserContent::Text("Second question".to_owned())]
                 }
             ]
@@ -265,20 +276,20 @@ mod tests {
             .load_conversation(conversation_id)
             .expect("the conversation should load");
         assert_eq!(
-            conversation.events()[1].event,
-            conversation_model_event(
+            conversation.events()[1].kind,
+            conversation_model_event_kind(
                 &source,
                 communication("Thinking", ModelEventImportance::Detailed)
             )
         );
-        let ConversationEvent::Model {
-            source: stored_source,
+        let ConversationEventKind::Model {
+            source: event_source,
             event: ModelEvent::AssistantResponse(_),
-        } = &conversation.events()[2].event
+        } = &conversation.events()[2].kind
         else {
             panic!("the event should be an assistant response");
         };
-        assert_eq!(stored_source, &source);
+        assert_eq!(event_source, &source);
     }
 
     #[test]
@@ -312,8 +323,8 @@ mod tests {
             .expect("the conversation should load");
         assert_eq!(conversation.events().len(), 1);
         assert!(matches!(
-            conversation.events()[0].event,
-            ConversationEvent::User { .. }
+            conversation.events()[0].kind,
+            ConversationEventKind::User { .. }
         ));
     }
 

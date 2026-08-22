@@ -7,8 +7,8 @@ use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
 pub(crate) use event::{
-    AssistantResponse, ConversationEvent, InvalidAssistantResponse, InvalidModelCommunication,
-    ModelCommunication, ModelEvent, ModelEventImportance, StoredConversationEvent, UserContent,
+    AssistantResponse, ConversationEvent, ConversationEventKind, InvalidAssistantResponse,
+    InvalidModelCommunication, ModelCommunication, ModelEvent, ModelEventImportance, UserContent,
 };
 pub(crate) use id::{ConversationEventId, ConversationId};
 pub(crate) use model::{ModelId, ModelSource, ProviderId};
@@ -16,13 +16,11 @@ pub(crate) use model::{ModelId, ModelSource, ProviderId};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Conversation {
     id: ConversationId,
-    events: Vec<StoredConversationEvent>,
+    events: Vec<ConversationEvent>,
 }
 
 impl Conversation {
-    pub(crate) fn from_events(
-        events: Vec<StoredConversationEvent>,
-    ) -> Result<Self, InvalidConversation> {
+    pub(crate) fn from_events(events: Vec<ConversationEvent>) -> Result<Self, InvalidConversation> {
         let conversation_id = events
             .first()
             .map(|event| event.conversation_id)
@@ -46,7 +44,7 @@ impl Conversation {
             }
 
             event
-                .event
+                .kind
                 .ensure_valid()
                 .map_err(|error| InvalidConversation::InvalidEvent {
                     position: event.position,
@@ -64,7 +62,7 @@ impl Conversation {
         self.id
     }
 
-    pub(crate) fn events(&self) -> &[StoredConversationEvent] {
+    pub(crate) fn events(&self) -> &[ConversationEvent] {
         &self.events
     }
 }
@@ -156,21 +154,18 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{
-        Conversation, ConversationEvent, ConversationEventId, ConversationId, InvalidConversation,
-        InvalidUserPrompt, StoredConversationEvent, UserContent, UserPrompt,
+        Conversation, ConversationEvent, ConversationEventId, ConversationEventKind,
+        ConversationId, InvalidConversation, InvalidUserPrompt, UserContent, UserPrompt,
     };
 
-    fn stored_user_event(
-        conversation_id: ConversationId,
-        position: u64,
-    ) -> StoredConversationEvent {
-        StoredConversationEvent {
+    fn user_event(conversation_id: ConversationId, position: u64) -> ConversationEvent {
+        ConversationEvent {
             conversation_id,
             position,
             id: ConversationEventId::new(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
-            schema_version: 6,
-            event: ConversationEvent::User {
+            schema_version: 7,
+            kind: ConversationEventKind::User {
                 content: vec![UserContent::Text(format!("event {position}"))],
             },
         }
@@ -190,8 +185,8 @@ mod tests {
         let second_conversation_id = ConversationId::new();
 
         let result = Conversation::from_events(vec![
-            stored_user_event(first_conversation_id, 0),
-            stored_user_event(second_conversation_id, 1),
+            user_event(first_conversation_id, 0),
+            user_event(second_conversation_id, 1),
         ]);
 
         assert_eq!(
@@ -207,7 +202,7 @@ mod tests {
     fn conversation_rejects_invalid_event_order() {
         let conversation_id = ConversationId::new();
 
-        let result = Conversation::from_events(vec![stored_user_event(conversation_id, 1)]);
+        let result = Conversation::from_events(vec![user_event(conversation_id, 1)]);
 
         assert_eq!(
             result,
@@ -223,8 +218,8 @@ mod tests {
         let conversation_id = ConversationId::new();
 
         let conversation = Conversation::from_events(vec![
-            stored_user_event(conversation_id, 0),
-            stored_user_event(conversation_id, 1),
+            user_event(conversation_id, 0),
+            user_event(conversation_id, 1),
         ])
         .expect("the conversation should be valid");
 
@@ -238,29 +233,27 @@ mod tests {
     fn conversation_rejects_invalid_deserialized_model_events() {
         let conversation_id = ConversationId::new();
         let event_id = ConversationEventId::new();
-        let stored_event: StoredConversationEvent = serde_json::from_value(json!({
+        let conversation_event: ConversationEvent = serde_json::from_value(json!({
             "conversation_id": conversation_id,
             "position": 0,
             "id": event_id,
             "timestamp": "2026-08-22T18:42:31.482Z",
-            "schema_version": 6,
+            "schema_version": 7,
+            "type": "model",
+            "source": {
+                "provider": "openai",
+                "model": "gpt-5.6"
+            },
             "event": {
-                "type": "model",
-                "source": {
-                    "provider": "openai",
-                    "model": "gpt-5.6"
-                },
-                "event": {
-                    "type": "assistant_response",
-                    "message": "   ",
-                    "extensions": {}
-                }
+                "type": "assistant_response",
+                "message": "   ",
+                "extensions": {}
             }
         }))
-        .expect("derived deserialization should construct the stored event");
+        .expect("derived deserialization should construct the conversation event");
 
         assert_eq!(
-            Conversation::from_events(vec![stored_event]),
+            Conversation::from_events(vec![conversation_event]),
             Err(InvalidConversation::InvalidEvent {
                 position: 0,
                 reason: "assistant response message must not be empty".to_owned(),
@@ -272,31 +265,29 @@ mod tests {
     fn conversation_rejects_invalid_deserialized_model_communications() {
         let conversation_id = ConversationId::new();
         let event_id = ConversationEventId::new();
-        let stored_event: StoredConversationEvent = serde_json::from_value(json!({
+        let conversation_event: ConversationEvent = serde_json::from_value(json!({
             "conversation_id": conversation_id,
             "position": 0,
             "id": event_id,
             "timestamp": "2026-08-22T18:42:31.482Z",
-            "schema_version": 6,
+            "schema_version": 7,
+            "type": "model",
+            "source": {
+                "provider": "openai",
+                "model": "gpt-5.6"
+            },
             "event": {
-                "type": "model",
-                "source": {
-                    "provider": "openai",
-                    "model": "gpt-5.6"
-                },
-                "event": {
-                    "type": "communication",
-                    "message": "reasoning",
-                    "importance": "detailed",
-                    "subtype": "   ",
-                    "extensions": {}
-                }
+                "type": "communication",
+                "message": "reasoning",
+                "importance": "detailed",
+                "subtype": "   ",
+                "extensions": {}
             }
         }))
-        .expect("derived deserialization should construct the stored event");
+        .expect("derived deserialization should construct the conversation event");
 
         assert_eq!(
-            Conversation::from_events(vec![stored_event]),
+            Conversation::from_events(vec![conversation_event]),
             Err(InvalidConversation::InvalidEvent {
                 position: 0,
                 reason: "model communication subtype must not be empty".to_owned(),

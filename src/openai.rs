@@ -6,7 +6,7 @@ use reqwest::blocking::Client;
 use serde_json::{Map, Value, json};
 
 use crate::conversation::{
-    AssistantResponse, Conversation, ConversationEvent, InvalidAssistantResponse,
+    AssistantResponse, Conversation, ConversationEventKind, InvalidAssistantResponse,
     InvalidModelCommunication, ModelCommunication, ModelEvent, ModelEventImportance, ModelId,
     ModelSource, ProviderId, UserContent,
 };
@@ -79,8 +79,8 @@ fn semantic_input(conversation: &Conversation) -> Value {
         conversation
             .events()
             .iter()
-            .filter_map(|stored_event| match &stored_event.event {
-                ConversationEvent::User { content } => {
+            .filter_map(|conversation_event| match &conversation_event.kind {
+                ConversationEventKind::User { content } => {
                     let text = content
                         .iter()
                         .map(|content| match content {
@@ -90,11 +90,11 @@ fn semantic_input(conversation: &Conversation) -> Value {
                         .join("\n");
                     Some(json!({ "role": "user", "content": text }))
                 }
-                ConversationEvent::Model {
+                ConversationEventKind::Model {
                     event: ModelEvent::AssistantResponse(response),
                     ..
                 } => Some(json!({ "role": "assistant", "content": response.message() })),
-                ConversationEvent::Model { .. } => None,
+                ConversationEventKind::Model { .. } => None,
             })
             .collect(),
     )
@@ -334,14 +334,95 @@ fn completed_response_text(payload: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::str::FromStr;
 
     use reqwest::StatusCode;
-    use serde_json::Map;
+    use serde_json::{Map, Value, json};
+    use time::OffsetDateTime;
 
-    use crate::conversation::{ModelCommunication, ModelEvent, ModelEventImportance};
+    use crate::conversation::{
+        AssistantResponse, Conversation, ConversationEvent, ConversationEventId,
+        ConversationEventKind, ConversationId, ModelCommunication, ModelEvent,
+        ModelEventImportance, ModelId, ModelSource, ProviderId, UserContent,
+    };
     use crate::model_driver::ModelDriverError;
 
-    use super::{classify_response_error, model_communication, parse_server_sent_events};
+    use super::{
+        classify_response_error, model_communication, parse_server_sent_events, semantic_input,
+    };
+
+    fn conversation_event(
+        conversation_id: ConversationId,
+        position: u64,
+        kind: ConversationEventKind,
+    ) -> ConversationEvent {
+        ConversationEvent {
+            conversation_id,
+            position,
+            id: ConversationEventId::new(),
+            timestamp: OffsetDateTime::UNIX_EPOCH,
+            schema_version: 7,
+            kind,
+        }
+    }
+
+    #[test]
+    fn semantic_input_projects_canonical_events_and_ignores_extensions() {
+        let conversation_id = ConversationId::new();
+        let source = ModelSource::new(
+            ProviderId::from_str("openai").expect("the provider identifier should be valid"),
+            ModelId::from_str("gpt-5.6").expect("the model identifier should be valid"),
+        );
+        let extensions = Map::from_iter([(
+            "unknown.extension".to_owned(),
+            Value::String("ignored".to_owned()),
+        )]);
+        let conversation = Conversation::from_events(vec![
+            conversation_event(
+                conversation_id,
+                0,
+                ConversationEventKind::User {
+                    content: vec![UserContent::Text("Hello".to_owned())],
+                },
+            ),
+            conversation_event(
+                conversation_id,
+                1,
+                ConversationEventKind::Model {
+                    source: source.clone(),
+                    event: ModelEvent::Communication(
+                        ModelCommunication::new(
+                            "Reasoning".to_owned(),
+                            ModelEventImportance::Detailed,
+                            "reasoning".to_owned(),
+                            extensions.clone(),
+                        )
+                        .expect("the model communication should be valid"),
+                    ),
+                },
+            ),
+            conversation_event(
+                conversation_id,
+                2,
+                ConversationEventKind::Model {
+                    source,
+                    event: ModelEvent::AssistantResponse(
+                        AssistantResponse::new("Hello.".to_owned(), extensions)
+                            .expect("the assistant response should be valid"),
+                    ),
+                },
+            ),
+        ])
+        .expect("the conversation should be valid");
+
+        assert_eq!(
+            semantic_input(&conversation),
+            json!([
+                { "role": "user", "content": "Hello" },
+                { "role": "assistant", "content": "Hello." }
+            ])
+        );
+    }
 
     #[test]
     fn streaming_response_returns_assistant_response() {
