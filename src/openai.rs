@@ -11,9 +11,9 @@ use serde_json::{Map, Value, json};
 use crate::conversation::{
     AssistantResponse, Conversation, ConversationEventKind, InvalidAssistantResponse,
     InvalidModelCommunication, InvalidModelProblem, ModelCommunication, ModelEvent,
-    ModelEventImportance, ModelId, ModelIssue, ModelProblem, ModelSource, ProviderId, UserContent,
+    ModelEventImportance, ModelId, ModelIssue, ModelSource, ProviderId, UserContent,
 };
-use crate::model_driver::{ModelDriver, ModelDriverError, ModelEventStream};
+use crate::model_driver::{ModelDriver, ModelDriverError, ModelDriverOutput, ModelOutputStream};
 
 type ResponseByteStream = BoxStream<'static, Result<Vec<u8>, ModelDriverError>>;
 
@@ -52,7 +52,7 @@ impl ModelDriver for OpenAiModelDriver {
     fn invoke<'invoke>(
         &'invoke self,
         conversation: &'invoke Conversation,
-    ) -> BoxFuture<'invoke, Result<ModelEventStream, ModelDriverError>> {
+    ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
         let mut request_body = Map::new();
         request_body.insert(
             "model".to_owned(),
@@ -98,7 +98,7 @@ impl ModelDriver for OpenAiModelDriver {
                         .map_err(|error| ModelDriverError::Transport(error.to_string()))
                 })
                 .boxed();
-            Ok(model_event_stream(response_bytes))
+            Ok(model_output_stream(response_bytes))
         }
         .boxed()
     }
@@ -125,6 +125,7 @@ fn semantic_input(conversation: &Conversation) -> Value {
                     ..
                 } => Some(json!({ "role": "assistant", "content": response.message() })),
                 ConversationEventKind::Model { .. } => None,
+                ConversationEventKind::Problem { .. } => None,
             })
             .collect(),
     )
@@ -164,8 +165,8 @@ fn is_context_limit_payload(payload: &Value) -> bool {
         .any(|code| matches!(code, "context_length_exceeded" | "context_window_exceeded"))
 }
 
-fn model_issue_stream(issue: ModelIssue) -> ModelEventStream {
-    stream::once(async move { Ok(ModelEvent::Problem(ModelProblem::Issue(issue))) }).boxed()
+fn model_issue_stream(issue: ModelIssue) -> ModelOutputStream {
+    stream::once(async move { Ok(ModelDriverOutput::Issue(issue)) }).boxed()
 }
 
 #[derive(Default)]
@@ -264,7 +265,7 @@ struct OpenAiStreamState {
     response_bytes: ResponseByteStream,
     decoder: ServerSentEventDecoder,
     response: ResponseState,
-    model_events: VecDeque<ModelEvent>,
+    model_outputs: VecDeque<ModelDriverOutput>,
     response_end: Option<ResponseEnd>,
     terminated: bool,
 }
@@ -275,28 +276,28 @@ enum ResponseEnd {
     DoneSentinel,
 }
 
-fn model_event_stream(response_bytes: ResponseByteStream) -> ModelEventStream {
+fn model_output_stream(response_bytes: ResponseByteStream) -> ModelOutputStream {
     let state = OpenAiStreamState {
         response_bytes,
         decoder: ServerSentEventDecoder::default(),
         response: ResponseState::default(),
-        model_events: VecDeque::new(),
+        model_outputs: VecDeque::new(),
         response_end: None,
         terminated: false,
     };
 
     stream::unfold(state, |mut state| async move {
         loop {
-            if let Some(model_event) = state.model_events.pop_front() {
-                return Some((Ok(model_event), state));
+            if let Some(model_output) = state.model_outputs.pop_front() {
+                return Some((Ok(model_output), state));
             }
             if state.terminated {
                 return None;
             }
             if let Some(server_sent_event) = state.decoder.events.pop_front() {
                 match process_event(server_sent_event, &mut state.response) {
-                    Ok(ProcessEventResult::Events(model_events)) => {
-                        state.model_events.extend(model_events);
+                    Ok(ProcessEventResult::Outputs(model_outputs)) => {
+                        state.model_outputs.extend(model_outputs);
                     }
                     Ok(ProcessEventResult::Done) => {
                         state.decoder.events.clear();
@@ -350,7 +351,7 @@ fn model_event_stream(response_bytes: ResponseByteStream) -> ModelEventStream {
 }
 
 enum ProcessEventResult {
-    Events(Vec<ModelEvent>),
+    Outputs(Vec<ModelDriverOutput>),
     Done,
 }
 
@@ -485,13 +486,13 @@ fn process_event(
         }
         _ => Vec::new(),
     };
-    Ok(ProcessEventResult::Events(model_events))
+    Ok(ProcessEventResult::Outputs(model_events))
 }
 
 fn complete_response(
     response_state: &mut ResponseState,
     payload: &Value,
-) -> Result<Vec<ModelEvent>, ModelDriverError> {
+) -> Result<Vec<ModelDriverOutput>, ModelDriverError> {
     if response_state.completed {
         return Err(ModelDriverError::InvalidResponse(
             "response.completed was received more than once".to_owned(),
@@ -541,7 +542,8 @@ fn complete_response(
         || model_events.iter().any(|event| {
             matches!(
                 event,
-                ModelEvent::AssistantResponse(_) | ModelEvent::Problem(_)
+                ModelDriverOutput::Event(ModelEvent::AssistantResponse(_))
+                    | ModelDriverOutput::Issue(_)
             )
         });
     if !has_completed_model_output {
@@ -556,7 +558,7 @@ fn complete_response(
 fn emit_reasoning(
     reasoning_outputs: &mut [AccumulatedText],
     key: &str,
-) -> Result<Option<ModelEvent>, ModelDriverError> {
+) -> Result<Option<ModelDriverOutput>, ModelDriverError> {
     let output = un_emitted_text(reasoning_outputs, key)?;
     let Some(reasoning_text) = preferred_text(&output.streamed_text, &output.completed_text) else {
         return Ok(None);
@@ -570,7 +572,7 @@ fn emit_reasoning(
 fn emit_reasoning_summary(
     reasoning_summaries: &mut [AccumulatedText],
     key: &str,
-) -> Result<Option<ModelEvent>, ModelDriverError> {
+) -> Result<Option<ModelDriverOutput>, ModelDriverError> {
     let output = un_emitted_text(reasoning_summaries, key)?;
     let Some(reasoning_summary) = preferred_text(&output.streamed_text, &output.completed_text)
     else {
@@ -588,7 +590,7 @@ fn emit_reasoning_summary(
 fn emit_assistant_response(
     assistant_outputs: &mut [AccumulatedText],
     key: &str,
-) -> Result<Option<ModelEvent>, ModelDriverError> {
+) -> Result<Option<ModelDriverOutput>, ModelDriverError> {
     let output = un_emitted_text(assistant_outputs, key)?;
     let assistant_text = preferred_text(&output.streamed_text, &output.completed_text);
     let Some(assistant_text) = assistant_text else {
@@ -602,7 +604,7 @@ fn emit_assistant_response(
 fn emit_refusal(
     refusal_outputs: &mut [AccumulatedText],
     key: &str,
-) -> Result<Option<ModelEvent>, ModelDriverError> {
+) -> Result<Option<ModelDriverOutput>, ModelDriverError> {
     let output = un_emitted_text(refusal_outputs, key)?;
     let refusal = preferred_text(&output.streamed_text, &output.completed_text);
     let Some(refusal) = refusal else {
@@ -615,7 +617,7 @@ fn emit_refusal(
 
 fn emit_remaining_reasoning(
     outputs: &mut [AccumulatedText],
-) -> Result<Vec<ModelEvent>, ModelDriverError> {
+) -> Result<Vec<ModelDriverOutput>, ModelDriverError> {
     let keys = un_emitted_keys(outputs);
     keys.into_iter()
         .filter_map(|key| emit_reasoning(outputs, &key).transpose())
@@ -624,7 +626,7 @@ fn emit_remaining_reasoning(
 
 fn emit_remaining_reasoning_summaries(
     outputs: &mut [AccumulatedText],
-) -> Result<Vec<ModelEvent>, ModelDriverError> {
+) -> Result<Vec<ModelDriverOutput>, ModelDriverError> {
     let keys = un_emitted_keys(outputs);
     keys.into_iter()
         .filter_map(|key| emit_reasoning_summary(outputs, &key).transpose())
@@ -633,7 +635,7 @@ fn emit_remaining_reasoning_summaries(
 
 fn emit_remaining_assistant_responses(
     outputs: &mut [AccumulatedText],
-) -> Result<Vec<ModelEvent>, ModelDriverError> {
+) -> Result<Vec<ModelDriverOutput>, ModelDriverError> {
     let keys = un_emitted_keys(outputs);
     keys.into_iter()
         .filter_map(|key| emit_assistant_response(outputs, &key).transpose())
@@ -642,28 +644,29 @@ fn emit_remaining_assistant_responses(
 
 fn emit_remaining_refusals(
     outputs: &mut [AccumulatedText],
-) -> Result<Vec<ModelEvent>, ModelDriverError> {
+) -> Result<Vec<ModelDriverOutput>, ModelDriverError> {
     let keys = un_emitted_keys(outputs);
     keys.into_iter()
         .filter_map(|key| emit_refusal(outputs, &key).transpose())
         .collect()
 }
 
-fn assistant_response(message: String) -> Result<ModelEvent, ModelDriverError> {
+fn assistant_response(message: String) -> Result<ModelDriverOutput, ModelDriverError> {
     AssistantResponse::new(message, Map::new())
         .map(ModelEvent::AssistantResponse)
+        .map(ModelDriverOutput::Event)
         .map_err(invalid_assistant_response)
 }
 
-fn model_refusal(message: String) -> Result<ModelEvent, ModelDriverError> {
+fn model_refusal(message: String) -> Result<ModelDriverOutput, ModelDriverError> {
     ModelIssue::try_refusal(message)
-        .map(|issue| ModelEvent::Problem(ModelProblem::Issue(issue)))
+        .map(ModelDriverOutput::Issue)
         .map_err(invalid_model_problem)
 }
 
-fn model_context_limit_exceeded() -> Result<ModelEvent, ModelDriverError> {
+fn model_context_limit_exceeded() -> Result<ModelDriverOutput, ModelDriverError> {
     ModelIssue::try_context_limit_exceeded("The model context limit was exceeded.".to_owned())
-        .map(|issue| ModelEvent::Problem(ModelProblem::Issue(issue)))
+        .map(ModelDriverOutput::Issue)
         .map_err(invalid_model_problem)
 }
 
@@ -765,9 +768,10 @@ fn model_communication(
     message: String,
     subtype: &str,
     importance: ModelEventImportance,
-) -> Result<ModelEvent, ModelDriverError> {
+) -> Result<ModelDriverOutput, ModelDriverError> {
     ModelCommunication::new(message, importance, subtype.to_owned(), Map::new())
         .map(ModelEvent::Communication)
+        .map(ModelDriverOutput::Event)
         .map_err(invalid_model_communication)
 }
 
@@ -921,14 +925,13 @@ mod tests {
     use crate::conversation::{
         AssistantResponse, Conversation, ConversationEvent, ConversationEventId,
         ConversationEventKind, ConversationId, ModelCommunication, ModelEvent,
-        ModelEventImportance, ModelId, ModelIssue, ModelProblem, ModelSource, ProviderId,
-        UserContent,
+        ModelEventImportance, ModelId, ModelIssue, ModelSource, ProviderId, UserContent,
     };
-    use crate::model_driver::{ModelDriver, ModelDriverError};
+    use crate::model_driver::{ModelDriver, ModelDriverError, ModelDriverOutput};
 
     use super::{
         OpenAiModelDriver, ResponseByteStream, classify_response_failure, model_communication,
-        model_event_stream, semantic_input,
+        model_output_stream, semantic_input,
     };
 
     fn conversation_event(
@@ -1013,9 +1016,30 @@ mod tests {
     }
 
     async fn collect_events(input: &str) -> Vec<Result<ModelEvent, ModelDriverError>> {
-        model_event_stream(response_byte_stream(vec![input.as_bytes().to_vec()]))
+        model_output_stream(response_byte_stream(vec![input.as_bytes().to_vec()]))
+            .map(|result| {
+                result.and_then(|output| match output {
+                    ModelDriverOutput::Event(event) => Ok(event),
+                    ModelDriverOutput::Issue(_) => Err(ModelDriverError::InvalidResponse(
+                        "the test expected a model event, not a model issue".to_owned(),
+                    )),
+                })
+            })
             .collect()
             .await
+    }
+
+    async fn collect_outputs(input: &str) -> Vec<Result<ModelDriverOutput, ModelDriverError>> {
+        model_output_stream(response_byte_stream(vec![input.as_bytes().to_vec()]))
+            .collect()
+            .await
+    }
+
+    fn expect_model_event(output: ModelDriverOutput) -> ModelEvent {
+        match output {
+            ModelDriverOutput::Event(event) => event,
+            ModelDriverOutput::Issue(_) => panic!("the output should be a model event"),
+        }
     }
 
     fn test_conversation() -> Conversation {
@@ -1081,8 +1105,14 @@ mod tests {
             .expect("the stream should yield an answer")
             .expect("the answer should be valid");
 
-        assert!(matches!(first_event, ModelEvent::Communication(_)));
-        assert!(matches!(second_event, ModelEvent::AssistantResponse(_)));
+        assert!(matches!(
+            first_event,
+            ModelDriverOutput::Event(ModelEvent::Communication(_))
+        ));
+        assert!(matches!(
+            second_event,
+            ModelDriverOutput::Event(ModelEvent::AssistantResponse(_))
+        ));
         assert!(model_events.next().await.is_none());
         server.join().expect("the mock server should stop");
     }
@@ -1159,12 +1189,12 @@ mod tests {
 
         assert!(matches!(
             &model_event,
-            ModelEvent::Problem(ModelProblem::Issue(ModelIssue::ContextLimitExceeded { .. }))
+            ModelDriverOutput::Issue(ModelIssue::ContextLimitExceeded { .. })
         ));
-        assert_eq!(
-            model_event.message(),
-            "The model context limit was exceeded."
-        );
+        let ModelDriverOutput::Issue(issue) = model_event else {
+            panic!("the output should be a model issue");
+        };
+        assert_eq!(issue.message(), "The model context limit was exceeded.");
         assert!(model_events.next().await.is_none());
         server.join().expect("the mock server should stop");
     }
@@ -1181,7 +1211,7 @@ mod tests {
             "data: {\"response\":{}}\r\n\r\n",
             "data: [DONE]\r\n\r\n"
         );
-        let mut model_events = model_event_stream(response_byte_stream(one_byte_chunks(input)));
+        let mut model_events = model_output_stream(response_byte_stream(one_byte_chunks(input)));
 
         let model_event = model_events
             .next()
@@ -1189,7 +1219,7 @@ mod tests {
             .expect("the stream should yield an event")
             .expect("the event should be valid");
 
-        assert_eq!(model_event.message(), "Hello");
+        assert_eq!(expect_model_event(model_event).message(), "Hello");
         assert!(model_events.next().await.is_none());
     }
 
@@ -1201,7 +1231,7 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
         );
 
-        let events = collect_events(input)
+        let events = collect_outputs(input)
             .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
@@ -1210,10 +1240,12 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
-            ModelEvent::Problem(ModelProblem::Issue(ModelIssue::Refusal { .. }))
+            ModelDriverOutput::Issue(ModelIssue::Refusal { .. })
         ));
-        assert_eq!(events[0].message(), "I cannot comply.");
-        assert_eq!(events[0].importance(), ModelEventImportance::Important);
+        let ModelDriverOutput::Issue(issue) = &events[0] else {
+            panic!("the output should be a refusal issue");
+        };
+        assert_eq!(issue.message(), "I cannot comply.");
     }
 
     #[tokio::test]
@@ -1248,17 +1280,14 @@ mod tests {
             "data: {\"type\":\"error\",\"message\":\"late failure\"}\n\n"
         );
         let mut model_events =
-            model_event_stream(response_byte_stream(vec![input.as_bytes().to_vec()]));
+            model_output_stream(response_byte_stream(vec![input.as_bytes().to_vec()]));
 
-        assert_eq!(
-            model_events
-                .next()
-                .await
-                .expect("the stream should yield an event")
-                .expect("the completed event should be valid")
-                .message(),
-            "Hello"
-        );
+        let completed_event = model_events
+            .next()
+            .await
+            .expect("the stream should yield an event")
+            .expect("the completed event should be valid");
+        assert_eq!(expect_model_event(completed_event).message(), "Hello");
         assert!(matches!(
             model_events.next().await,
             Some(Err(ModelDriverError::Provider(_)))
@@ -1272,7 +1301,7 @@ mod tests {
             "data: {\"type\":\"error\",\"code\":\"context_length_exceeded\",\"message\":\"raw details\"}\n\n",
             "data: [DONE]\n\n"
         );
-        let events = collect_events(input)
+        let events = collect_outputs(input)
             .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
@@ -1281,7 +1310,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
-            ModelEvent::Problem(ModelProblem::Issue(ModelIssue::ContextLimitExceeded { .. }))
+            ModelDriverOutput::Issue(ModelIssue::ContextLimitExceeded { .. })
         ));
     }
 
@@ -1289,11 +1318,13 @@ mod tests {
     async fn premature_body_end_is_a_stream_interruption() {
         let input = "data: {\"type\":\"response.output_text.done\",\"text\":\"Hello\"}\n\n";
         let mut model_events =
-            model_event_stream(response_byte_stream(vec![input.as_bytes().to_vec()]));
+            model_output_stream(response_byte_stream(vec![input.as_bytes().to_vec()]));
 
         assert!(matches!(
             model_events.next().await,
-            Some(Ok(ModelEvent::AssistantResponse(_)))
+            Some(Ok(ModelDriverOutput::Event(ModelEvent::AssistantResponse(
+                _
+            ))))
         ));
         assert!(matches!(
             model_events.next().await,
@@ -1308,11 +1339,13 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let mut model_events =
-            model_event_stream(response_byte_stream(vec![input.as_bytes().to_vec()]));
+            model_output_stream(response_byte_stream(vec![input.as_bytes().to_vec()]));
 
         assert!(matches!(
             model_events.next().await,
-            Some(Ok(ModelEvent::AssistantResponse(_)))
+            Some(Ok(ModelDriverOutput::Event(ModelEvent::AssistantResponse(
+                _
+            ))))
         ));
         assert!(matches!(
             model_events.next().await,
@@ -1381,11 +1414,13 @@ mod tests {
             "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"Answer\"}\n\n",
             "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"Answer\"}\n\n"
         );
-        let mut events = model_event_stream(response_byte_stream(vec![input.as_bytes().to_vec()]));
+        let mut events = model_output_stream(response_byte_stream(vec![input.as_bytes().to_vec()]));
 
         assert!(matches!(
             events.next().await,
-            Some(Ok(ModelEvent::AssistantResponse(_)))
+            Some(Ok(ModelDriverOutput::Event(ModelEvent::AssistantResponse(
+                _
+            ))))
         ));
         assert!(matches!(
             events.next().await,
@@ -1410,7 +1445,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_json_is_a_stream_error() {
         let mut events =
-            model_event_stream(response_byte_stream(vec![b"data: not-json\n\n".to_vec()]));
+            model_output_stream(response_byte_stream(vec![b"data: not-json\n\n".to_vec()]));
 
         assert!(matches!(
             events.next().await,

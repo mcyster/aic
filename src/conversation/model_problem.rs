@@ -268,18 +268,94 @@ mod tests {
     }
 
     #[test]
-    fn invocation_retryability_reflects_an_unchanged_later_attempt() {
-        let rate_limited = ModelProblem::Invocation(
-            InvocationError::try_rate_limited("Try again later.".to_owned())
-                .expect("the rate limit should be valid"),
-        );
-        let invalid_response = ModelProblem::Invocation(
-            InvocationError::try_invalid_provider_response("Invalid response.".to_owned())
-                .expect("the invalid response should be valid"),
-        );
+    fn every_problem_has_an_intentional_message_and_retryability() {
+        let problems = [
+            (
+                ModelProblem::Issue(
+                    ModelIssue::try_refusal("Refused.".to_owned())
+                        .expect("the refusal should be valid"),
+                ),
+                "Refused.",
+                false,
+            ),
+            (
+                ModelProblem::Issue(
+                    ModelIssue::try_context_limit_exceeded("Context exceeded.".to_owned())
+                        .expect("the context issue should be valid"),
+                ),
+                "Context exceeded.",
+                false,
+            ),
+            (
+                ModelProblem::Issue(
+                    ModelIssue::try_other("Other issue.".to_owned(), Map::new())
+                        .expect("the other issue should be valid"),
+                ),
+                "Other issue.",
+                false,
+            ),
+            (
+                ModelProblem::Invocation(
+                    InvocationError::try_authentication("Authentication failed.".to_owned())
+                        .expect("the authentication error should be valid"),
+                ),
+                "Authentication failed.",
+                false,
+            ),
+            (
+                ModelProblem::Invocation(
+                    InvocationError::try_rate_limited("Rate limited.".to_owned())
+                        .expect("the rate limit should be valid"),
+                ),
+                "Rate limited.",
+                true,
+            ),
+            (
+                ModelProblem::Invocation(
+                    InvocationError::try_transport("Transport failed.".to_owned())
+                        .expect("the transport error should be valid"),
+                ),
+                "Transport failed.",
+                true,
+            ),
+            (
+                ModelProblem::Invocation(
+                    InvocationError::try_invalid_request("Request invalid.".to_owned())
+                        .expect("the invalid request should be valid"),
+                ),
+                "Request invalid.",
+                false,
+            ),
+            (
+                ModelProblem::Invocation(
+                    InvocationError::try_provider_failure("Provider failed.".to_owned())
+                        .expect("the provider failure should be valid"),
+                ),
+                "Provider failed.",
+                true,
+            ),
+            (
+                ModelProblem::Invocation(
+                    InvocationError::try_invalid_provider_response("Response invalid.".to_owned())
+                        .expect("the invalid provider response should be valid"),
+                ),
+                "Response invalid.",
+                false,
+            ),
+            (
+                ModelProblem::Invocation(
+                    InvocationError::try_stream_interrupted("Stream interrupted.".to_owned())
+                        .expect("the stream interruption should be valid"),
+                ),
+                "Stream interrupted.",
+                true,
+            ),
+        ];
 
-        assert!(rate_limited.retryable());
-        assert!(!invalid_response.retryable());
+        for (problem, expected_message, expected_retryability) in problems {
+            assert_eq!(problem.message(), expected_message);
+            assert_eq!(problem.retryable(), expected_retryability);
+        }
     }
 
     #[test]
@@ -287,6 +363,26 @@ mod tests {
         assert!(ModelIssue::try_refusal("  ".to_owned()).is_err());
         assert!(ModelIssue::try_context_limit_exceeded(String::new()).is_err());
         assert!(ModelIssue::try_other("\n".to_owned(), Map::new()).is_err());
+        assert!(InvocationError::try_authentication(" ".to_owned()).is_err());
+        assert!(InvocationError::try_rate_limited("\n".to_owned()).is_err());
         assert!(InvocationError::try_transport("\t".to_owned()).is_err());
+        assert!(InvocationError::try_invalid_request(String::new()).is_err());
+        assert!(InvocationError::try_provider_failure("  ".to_owned()).is_err());
+        assert!(InvocationError::try_invalid_provider_response("\r\n".to_owned()).is_err());
+        assert!(InvocationError::try_stream_interrupted("\t".to_owned()).is_err());
+    }
+
+    #[test]
+    fn model_problem_messages_preserve_surrounding_whitespace() {
+        let issue = ModelProblem::Issue(
+            ModelIssue::try_refusal("  refusal\n".to_owned()).expect("the refusal should be valid"),
+        );
+        let invocation = ModelProblem::Invocation(
+            InvocationError::try_transport("  transport\n".to_owned())
+                .expect("the transport error should be valid"),
+        );
+
+        assert_eq!(issue.message(), "  refusal\n");
+        assert_eq!(invocation.message(), "  transport\n");
     }
 }

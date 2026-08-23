@@ -3,7 +3,9 @@ use std::io::{self, Write};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::conversation::{ConversationId, ModelEvent, ModelEventImportance, ModelId};
+use crate::conversation::{
+    ConversationId, ModelEvent, ModelEventImportance, ModelId, ModelProblem,
+};
 use crate::openai::OpenAiModelDriver;
 use crate::persistence::EventStore;
 use crate::turn::{TurnProgress, TurnRequest, TurnResultValue, TurnService};
@@ -53,15 +55,18 @@ impl CommandLine {
                         |conversation_id| eprintln!("#> conversation {conversation_id}"),
                         |progress| {
                             match progress {
-                                TurnProgress::ModelInvocationStarted { model } => {
+                                TurnProgress::InvocationStarted { model } => {
                                     eprintln!("## waiting for model {model}");
                                 }
-                                TurnProgress::ModelEventCompleted { event }
+                                TurnProgress::EventCompleted { event }
                                     if verbosity.includes(event.importance()) =>
                                 {
                                     render_model_event(&event)?;
                                 }
-                                TurnProgress::ModelEventCompleted { .. } => {}
+                                TurnProgress::EventCompleted { .. } => {}
+                                TurnProgress::ProblemCompleted { problem } => {
+                                    render_model_problem(&problem)?;
+                                }
                             }
                             Ok(())
                         },
@@ -75,10 +80,16 @@ impl CommandLine {
 fn render_model_event(model_event: &ModelEvent) -> io::Result<()> {
     let prefix = match model_event {
         ModelEvent::AssistantResponse(_) => "",
-        ModelEvent::Communication(_) | ModelEvent::Problem(_) => "### ",
+        ModelEvent::Communication(_) => "### ",
     };
     let mut standard_output = io::stdout().lock();
     writeln!(standard_output, "{prefix}{}", model_event.message())?;
+    standard_output.flush()
+}
+
+fn render_model_problem(problem: &ModelProblem) -> io::Result<()> {
+    let mut standard_output = io::stdout().lock();
+    writeln!(standard_output, "### {}", problem.message())?;
     standard_output.flush()
 }
 

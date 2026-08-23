@@ -6,7 +6,7 @@ use crate::conversation::{
     ConversationEventKind, ConversationId, InvalidModelProblem, InvocationError, ModelEvent,
     ModelProblem, ModelSource, UserContent, UserPrompt,
 };
-use crate::model_driver::{ModelDriver, ModelDriverError};
+use crate::model_driver::{ModelDriver, ModelDriverError, ModelDriverOutput};
 use crate::persistence::EventStore;
 
 pub(crate) type TurnResultValue<T> = Result<T, Box<dyn Error>>;
@@ -17,8 +17,9 @@ pub(crate) struct TurnRequest {
 }
 
 pub(crate) enum TurnProgress {
-    ModelInvocationStarted { model: String },
-    ModelEventCompleted { event: ModelEvent },
+    InvocationStarted { model: String },
+    EventCompleted { event: ModelEvent },
+    ProblemCompleted { problem: ModelProblem },
 }
 
 pub(crate) struct TurnService {
@@ -57,11 +58,11 @@ impl TurnService {
 
         let conversation = self.event_store.load_conversation(conversation_id)?;
         let source = self.model_driver.source().clone();
-        report_progress(TurnProgress::ModelInvocationStarted {
+        report_progress(TurnProgress::InvocationStarted {
             model: source.model().as_str().to_owned(),
         })?;
-        let mut model_events = match self.model_driver.invoke(&conversation).await {
-            Ok(model_events) => model_events,
+        let mut model_outputs = match self.model_driver.invoke(&conversation).await {
+            Ok(model_outputs) => model_outputs,
             Err(error) => {
                 self.append_invocation_problem(
                     conversation_id,
@@ -72,9 +73,9 @@ impl TurnService {
                 return Err(Box::new(error));
             }
         };
-        while let Some(model_event) = model_events.next().await {
-            let model_event = match model_event {
-                Ok(model_event) => model_event,
+        while let Some(model_output) = model_outputs.next().await {
+            let model_output = match model_output {
+                Ok(model_output) => model_output,
                 Err(error) => {
                     self.append_invocation_problem(
                         conversation_id,
@@ -85,14 +86,29 @@ impl TurnService {
                     return Err(Box::new(error));
                 }
             };
-            self.event_store.append_conversation_event(
-                conversation_id,
-                ConversationEventKind::Model {
-                    source: source.clone(),
-                    event: model_event.clone(),
-                },
-            )?;
-            report_progress(TurnProgress::ModelEventCompleted { event: model_event })?;
+            match model_output {
+                ModelDriverOutput::Event(model_event) => {
+                    self.event_store.append_conversation_event(
+                        conversation_id,
+                        ConversationEventKind::Model {
+                            source: source.clone(),
+                            event: model_event.clone(),
+                        },
+                    )?;
+                    report_progress(TurnProgress::EventCompleted { event: model_event })?;
+                }
+                ModelDriverOutput::Issue(issue) => {
+                    let problem = ModelProblem::Issue(issue);
+                    self.event_store.append_conversation_event(
+                        conversation_id,
+                        ConversationEventKind::Problem {
+                            source: source.clone(),
+                            problem: problem.clone(),
+                        },
+                    )?;
+                    report_progress(TurnProgress::ProblemCompleted { problem })?;
+                }
+            }
         }
 
         Ok(())
@@ -108,9 +124,9 @@ impl TurnService {
         let problem = invocation_problem(error, stage)?;
         self.event_store.append_conversation_event(
             conversation_id,
-            ConversationEventKind::Model {
+            ConversationEventKind::Problem {
                 source: source.clone(),
-                event: ModelEvent::Problem(problem),
+                problem,
             },
         )?;
         Ok(())
@@ -171,10 +187,12 @@ mod tests {
     use super::{TurnProgress, TurnRequest, TurnService};
     use crate::conversation::{
         AssistantResponse, Conversation, ConversationEventKind, ConversationId, InvocationError,
-        ModelCommunication, ModelEvent, ModelEventImportance, ModelId, ModelProblem, ModelSource,
-        ProviderId, UserContent, UserPrompt,
+        ModelCommunication, ModelEvent, ModelEventImportance, ModelId, ModelIssue, ModelProblem,
+        ModelSource, ProviderId, UserContent, UserPrompt,
     };
-    use crate::model_driver::{ModelDriver, ModelDriverError, ModelEventStream};
+    use crate::model_driver::{
+        ModelDriver, ModelDriverError, ModelDriverOutput, ModelOutputStream,
+    };
     use crate::persistence::EventStore;
 
     struct RecordingModelDriver {
@@ -191,13 +209,16 @@ mod tests {
         fn invoke<'invoke>(
             &'invoke self,
             conversation: &'invoke Conversation,
-        ) -> BoxFuture<'invoke, Result<ModelEventStream, ModelDriverError>> {
+        ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
             self.inputs
                 .lock()
                 .expect("the model input list should lock")
                 .push(conversation.clone());
             let events = self.events.clone();
-            async move { Ok(stream::iter(events.into_iter().map(Ok)).boxed()) }.boxed()
+            async move {
+                Ok(stream::iter(events.into_iter().map(ModelDriverOutput::Event).map(Ok)).boxed())
+            }
+            .boxed()
         }
     }
 
@@ -213,7 +234,7 @@ mod tests {
         fn invoke<'invoke>(
             &'invoke self,
             _conversation: &'invoke Conversation,
-        ) -> BoxFuture<'invoke, Result<ModelEventStream, ModelDriverError>> {
+        ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
             async { Err(ModelDriverError::Provider("failure".to_owned())) }.boxed()
         }
     }
@@ -221,6 +242,28 @@ mod tests {
     struct LateFailingModelDriver {
         source: ModelSource,
         completed_event: ModelEvent,
+    }
+
+    struct IssueModelDriver {
+        source: ModelSource,
+        issue: ModelIssue,
+    }
+
+    impl ModelDriver for IssueModelDriver {
+        fn source(&self) -> &ModelSource {
+            &self.source
+        }
+
+        fn invoke<'invoke>(
+            &'invoke self,
+            _conversation: &'invoke Conversation,
+        ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
+            let issue = self.issue.clone();
+            async move {
+                Ok(stream::once(async move { Ok(ModelDriverOutput::Issue(issue)) }).boxed())
+            }
+            .boxed()
+        }
     }
 
     impl ModelDriver for LateFailingModelDriver {
@@ -231,11 +274,11 @@ mod tests {
         fn invoke<'invoke>(
             &'invoke self,
             _conversation: &'invoke Conversation,
-        ) -> BoxFuture<'invoke, Result<ModelEventStream, ModelDriverError>> {
+        ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
             let completed_event = self.completed_event.clone();
             async move {
                 Ok(stream::iter(vec![
-                    Ok(completed_event),
+                    Ok(ModelDriverOutput::Event(completed_event)),
                     Err(ModelDriverError::Transport("late failure".to_owned())),
                 ])
                 .boxed())
@@ -392,7 +435,7 @@ mod tests {
                         Some(conversation_id);
                 },
                 move |progress| {
-                    if let TurnProgress::ModelEventCompleted { .. } = progress {
+                    if let TurnProgress::EventCompleted { .. } = progress {
                         let conversation_id = report_conversation_id
                             .lock()
                             .expect("the conversation identification should lock")
@@ -479,10 +522,7 @@ mod tests {
             conversation.events()[0].kind,
             ConversationEventKind::User { .. }
         ));
-        let ConversationEventKind::Model {
-            source,
-            event: ModelEvent::Problem(problem),
-        } = &conversation.events()[1].kind
+        let ConversationEventKind::Problem { source, problem } = &conversation.events()[1].kind
         else {
             panic!("the second event should be an invocation problem");
         };
@@ -495,6 +535,58 @@ mod tests {
             problem,
             ModelProblem::Invocation(InvocationError::ProviderFailure { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn model_issue_is_persisted_and_reported_as_a_top_level_problem() {
+        let root_directory =
+            std::env::temp_dir().join(format!("tog-model-issue-test-{}", uuid::Uuid::now_v7()));
+        let source = model_source("test-provider", "test-model");
+        let service = TurnService::new(
+            EventStore::new(root_directory).expect("the event store should be created"),
+            Box::new(IssueModelDriver {
+                source: source.clone(),
+                issue: ModelIssue::try_refusal("Refused.".to_owned())
+                    .expect("the refusal should be valid"),
+            }),
+        );
+        let reported_problems = Arc::new(Mutex::new(Vec::new()));
+        let problem_reports = Arc::clone(&reported_problems);
+        let mut conversation_id = None;
+
+        service
+            .execute(
+                turn_request(None, "Question"),
+                |identified_conversation_id| conversation_id = Some(identified_conversation_id),
+                move |progress| {
+                    if let TurnProgress::ProblemCompleted { problem } = progress {
+                        problem_reports
+                            .lock()
+                            .expect("the problem report list should lock")
+                            .push(problem);
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .expect("the model issue turn should complete");
+
+        let conversation = service
+            .event_store
+            .load_conversation(conversation_id.expect("the turn should identify its conversation"))
+            .expect("the conversation should load");
+        assert!(matches!(
+            &conversation.events()[1].kind,
+            ConversationEventKind::Problem {
+                source: event_source,
+                problem: ModelProblem::Issue(ModelIssue::Refusal { .. }),
+            } if event_source == &source
+        ));
+        let reports = reported_problems
+            .lock()
+            .expect("the problem report list should lock");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].message(), "Refused.");
     }
 
     #[tokio::test]
@@ -535,10 +627,8 @@ mod tests {
         );
         assert!(matches!(
             conversation.events()[2].kind,
-            ConversationEventKind::Model {
-                event: ModelEvent::Problem(ModelProblem::Invocation(
-                    InvocationError::StreamInterrupted { .. }
-                )),
+            ConversationEventKind::Problem {
+                problem: ModelProblem::Invocation(InvocationError::StreamInterrupted { .. }),
                 ..
             }
         ));

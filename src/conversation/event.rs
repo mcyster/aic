@@ -29,6 +29,10 @@ pub(crate) enum ConversationEventKind {
         source: ModelSource,
         event: ModelEvent,
     },
+    Problem {
+        source: ModelSource,
+        problem: ModelProblem,
+    },
 }
 
 impl ConversationEventKind {
@@ -38,6 +42,9 @@ impl ConversationEventKind {
             Self::Model { event, .. } => event
                 .ensure_valid()
                 .map_err(InvalidConversationEventKind::InvalidModelEvent),
+            Self::Problem { problem, .. } => problem
+                .ensure_valid()
+                .map_err(InvalidConversationEventKind::InvalidModelProblem),
         }
     }
 }
@@ -45,12 +52,14 @@ impl ConversationEventKind {
 #[derive(Debug)]
 pub(super) enum InvalidConversationEventKind {
     InvalidModelEvent(InvalidModelEvent),
+    InvalidModelProblem(InvalidModelProblem),
 }
 
 impl Display for InvalidConversationEventKind {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidModelEvent(error) => Display::fmt(error, formatter),
+            Self::InvalidModelProblem(error) => Display::fmt(error, formatter),
         }
     }
 }
@@ -62,7 +71,6 @@ impl Error for InvalidConversationEventKind {}
 pub(crate) enum ModelEvent {
     AssistantResponse(AssistantResponse),
     Communication(ModelCommunication),
-    Problem(ModelProblem),
 }
 
 impl ModelEvent {
@@ -70,7 +78,6 @@ impl ModelEvent {
         match self {
             Self::AssistantResponse(response) => response.message(),
             Self::Communication(communication) => communication.message(),
-            Self::Problem(problem) => problem.message(),
         }
     }
 
@@ -78,7 +85,6 @@ impl ModelEvent {
         match self {
             Self::AssistantResponse(_) => ModelEventImportance::Important,
             Self::Communication(communication) => communication.importance(),
-            Self::Problem(_) => ModelEventImportance::Important,
         }
     }
 
@@ -90,9 +96,6 @@ impl ModelEvent {
             Self::Communication(communication) => communication
                 .ensure_valid()
                 .map_err(InvalidModelEvent::ModelCommunication),
-            Self::Problem(problem) => problem
-                .ensure_valid()
-                .map_err(InvalidModelEvent::ModelProblem),
         }
     }
 }
@@ -101,7 +104,6 @@ impl ModelEvent {
 pub(super) enum InvalidModelEvent {
     AssistantResponse(InvalidAssistantResponse),
     ModelCommunication(InvalidModelCommunication),
-    ModelProblem(InvalidModelProblem),
 }
 
 impl Display for InvalidModelEvent {
@@ -109,7 +111,6 @@ impl Display for InvalidModelEvent {
         match self {
             Self::AssistantResponse(error) => Display::fmt(error, formatter),
             Self::ModelCommunication(error) => Display::fmt(error, formatter),
-            Self::ModelProblem(error) => Display::fmt(error, formatter),
         }
     }
 }
@@ -363,30 +364,41 @@ mod tests {
     }
 
     #[test]
-    fn model_problem_uses_the_common_model_event_surface() {
-        let event = ModelEvent::Problem(ModelProblem::Issue(
+    fn model_problem_uses_one_authoritative_conversation_event_surface() {
+        let problem = ModelProblem::Issue(
             ModelIssue::try_refusal("I cannot comply.".to_owned())
                 .expect("the refusal should be valid"),
-        ));
+        );
+        let event = ConversationEventKind::Problem {
+            source: source(),
+            problem: problem.clone(),
+        };
 
         let serialized = serde_json::to_value(&event).expect("the problem should serialize");
-        let deserialized: ModelEvent =
+        let deserialized: ConversationEventKind =
             serde_json::from_value(serialized.clone()).expect("the problem should deserialize");
 
         assert_eq!(
             serialized,
             json!({
                 "type": "problem",
-                "category": "issue",
-                "detail": {
-                    "type": "refusal",
-                    "message": "I cannot comply."
+                "source": {
+                    "provider": "openai",
+                    "model": "gpt-5.6"
+                },
+                "problem": {
+                    "category": "issue",
+                    "detail": {
+                        "type": "refusal",
+                        "message": "I cannot comply."
+                    }
                 }
             })
         );
         assert_eq!(deserialized, event);
-        assert_eq!(event.message(), "I cannot comply.");
-        assert_eq!(event.importance(), ModelEventImportance::Important);
+        assert_eq!(problem.message(), "I cannot comply.");
+        assert!(serialized.get("message").is_none());
+        assert!(serialized.get("severity").is_none());
     }
 
     #[test]

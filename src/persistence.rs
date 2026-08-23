@@ -13,7 +13,7 @@ use crate::conversation::{
     Conversation, ConversationEvent, ConversationEventId, ConversationEventKind, ConversationId,
 };
 
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 pub(crate) struct EventStore {
     root_directory: PathBuf,
@@ -212,11 +212,11 @@ mod tests {
 
         assert_eq!(first_event.conversation_id, conversation_id);
         assert_eq!(first_event.position, 0);
-        assert_eq!(first_event.schema_version, 8);
+        assert_eq!(first_event.schema_version, 9);
         assert_ne!(first_event.timestamp, OffsetDateTime::UNIX_EPOCH);
         assert_eq!(second_event.conversation_id, conversation_id);
         assert_eq!(second_event.position, 1);
-        assert_eq!(second_event.schema_version, 8);
+        assert_eq!(second_event.schema_version, 9);
         assert_ne!(second_event.timestamp, OffsetDateTime::UNIX_EPOCH);
         assert_ne!(second_event.id, first_event.id);
 

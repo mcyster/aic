@@ -12,14 +12,19 @@ The original `ModelDriver` contract returned a batch of semantic model events on
 
 ## Decision
 
-One `ModelDriver::invoke` call represents one provider/model invocation and asynchronously establishes a stream of completed semantic `ModelEvent`s. The intended interface is approximately:
+One `ModelDriver::invoke` call represents one provider/model invocation and asynchronously establishes a stream of completed semantic `ModelDriverOutput`s. The intended interface is approximately:
 
 ```rust
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 
-pub(crate) type ModelEventStream =
-    BoxStream<'static, Result<ModelEvent, ModelDriverError>>;
+pub(crate) enum ModelDriverOutput {
+    Event(ModelEvent),
+    Issue(ModelIssue),
+}
+
+pub(crate) type ModelOutputStream =
+    BoxStream<'static, Result<ModelDriverOutput, ModelDriverError>>;
 
 pub(crate) trait ModelDriver {
     fn source(&self) -> &ModelSource;
@@ -29,14 +34,14 @@ pub(crate) trait ModelDriver {
         conversation: &'invoke Conversation,
     ) -> BoxFuture<
         'invoke,
-        Result<ModelEventStream, ModelDriverError>,
+        Result<ModelOutputStream, ModelDriverError>,
     >;
 }
 ```
 
-This has the conceptual shape `Future<Stream<ModelEvent>>`, or `Mono<Flux<ModelEvent>>` in Reactor terminology. The outer future constructs the request and establishes the provider invocation. It may fail before a stream exists because of request construction, authentication, connection, or HTTP errors. Once established, the stream yields `Result<ModelEvent, ModelDriverError>` because the invocation may fail after streaming begins. The consumer controls demand by polling for the next event. A caller that needs batch behavior may collect the stream; no separate batch interface is required.
+This has the conceptual shape `Future<Stream<ModelDriverOutput>>`, or `Mono<Flux<ModelDriverOutput>>` in Reactor terminology. The outer future constructs the request and establishes the provider invocation. It may fail before a stream exists because of request construction, authentication, connection, or HTTP errors. Once established, the stream yields `Result<ModelDriverOutput, ModelDriverError>` because the invocation may fail after streaming begins. The consumer controls demand by polling for the next output. A caller that needs batch behavior may collect the stream; no separate batch interface is required.
 
-For OpenAI, one invocation uses one REST request and one SSE response stream. Consuming several `ModelEvent`s from that stream does not make several model requests. Provider protocol events and raw text deltas remain private to the concrete driver. The driver aggregates provider deltas and yields only completed semantic events. `AssistantResponse`, `ModelCommunication`, and semantic model issues are `ModelEvent`s; raw SSE deltas are not `ConversationEvent`s and are not persisted merely because they arrived.
+For OpenAI, one invocation uses one REST request and one SSE response stream. Consuming several outputs from that stream does not make several model requests. Provider protocol events and raw text deltas remain private to the concrete driver. The driver aggregates provider deltas and yields only completed semantic output. `AssistantResponse` and `ModelCommunication` are successful model events; semantic model issues are separate driver outputs. Raw SSE deltas are not `ConversationEvent`s and are not persisted merely because they arrived.
 
 Completed semantic events may be wrapped as canonical `ConversationEvent`s, displayed, and appended incrementally while the provider invocation remains active. If the stream later fails, already yielded completed events remain valid conversation facts and already appended events are not rolled back. Incomplete provider deltas that never formed a completed `ModelEvent` are discarded. ADR 0005 defines how the caller records the stream error as a sanitized model-associated problem. This supersedes the previous contract under which every model event was withheld until the complete invocation succeeded and all model output was discarded after a late provider failure.
 

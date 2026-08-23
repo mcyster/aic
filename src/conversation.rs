@@ -307,13 +307,12 @@ mod tests {
             "id": event_id,
             "timestamp": "2026-08-22T18:42:31.482Z",
             "schema_version": 8,
-            "type": "model",
+            "type": "problem",
             "source": {
                 "provider": "openai",
                 "model": "gpt-5.6"
             },
-            "event": {
-                "type": "problem",
+            "problem": {
                 "category": "issue",
                 "detail": {
                     "type": "refusal",

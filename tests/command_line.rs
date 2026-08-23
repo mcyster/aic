@@ -37,6 +37,9 @@ enum MockResponse {
     Failure {
         status: &'static str,
     },
+    Refusal {
+        message: &'static str,
+    },
     Incremental {
         first_events: &'static str,
         remaining_events: &'static str,
@@ -177,6 +180,18 @@ fn write_response(stream: &mut TcpStream, response: MockResponse) {
             "application/json",
             "{\"error\":{\"message\":\"request rejected\"}}".to_owned(),
         ),
+        MockResponse::Refusal { message } => (
+            "200 OK",
+            "text/event-stream",
+            format!(
+                concat!(
+                    "data: {{\"type\":\"response.refusal.done\",\"refusal\":\"{}\"}}\n\n",
+                    "data: {{\"type\":\"response.completed\",\"response\":{{}}}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+                message
+            ),
+        ),
         MockResponse::Incremental { .. } => unreachable!("handled before the response match"),
     };
     write!(
@@ -249,7 +264,7 @@ fn turn_persists_events_and_prints_semantic_output() {
             .replace('-', ""),
         conversation_id.trim_start_matches("conversation_")
     );
-    assert_eq!(first_event["schema_version"], 8);
+    assert_eq!(first_event["schema_version"], 9);
     assert_eq!(first_event["type"], "user");
     assert_eq!(first_event["content"][0]["type"], "text");
     assert_eq!(first_event["content"][0]["value"], "say hi");
@@ -258,7 +273,7 @@ fn turn_persists_events_and_prints_semantic_output() {
         fs::File::open(&event_paths[1]).expect("the persisted model event should open"),
     )
     .expect("the persisted model event should be JSON");
-    assert_eq!(model_event["schema_version"], 8);
+    assert_eq!(model_event["schema_version"], 9);
     assert_eq!(model_event["type"], "model");
     assert_eq!(model_event["source"]["provider"], "openai");
     assert_eq!(model_event["source"]["model"], "gpt-5.6");
@@ -345,6 +360,46 @@ fn cli_output_is_incremental_and_not_duplicated() {
     assert_eq!(remaining_output, "Final answer\n");
     let requests = server.finish();
     assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn model_issue_is_rendered_and_persisted_as_a_top_level_problem() {
+    let server = MockOpenAiServer::start(vec![MockResponse::Refusal {
+        message: "I cannot comply.",
+    }]);
+    let data_directory = temporary_data_directory();
+
+    let command_output = configured_command(&server, &data_directory)
+        .args(["Question"])
+        .output()
+        .expect("tog should run");
+
+    assert!(command_output.status.success());
+    assert_eq!(
+        String::from_utf8(command_output.stdout).expect("standard output should be UTF-8"),
+        "### I cannot comply.\n"
+    );
+    let conversation_id = reported_conversation_id(&command_output.stderr);
+    let events_directory = data_directory
+        .join("conversations")
+        .join(conversation_id.trim_start_matches("conversation_"))
+        .join("events");
+    let mut event_paths = fs::read_dir(events_directory)
+        .expect("the persisted events should be readable")
+        .map(|entry| entry.expect("the event entry should be readable").path())
+        .collect::<Vec<_>>();
+    event_paths.sort();
+    let problem: Value = serde_json::from_reader(
+        fs::File::open(&event_paths[1]).expect("the problem event should open"),
+    )
+    .expect("the problem event should be JSON");
+    assert_eq!(problem["type"], "problem");
+    assert_eq!(problem["problem"]["category"], "issue");
+    assert_eq!(problem["problem"]["detail"]["type"], "refusal");
+    assert_eq!(problem["problem"]["detail"]["message"], "I cannot comply.");
+    assert!(problem.get("message").is_none());
+    assert!(problem.get("severity").is_none());
+    assert_eq!(server.finish().len(), 1);
 }
 
 #[test]
@@ -554,17 +609,18 @@ fn failed_user_turn_is_included_in_the_next_local_reconstruction() {
         fs::File::open(&event_paths[3]).expect("the invocation problem should open"),
     )
     .expect("the invocation problem should be JSON");
-    assert_eq!(invocation_problem["type"], "model");
-    assert_eq!(invocation_problem["event"]["type"], "problem");
-    assert_eq!(invocation_problem["event"]["category"], "invocation");
+    assert_eq!(invocation_problem["type"], "problem");
+    assert_eq!(invocation_problem["problem"]["category"], "invocation");
     assert_eq!(
-        invocation_problem["event"]["detail"]["type"],
+        invocation_problem["problem"]["detail"]["type"],
         "provider_failure"
     );
     assert_eq!(
-        invocation_problem["event"]["detail"]["message"],
+        invocation_problem["problem"]["detail"]["message"],
         "The model provider failed the invocation."
     );
+    assert!(invocation_problem.get("message").is_none());
+    assert!(invocation_problem.get("severity").is_none());
     assert!(!invocation_problem.to_string().contains("request rejected"));
 
     let recovered_output = configured_command(&server, &data_directory)
