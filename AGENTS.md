@@ -47,6 +47,7 @@ The complete development standards are in [`docs/development-standards.md`](docs
 
 ## Change Discipline
 
+- Make repository changes on a branch and submit them through a pull request. Do not commit directly to the default branch.
 - Make the smallest complete change that satisfies the requirement.
 - Treat exploratory ideas and future possibilities as non-requirements until explicitly accepted.
 - Do not add speculative compatibility, configuration, abstractions, or extension points.
