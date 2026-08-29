@@ -25,6 +25,26 @@ Add more specific areas such as `docs/designs/` or `docs/architecture/` only whe
 the project has enough durable material to justify them. Do not create empty
 taxonomies in anticipation of future documents.
 
+## File names
+
+Use short, specific, lowercase names separated by hyphens.
+
+- Notes capture thinking at a moment, so name them
+  `docs/notes/YYYY-MM-DD-short-specific-name.md`.
+- Decisions are events, so name them
+  `docs/decisions/YYYY-MM-DD-decision-statement.md`. State the decision rather
+  than merely its subject: prefer
+  `2026-08-29-use-semantic-conversation-events.md` to
+  `2026-08-29-conversation-events.md`.
+- Plans are living documents, so omit the date and name them by intended outcome,
+  such as `docs/plans/add-tool-execution.md`.
+- Designs and architecture describe the system, so omit the date and name them by
+  concept, such as `docs/architecture/conversation.md`.
+
+Do not date-prefix everything. Dates distinguish historical notes and decisions
+from living descriptions. Use the date the note or decision was first recorded;
+ordinary revisions do not rename the file.
+
 ## Write for human readers
 
 Lead with the point. Preserve the result of the thinking rather than its chronology.
