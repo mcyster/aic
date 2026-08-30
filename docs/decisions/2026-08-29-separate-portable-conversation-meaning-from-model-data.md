@@ -1,12 +1,8 @@
-# 0006: Separate Portable Conversation Meaning from Model Data
+# Separate Portable Conversation Meaning from Model Data
 
-## Status
+## Why
 
-Accepted; the driver-output ownership is amended by ADR 0007.
-
-## Context
-
-Model-specific data lived inside the portable event vocabulary: `AssistantResponse` and `ModelCommunication` carried `extensions`, and `ModelIssue::Other` accepted arbitrary extension objects. The `Problem` kind also repeated the invoked `ModelSource`, which made problems look like model output merely because they concerned a model invocation. At the driver boundary, `ModelDriverOutput::Issue` ran as a second channel beside `ModelDriverOutput::Event`, so a model-reported problem was not visibly an event on the driver's stream.
+Model-specific data lived inside the portable event vocabulary: `AssistantResponse` and `ModelCommunication` carried `extensions`, and `ModelIssue::Other` accepted arbitrary extension objects. The `Problem` kind also repeated the invoked `ModelSource`, which made problems look like model output merely because they concerned a model invocation. At the driver boundary, the earlier output wrapper ran as a second channel beside model events, so a model-reported problem was not visibly a conversation event on the driver's stream.
 
 These choices obscured the portability contract: another driver could not tell which parts of a durable event it must understand to continue the conversation.
 
@@ -46,4 +42,4 @@ Portable conversation meaning and optional model data are visibly separate, and 
 
 Events persist at schema version 10. Earlier problem events load without their source, and earlier events load without their extensions, because the conversation no longer models those fields. Events persisted with `ModelIssue::Other` no longer deserialize; no production driver ever emitted them.
 
-This decision supersedes the extension mechanism described in ADR 0005 and restates its problem surface without `ModelSource`. ADR 0007 amends the stream boundary so `ModelDriverEvent` is internal to each driver and the public stream returns `ConversationEvent`s.
+This decision supersedes the extension mechanism described in the earlier problem decision and restates its problem surface without `ModelSource`. The linked driver-boundary decision amends the stream boundary so `ModelDriverEvent` is internal to each driver and the public stream returns `ConversationEvent`s.

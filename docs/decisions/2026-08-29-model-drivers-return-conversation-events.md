@@ -1,4 +1,4 @@
-# 0007: Make ModelDrivers Return Conversation Events
+# Make ModelDrivers Return Conversation Events
 
 ## Status
 
@@ -6,8 +6,9 @@ Accepted
 
 ## Context
 
-ADR 0006 made the distinction between portable conversation meaning and
-provider-specific model data explicit, but its proposed `ModelDriverEvent`
+The preceding model-data decision made the distinction between portable
+conversation meaning and provider-specific model data explicit, but its proposed
+intermediate driver event
 remained the public output type. That left the caller responsible for
 assembling the durable `ConversationEvent` envelope, provenance, and model
 data, even though those values are part of the driver's translated result.
