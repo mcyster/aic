@@ -4,28 +4,18 @@ use std::fmt::{Display, Formatter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::ProviderId;
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
 pub(crate) struct ModelData {
-    provider: ProviderId,
     content: Map<String, Value>,
 }
 
 impl ModelData {
     #[allow(dead_code)]
-    pub(crate) fn new(
-        provider: ProviderId,
-        content: Map<String, Value>,
-    ) -> Result<Self, InvalidModelData> {
-        let model_data = Self { provider, content };
+    pub(crate) fn new(content: Map<String, Value>) -> Result<Self, InvalidModelData> {
+        let model_data = Self { content };
         model_data.ensure_valid()?;
         Ok(model_data)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn provider(&self) -> &ProviderId {
-        &self.provider
     }
 
     #[allow(dead_code)]
@@ -58,47 +48,31 @@ impl Error for InvalidModelData {}
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use serde_json::{Map, Value, json};
 
     use super::{InvalidModelData, ModelData};
-    use crate::conversation::ProviderId;
-
-    fn provider() -> ProviderId {
-        ProviderId::from_str("openai").expect("the provider identifier should be valid")
-    }
-
     fn content() -> Map<String, Value> {
         Map::from_iter([("response_id".to_owned(), Value::String("resp_1".to_owned()))])
     }
 
     #[test]
-    fn model_data_round_trips_with_its_provider_identity() {
-        let model_data =
-            ModelData::new(provider(), content()).expect("the model data should be valid");
+    fn model_data_round_trips_as_an_opaque_json_object() {
+        let model_data = ModelData::new(content()).expect("the model data should be valid");
 
         let serialized =
             serde_json::to_value(&model_data).expect("the model data should serialize");
         let deserialized: ModelData =
             serde_json::from_value(serialized.clone()).expect("the model data should deserialize");
 
-        assert_eq!(
-            serialized,
-            json!({
-                "provider": "openai",
-                "content": { "response_id": "resp_1" }
-            })
-        );
+        assert_eq!(serialized, json!({ "response_id": "resp_1" }));
         assert_eq!(deserialized, model_data);
-        assert_eq!(model_data.provider(), &provider());
         assert_eq!(model_data.content(), &content());
     }
 
     #[test]
     fn model_data_rejects_empty_content() {
         assert_eq!(
-            ModelData::new(provider(), Map::new()),
+            ModelData::new(Map::new()),
             Err(InvalidModelData::EmptyContent)
         );
     }

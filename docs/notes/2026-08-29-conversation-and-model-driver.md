@@ -64,9 +64,8 @@ See [Use Asynchronous Streaming ModelDriver Invocations](../decisions/2026-08-22
 User input is durable before model invocation. A meaningful model limitation or
 a sanitized invocation failure becomes a top-level
 `ConversationEventKind::Problem`. The problem is not model output merely
-because it concerns a model invocation, so it carries no `ModelSource`; the
-envelope's optional `ModelData` preserves driver-native detail when the driver
-supplies it.
+because it concerns a model invocation. Model-associated problems carry
+`Some(ModelDetails)`; a future unrelated problem may carry `None`.
 
 Already appended facts are never rolled back. Detailed transport errors remain
 control-flow errors and diagnostics; sensitive provider bodies and credentials

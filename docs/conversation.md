@@ -76,7 +76,7 @@ Conversation events define a universal semantic minimum and permit lossless enri
 
 Driver-specific data enriches portable semantics; it must not replace them. The portable representation must contain enough information for another compatible driver to continue meaningfully, and semantically important structured concepts remain structured. For example, a tool request retains its portable call ID, tool name, and arguments even if it also contains a provider-specific call ID.
 
-Driver-specific details remain immutable parts of the Conversation Log through the optional `ModelData` on the `ConversationEvent` envelope, never inside the portable event kind. `ModelData` is opaque to the conversation, serializes as JSON, and retains its owning `ProviderId` so a driver can decide whether it knows how to interpret the content. The driver that creates it defines and interprets it; any other driver may ignore it safely. Model data is recorded when the event is created, and later drivers never mutate old events to attach their own representations. Raw provider transport events do not become semantic conversation events merely because they are provider-specific.
+Driver-specific details remain immutable parts of the Conversation Log through `ModelDetails` on model-associated event kinds, never as a separate top-level field. `ModelDetails` always contains a `ModelSource` and may contain opaque JSON-serializable `ModelData`. The source identifies which driver may interpret the data. The driver that creates it defines and interprets it; any other driver may ignore it safely. Model data is recorded when the event is created, and later drivers never mutate old events to attach their own representations. Raw provider transport events do not become semantic conversation events merely because they are provider-specific.
 
 ## Event Meanings
 
@@ -88,17 +88,17 @@ Large or binary content belongs in a content store and is referenced by a strong
 
 ### Model
 
-`Model` combines successful typed semantic `ModelEvent` output with the relevant `ModelSource`. `ModelSource` contains validated provider and model identities. Provenance belongs to the canonical `ConversationEvent`, not the `ModelEvent`, because the driver knows its configured source and records it while constructing the returned event. Full invocation configuration is not repeated on each event.
+`Model` combines `ModelDetails` with successful typed semantic `ModelEvent` output. `ModelDetails` keeps the validated `ModelSource` and optional model-native data together. Provenance belongs to the canonical `ConversationEvent`, not the `ModelEvent`, because the driver knows its configured source and records it while constructing the returned event. Full invocation configuration is not repeated on each event.
 
-`AssistantResponse` is the model's actual response to the conversation. It participates in portable continuation and is always `Important`. `ModelCommunication` records auxiliary model-produced information such as detailed reasoning, reasoning summaries, status, or emerging concepts that do not yet justify another typed variant. Communications are persisted but are not automatically replayed as assistant responses.
+`ModelEvent::Assistant(AssistantResponse)` is the model's actual response to the conversation. It participates in portable continuation and is always `Important`. `ModelEvent::Communication(ModelCommunication)` records auxiliary model-produced information such as detailed reasoning, reasoning summaries, status, or emerging concepts that do not yet justify another typed variant. Communications are persisted but are not automatically replayed as assistant responses.
 
 Communication importance has three ordered levels: `Detailed`, `Interesting`, and `Important`. Consumers decide which messages to present, and the CLI maps low, medium, and high verbosity to progressively broader levels. Repeated cross-driver concepts may later be promoted from `ModelCommunication` into explicit `ModelEvent` variants.
 
-Both model-event variants retain meaningful portable messages, and the portable event kind contains the complete meaning of the event. `ModelData` on the envelope may preserve native fidelity or improve continuation, but understanding the conversation never requires it. Exposed reasoning is aggregated into coherent communications rather than persisting every transport delta.
+Both model-event variants retain meaningful portable messages, and the portable event kind contains the complete meaning of the event. Optional `ModelData` inside `ModelDetails` may preserve native fidelity or improve continuation, but understanding the conversation never requires it. Exposed reasoning is aggregated into coherent communications rather than persisting every transport delta.
 
 ### Problem
 
-`Problem` records a `ConversationProblem` as a top-level conversation event. It is not model output merely because it concerns a model invocation, so it does not carry a `ModelSource`. `ConversationProblem::Issue` records a semantic model limitation or unsuccessful outcome, such as refusal or context exhaustion. `ConversationProblem::Invocation` records a sanitized operational invocation failure. Every concrete problem provides one meaningful message, and the shared parent exposes that message and whether retrying the unchanged invocation may reasonably succeed. The enclosing conversation event does not duplicate the message and does not add generic severity.
+`Problem` records a `ConversationProblem` as a top-level conversation event. It is not model output merely because it concerns a model invocation. A model-associated problem carries `Some(ModelDetails)`; a future unrelated problem may carry `None`. `ConversationProblem::Issue` records a semantic model limitation or unsuccessful outcome, such as refusal or context exhaustion. `ConversationProblem::Invocation` records a sanitized operational invocation failure. Every concrete problem provides one meaningful message, and the shared parent exposes that message and whether retrying the unchanged invocation may reasonably succeed. The enclosing conversation event does not duplicate the message and does not add generic severity.
 
 There is no `Other` problem kind. A newly understood semantic problem receives a specific shared kind, while unusable provider output and unclassified invocation failure retain their distinct existing meanings. Problems are not automatically projected into every provider request; each driver decides how a retained problem should inform a later model.
 
@@ -110,7 +110,7 @@ For example, several provider events may project to one response:
 text.delta "Hel"
 text.delta "lo"
 output.done
-    -> Model(source=..., event=AssistantResponse(message="Hello"))
+    -> Model(model=..., event=Assistant(AssistantResponse(message="Hello")))
 ```
 
 ### ToolRequest And ToolResponse
@@ -159,7 +159,7 @@ Event positions must not be used as semantic identifiers.
 
 User input is appended before model invocation. The asynchronous invocation establishes one provider/model request and returns a stream of completed semantic `ConversationEvent`s. The consumer controls demand by polling that stream for its next event; receiving several events does not represent several model requests.
 
-The driver combines each completed semantic result with its `ModelSource`, optional `ModelData`, and envelope metadata before returning it. The caller persists and may display each returned `ConversationEvent` while the invocation remains active. If invocation setup or the stream fails, the caller creates and appends a sanitized `ConversationProblem::Invocation` and returns the detailed `ModelDriverError`. Completed semantic events already yielded remain valid conversation facts and appended events are not rolled back. Provider deltas that did not form a completed `ModelEvent` are discarded.
+The driver combines each completed semantic result with `ModelDetails` and envelope metadata before returning it. The caller persists and may display each returned `ConversationEvent` while the invocation remains active. If invocation setup or the stream fails, the caller creates and appends a sanitized `ConversationProblem::Invocation` with `Some(ModelDetails)` and `data: None`, then returns the detailed `ModelDriverError`. Completed semantic events already yielded remain valid conversation facts and appended events are not rolled back. Provider deltas that did not form a completed `ModelEvent` are discarded.
 
 This supersedes the earlier batch contract in which all model events were returned only after the complete invocation succeeded and all model output was discarded on a late provider failure. A caller that needs batch behavior can collect the stream; no separate batch interface is required.
 

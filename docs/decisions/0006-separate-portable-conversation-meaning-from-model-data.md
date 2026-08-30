@@ -12,19 +12,29 @@ These choices obscured the portability contract: another driver could not tell w
 
 ## Decision
 
-Every `ConversationEvent` carries a flattened portable `ConversationEventKind` plus an optional envelope-level `ModelData`:
+Every `ConversationEvent` carries a flattened portable `ConversationEventKind`. Model-associated kinds carry `ModelDetails`, which keeps the source and optional data together:
 
 ```rust
 struct ConversationEvent {
     // identity, position, timestamp, and schema
     kind: ConversationEventKind,
-    model: Option<ModelData>,
+}
+
+enum ConversationEventKind {
+    User { content: Vec<UserContent> },
+    Model { model: ModelDetails, event: ModelEvent },
+    Problem { model: Option<ModelDetails>, problem: ConversationProblem },
+}
+
+struct ModelDetails {
+    source: ModelSource,
+    data: Option<ModelData>,
 }
 ```
 
-`ModelData` is opaque to the conversation and serializes as JSON. The driver that creates it defines and interprets its contents; any other driver may ignore it safely. It retains its owning `ProviderId` so a driver can decide whether it knows how to interpret the content. Model data is recorded when the event is created; later drivers never mutate old events to attach their own representations.
+`ModelData` is opaque to the conversation and serializes as JSON. `ModelDetails` keeps it with its `ModelSource`, so the driver can decide whether it knows how to interpret the content. The driver that creates it defines and interprets it; any other driver may ignore it safely. Model data is recorded when the event is created; later drivers never mutate old events to attach their own representations.
 
-The portable kind contains the complete meaning of the event. `AssistantResponse` and `ModelCommunication` no longer carry extensions. `Problem { problem: ConversationProblem }` remains a top-level conversation event without a `ModelSource`; `ModelProblem` is renamed `ConversationProblem`.
+The portable kind contains the complete meaning of the event. `AssistantResponse` and `ModelCommunication` no longer carry extensions. A model-associated `Problem` carries `Some(ModelDetails)`; a future unrelated problem may carry `None`. `ModelProblem` is renamed `ConversationProblem`.
 
 There is no `Other` problem kind. A newly understood semantic problem receives a specific shared `ModelIssue` kind, while unusable provider output (`InvocationError::InvalidProviderResponse`) and unclassified invocation failure (`InvocationError::ProviderFailure`) retain their distinct existing meanings.
 

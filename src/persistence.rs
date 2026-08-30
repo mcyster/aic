@@ -8,9 +8,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-use crate::conversation::{
-    Conversation, ConversationEvent, ConversationEventKind, ConversationId, ModelData,
-};
+use crate::conversation::{Conversation, ConversationEvent, ConversationEventKind, ConversationId};
 
 pub(crate) struct EventStore {
     root_directory: PathBuf,
@@ -59,7 +57,6 @@ impl EventStore {
         &self,
         conversation_id: ConversationId,
         kind: ConversationEventKind,
-        model: Option<ModelData>,
     ) -> io::Result<ConversationEvent> {
         let conversation_directory = self.conversation_directory(conversation_id);
         create_private_directory(&conversation_directory)?;
@@ -79,12 +76,8 @@ impl EventStore {
             }
             conversation.events().last().map(|event| event.position)
         };
-        let conversation_event = ConversationEvent::new(
-            conversation_id,
-            next_position(previous_position)?,
-            kind,
-            model,
-        );
+        let conversation_event =
+            ConversationEvent::new(conversation_id, next_position(previous_position)?, kind);
         write_json_atomically(
             &event_path(
                 &events_directory,
@@ -213,7 +206,7 @@ mod tests {
     use super::EventStore;
     use crate::conversation::{
         AssistantResponse, ConversationEvent, ConversationEventKind, ConversationId, ModelData,
-        ModelEvent, ModelId, ModelSource, ProviderId, UserContent,
+        ModelDetails, ModelEvent, ModelId, ModelSource, ProviderId, UserContent,
     };
 
     fn temporary_store() -> EventStore {
@@ -232,7 +225,6 @@ mod tests {
                 ConversationEventKind::User {
                     content: vec![UserContent::Text("first".to_owned())],
                 },
-                None,
             )
             .expect("the first event should be persisted");
         let second_event = store
@@ -241,7 +233,6 @@ mod tests {
                 ConversationEventKind::User {
                     content: vec![UserContent::Text("second".to_owned())],
                 },
-                None,
             )
             .expect("the second event should be persisted");
 
@@ -282,32 +273,31 @@ mod tests {
             ProviderId::from_str("openai").expect("the provider identifier should be valid"),
             ModelId::from_str("gpt-5.6").expect("the model identifier should be valid"),
         );
-        let model_data = ModelData::new(
-            ProviderId::from_str("openai").expect("the provider identifier should be valid"),
-            Map::from_iter([("response_id".to_owned(), Value::String("resp_1".to_owned()))]),
-        )
+        let model_data = ModelData::new(Map::from_iter([(
+            "response_id".to_owned(),
+            Value::String("resp_1".to_owned()),
+        )]))
         .expect("the model data should be valid");
 
         let model_event = ConversationEvent::new(
             conversation_id,
             0,
             ConversationEventKind::Model {
-                source,
-                event: ModelEvent::AssistantResponse(
+                model: ModelDetails::new(source, Some(model_data))
+                    .expect("the model details should be valid"),
+                event: ModelEvent::Assistant(
                     AssistantResponse::new("The answer is 42.".to_owned())
                         .expect("the assistant response should be valid"),
                 ),
             },
-            Some(model_data.clone()),
         );
         store
             .append_conversation_event(model_event.clone())
             .expect("the model event should be persisted");
 
-        assert_eq!(model_event.model, Some(model_data.clone()));
         let conversation = store
             .load_conversation(conversation_id)
             .expect("the conversation should load");
-        assert_eq!(conversation.events()[0].model, Some(model_data));
+        assert_eq!(conversation.events()[0], model_event);
     }
 }

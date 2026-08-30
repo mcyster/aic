@@ -6,7 +6,7 @@ use time::OffsetDateTime;
 
 use super::{
     ConversationEventId, ConversationId, ConversationProblem, InvalidConversationProblem,
-    InvalidModelData, ModelData, ModelSource,
+    InvalidModelData, ModelDetails,
 };
 
 pub(crate) const SCHEMA_VERSION: u32 = 10;
@@ -21,8 +21,6 @@ pub(crate) struct ConversationEvent {
     pub(crate) schema_version: u32,
     #[serde(flatten)]
     pub(crate) kind: ConversationEventKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) model: Option<ModelData>,
 }
 
 impl ConversationEvent {
@@ -30,7 +28,6 @@ impl ConversationEvent {
         conversation_id: ConversationId,
         position: u64,
         kind: ConversationEventKind,
-        model: Option<ModelData>,
     ) -> Self {
         Self {
             conversation_id,
@@ -39,20 +36,11 @@ impl ConversationEvent {
             timestamp: OffsetDateTime::now_utc(),
             schema_version: SCHEMA_VERSION,
             kind,
-            model,
         }
     }
 
-    pub(super) fn ensure_valid(&self) -> Result<(), InvalidConversationEvent> {
-        self.kind
-            .ensure_valid()
-            .map_err(InvalidConversationEvent::InvalidKind)?;
-        if let Some(model_data) = &self.model {
-            model_data
-                .ensure_valid()
-                .map_err(InvalidConversationEvent::InvalidModelData)?;
-        }
-        Ok(())
+    pub(super) fn ensure_valid(&self) -> Result<(), InvalidConversationEventKind> {
+        self.kind.ensure_valid()
     }
 }
 
@@ -63,10 +51,11 @@ pub(crate) enum ConversationEventKind {
         content: Vec<UserContent>,
     },
     Model {
-        source: ModelSource,
+        model: ModelDetails,
         event: ModelEvent,
     },
     Problem {
+        model: Option<ModelDetails>,
         problem: ConversationProblem,
     },
 }
@@ -75,44 +64,41 @@ impl ConversationEventKind {
     pub(super) fn ensure_valid(&self) -> Result<(), InvalidConversationEventKind> {
         match self {
             Self::User { .. } => Ok(()),
-            Self::Model { event, .. } => event
-                .ensure_valid()
-                .map_err(InvalidConversationEventKind::InvalidModelEvent),
-            Self::Problem { problem } => problem
-                .ensure_valid()
-                .map_err(InvalidConversationEventKind::InvalidConversationProblem),
+            Self::Model { model, event } => {
+                model
+                    .ensure_valid()
+                    .map_err(InvalidConversationEventKind::ModelData)?;
+                event
+                    .ensure_valid()
+                    .map_err(InvalidConversationEventKind::ModelEvent)
+            }
+            Self::Problem { model, problem } => {
+                if let Some(model) = model {
+                    model
+                        .ensure_valid()
+                        .map_err(InvalidConversationEventKind::ModelData)?;
+                }
+                problem
+                    .ensure_valid()
+                    .map_err(InvalidConversationEventKind::ConversationProblem)
+            }
         }
     }
 }
-
-#[derive(Debug)]
-pub(super) enum InvalidConversationEvent {
-    InvalidKind(InvalidConversationEventKind),
-    InvalidModelData(InvalidModelData),
-}
-
-impl Display for InvalidConversationEvent {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidKind(error) => Display::fmt(error, formatter),
-            Self::InvalidModelData(error) => Display::fmt(error, formatter),
-        }
-    }
-}
-
-impl Error for InvalidConversationEvent {}
 
 #[derive(Debug)]
 pub(super) enum InvalidConversationEventKind {
-    InvalidModelEvent(InvalidModelEvent),
-    InvalidConversationProblem(InvalidConversationProblem),
+    ModelEvent(InvalidModelEvent),
+    ConversationProblem(InvalidConversationProblem),
+    ModelData(InvalidModelData),
 }
 
 impl Display for InvalidConversationEventKind {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidModelEvent(error) => Display::fmt(error, formatter),
-            Self::InvalidConversationProblem(error) => Display::fmt(error, formatter),
+            Self::ModelEvent(error) => Display::fmt(error, formatter),
+            Self::ConversationProblem(error) => Display::fmt(error, formatter),
+            Self::ModelData(error) => Display::fmt(error, formatter),
         }
     }
 }
@@ -122,30 +108,30 @@ impl Error for InvalidConversationEventKind {}
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ModelEvent {
-    AssistantResponse(AssistantResponse),
+    Assistant(AssistantResponse),
     Communication(ModelCommunication),
 }
 
 impl ModelEvent {
     pub(crate) fn message(&self) -> &str {
         match self {
-            Self::AssistantResponse(response) => response.message(),
+            Self::Assistant(response) => response.message(),
             Self::Communication(communication) => communication.message(),
         }
     }
 
     pub(crate) fn importance(&self) -> ModelEventImportance {
         match self {
-            Self::AssistantResponse(_) => ModelEventImportance::Important,
+            Self::Assistant(_) => ModelEventImportance::Important,
             Self::Communication(communication) => communication.importance(),
         }
     }
 
     fn ensure_valid(&self) -> Result<(), InvalidModelEvent> {
         match self {
-            Self::AssistantResponse(response) => response
+            Self::Assistant(response) => response
                 .ensure_valid()
-                .map_err(InvalidModelEvent::AssistantResponse),
+                .map_err(InvalidModelEvent::Assistant),
             Self::Communication(communication) => communication
                 .ensure_valid()
                 .map_err(InvalidModelEvent::ModelCommunication),
@@ -155,14 +141,14 @@ impl ModelEvent {
 
 #[derive(Debug)]
 pub(super) enum InvalidModelEvent {
-    AssistantResponse(InvalidAssistantResponse),
+    Assistant(InvalidAssistantResponse),
     ModelCommunication(InvalidModelCommunication),
 }
 
 impl Display for InvalidModelEvent {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AssistantResponse(error) => Display::fmt(error, formatter),
+            Self::Assistant(error) => Display::fmt(error, formatter),
             Self::ModelCommunication(error) => Display::fmt(error, formatter),
         }
     }
@@ -299,8 +285,8 @@ mod tests {
         InvalidModelCommunication, ModelCommunication, ModelEvent, ModelEventImportance,
     };
     use crate::conversation::{
-        ConversationEventId, ConversationId, ConversationProblem, ModelData, ModelId, ModelIssue,
-        ModelSource, ProviderId, UserContent,
+        ConversationEventId, ConversationId, ConversationProblem, ModelData, ModelDetails, ModelId,
+        ModelIssue, ModelSource, ProviderId, UserContent,
     };
 
     fn model_content() -> Map<String, Value> {
@@ -308,11 +294,7 @@ mod tests {
     }
 
     fn model_data() -> ModelData {
-        ModelData::new(
-            ProviderId::from_str("openai").expect("the provider identifier should be valid"),
-            model_content(),
-        )
-        .expect("the model data should be valid")
+        ModelData::new(model_content()).expect("the model data should be valid")
     }
 
     fn source() -> ModelSource {
@@ -343,7 +325,6 @@ mod tests {
             kind: ConversationEventKind::User {
                 content: vec![UserContent::Text("Hello".to_owned())],
             },
-            model: None,
         };
 
         let json = serde_json::to_value(&conversation_event)
@@ -367,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn model_event_round_trips_with_optional_model_data_on_the_envelope() {
+    fn model_event_round_trips_with_model_details() {
         let conversation_id = ConversationId::new();
         let event_id = ConversationEventId::new();
         let conversation_event = ConversationEvent {
@@ -377,13 +358,13 @@ mod tests {
             timestamp: fixed_timestamp(),
             schema_version: 7,
             kind: ConversationEventKind::Model {
-                source: source(),
-                event: ModelEvent::AssistantResponse(
+                model: ModelDetails::new(source(), Some(model_data()))
+                    .expect("the model details should be valid"),
+                event: ModelEvent::Assistant(
                     AssistantResponse::new("The answer is 42.".to_owned())
                         .expect("the assistant response should be valid"),
                 ),
             },
-            model: Some(model_data()),
         };
 
         let json = serde_json::to_value(&conversation_event)
@@ -400,42 +381,22 @@ mod tests {
                 "timestamp": "2026-08-22T18:42:31.482Z",
                 "schema_version": 7,
                 "type": "model",
-                "source": { "provider": "openai", "model": "gpt-5.6" },
-                "event": {
-                    "type": "assistant_response",
-                    "message": "The answer is 42."
-                },
                 "model": {
-                    "provider": "openai",
-                    "content": { "response_id": "resp_1" }
+                    "source": { "provider": "openai", "model": "gpt-5.6" },
+                    "data": { "response_id": "resp_1" }
+                },
+                "event": {
+                    "type": "assistant",
+                    "message": "The answer is 42."
                 }
             })
         );
         assert_eq!(deserialized_event, conversation_event);
-        assert_eq!(deserialized_event.model, Some(model_data()));
-    }
-
-    #[test]
-    fn events_without_model_data_deserialize_without_the_model_field() {
-        let conversation_id = ConversationId::new();
-        let event_id = ConversationEventId::new();
-        let conversation_event: ConversationEvent = serde_json::from_value(json!({
-            "conversation_id": conversation_id,
-            "position": 0,
-            "id": event_id,
-            "timestamp": "2026-08-22T18:42:31.482Z",
-            "schema_version": 7,
-            "type": "user",
-            "content": [{ "type": "text", "value": "Hello" }]
-        }))
-        .expect("the conversation event should deserialize");
-
-        assert_eq!(conversation_event.model, None);
     }
 
     #[test]
     fn assistant_response_round_trips_through_json() {
-        let event = ModelEvent::AssistantResponse(
+        let event = ModelEvent::Assistant(
             AssistantResponse::new("The answer is 42.".to_owned())
                 .expect("the assistant response should be valid"),
         );
@@ -447,7 +408,7 @@ mod tests {
         assert_eq!(
             json,
             json!({
-                "type": "assistant_response",
+                "type": "assistant",
                 "message": "The answer is 42."
             })
         );
@@ -467,6 +428,9 @@ mod tests {
     #[test]
     fn conversation_problem_uses_one_authoritative_conversation_event_surface() {
         let event = ConversationEventKind::Problem {
+            model: Some(
+                ModelDetails::new(source(), None).expect("the model details should be valid"),
+            ),
             problem: ConversationProblem::Issue(
                 ModelIssue::try_refusal("I cannot comply.".to_owned())
                     .expect("the refusal should be valid"),
@@ -481,6 +445,12 @@ mod tests {
             serialized,
             json!({
                 "type": "problem",
+                "model": {
+                    "source": {
+                        "provider": "openai",
+                        "model": "gpt-5.6"
+                    }
+                },
                 "problem": {
                     "category": "issue",
                     "detail": {
@@ -491,7 +461,6 @@ mod tests {
             })
         );
         assert_eq!(deserialized, event);
-        assert!(serialized.get("source").is_none());
         assert!(serialized.get("message").is_none());
         assert!(serialized.get("severity").is_none());
     }
@@ -595,7 +564,7 @@ mod tests {
         let conversation_id = ConversationId::new();
         let event_id = ConversationEventId::new();
         let source = source();
-        let model_event = ModelEvent::AssistantResponse(
+        let model_event = ModelEvent::Assistant(
             AssistantResponse::new("The answer is 42.".to_owned())
                 .expect("the assistant response should be valid"),
         );
@@ -606,10 +575,10 @@ mod tests {
             timestamp: fixed_timestamp(),
             schema_version: 7,
             kind: ConversationEventKind::Model {
-                source: source.clone(),
+                model: ModelDetails::new(source.clone(), None)
+                    .expect("the model details should be valid"),
                 event: model_event.clone(),
             },
-            model: None,
         };
 
         let json = serde_json::to_value(&conversation_event)
@@ -626,9 +595,11 @@ mod tests {
                 "timestamp": "2026-08-22T18:42:31.482Z",
                 "schema_version": 7,
                 "type": "model",
-                "source": { "provider": "openai", "model": "gpt-5.6" },
+                "model": {
+                    "source": { "provider": "openai", "model": "gpt-5.6" }
+                },
                 "event": {
-                    "type": "assistant_response",
+                    "type": "assistant",
                     "message": "The answer is 42."
                 }
             })
@@ -637,7 +608,7 @@ mod tests {
         assert_eq!(
             conversation_event.kind,
             ConversationEventKind::Model {
-                source,
+                model: ModelDetails::new(source, None).expect("the model details should be valid"),
                 event: model_event,
             }
         );

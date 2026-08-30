@@ -11,8 +11,8 @@ use serde_json::{Map, Value, json};
 use crate::conversation::{
     AssistantResponse, Conversation, ConversationEvent, ConversationEventKind, ConversationId,
     ConversationProblem, InvalidAssistantResponse, InvalidConversationProblem,
-    InvalidModelCommunication, ModelCommunication, ModelData, ModelEvent, ModelEventImportance,
-    ModelId, ModelIssue, ModelSource, ProviderId, UserContent,
+    InvalidModelCommunication, InvalidModelData, ModelCommunication, ModelData, ModelDetails,
+    ModelEvent, ModelEventImportance, ModelId, ModelIssue, ModelSource, ProviderId, UserContent,
 };
 use crate::model_driver::{ModelDriver, ModelDriverError, ModelOutputStream};
 
@@ -155,7 +155,7 @@ fn semantic_input(conversation: &Conversation) -> Value {
                     Some(json!({ "role": "user", "content": text }))
                 }
                 ConversationEventKind::Model {
-                    event: ModelEvent::AssistantResponse(response),
+                    event: ModelEvent::Assistant(response),
                     ..
                 } => Some(json!({ "role": "assistant", "content": response.message() })),
                 ConversationEventKind::Model { .. } => None,
@@ -236,40 +236,20 @@ fn conversation_event_stream(
                 return None;
             }
             match state.provider_events.next().await {
-                Some(Ok(ModelDriverEvent::Model { event, data })) => {
-                    let conversation_event = ConversationEvent::new(
+                Some(Ok(driver_event)) => {
+                    let conversation_event = translate_model_driver_event(
+                        driver_event,
                         state.conversation_id,
                         state.next_position,
-                        ConversationEventKind::Model {
-                            source: state.source.clone(),
-                            event,
-                        },
-                        data,
+                        &state.source,
                     );
-                    state.next_position = match state.next_position.checked_add(1) {
-                        Some(next_position) => next_position,
-                        None => {
+                    let conversation_event = match conversation_event {
+                        Ok(conversation_event) => conversation_event,
+                        Err(error) => {
                             state.terminated = true;
-                            return Some((
-                                Err(ModelDriverError::InvalidResponse(
-                                    "the model output exceeded available conversation positions"
-                                        .to_owned(),
-                                )),
-                                state,
-                            ));
+                            return Some((Err(error), state));
                         }
                     };
-                    Some((Ok(conversation_event), state))
-                }
-                Some(Ok(ModelDriverEvent::Problem { problem, data })) => {
-                    let conversation_event = ConversationEvent::new(
-                        state.conversation_id,
-                        state.next_position,
-                        ConversationEventKind::Problem {
-                            problem: ConversationProblem::Issue(problem),
-                        },
-                        data,
-                    );
                     state.next_position = match state.next_position.checked_add(1) {
                         Some(next_position) => next_position,
                         None => {
@@ -294,6 +274,25 @@ fn conversation_event_stream(
         },
     )
     .boxed()
+}
+
+fn translate_model_driver_event(
+    driver_event: ModelDriverEvent,
+    conversation_id: ConversationId,
+    position: u64,
+    source: &ModelSource,
+) -> Result<ConversationEvent, ModelDriverError> {
+    let kind = match driver_event {
+        ModelDriverEvent::Model { event, data } => ConversationEventKind::Model {
+            model: ModelDetails::new(source.clone(), data).map_err(invalid_model_data)?,
+            event,
+        },
+        ModelDriverEvent::Problem { problem, data } => ConversationEventKind::Problem {
+            model: Some(ModelDetails::new(source.clone(), data).map_err(invalid_model_data)?),
+            problem: ConversationProblem::Issue(problem),
+        },
+    };
+    Ok(ConversationEvent::new(conversation_id, position, kind))
 }
 
 #[derive(Default)]
@@ -670,7 +669,7 @@ fn complete_response(
             matches!(
                 event,
                 ModelDriverEvent::Model {
-                    event: ModelEvent::AssistantResponse(_),
+                    event: ModelEvent::Assistant(_),
                     ..
                 } | ModelDriverEvent::Problem { .. }
             )
@@ -782,7 +781,7 @@ fn emit_remaining_refusals(
 
 fn assistant_response(message: String) -> Result<ModelDriverEvent, ModelDriverError> {
     AssistantResponse::new(message)
-        .map(ModelEvent::AssistantResponse)
+        .map(ModelEvent::Assistant)
         .map(|event| ModelDriverEvent::Model { event, data: None })
         .map_err(invalid_assistant_response)
 }
@@ -919,6 +918,10 @@ fn invalid_model_communication(error: InvalidModelCommunication) -> ModelDriverE
 }
 
 fn invalid_conversation_problem(error: InvalidConversationProblem) -> ModelDriverError {
+    ModelDriverError::InvalidResponse(error.to_string())
+}
+
+fn invalid_model_data(error: InvalidModelData) -> ModelDriverError {
     ModelDriverError::InvalidResponse(error.to_string())
 }
 
@@ -1060,8 +1063,8 @@ mod tests {
     use crate::conversation::{
         AssistantResponse, Conversation, ConversationEvent, ConversationEventId,
         ConversationEventKind, ConversationId, ConversationProblem, ModelCommunication, ModelData,
-        ModelEvent, ModelEventImportance, ModelId, ModelIssue, ModelSource, ProviderId,
-        UserContent,
+        ModelDetails, ModelEvent, ModelEventImportance, ModelId, ModelIssue, ModelSource,
+        ProviderId, UserContent,
     };
     use crate::model_driver::{ModelDriver, ModelDriverError};
 
@@ -1074,7 +1077,6 @@ mod tests {
         conversation_id: ConversationId,
         position: u64,
         kind: ConversationEventKind,
-        model: Option<ModelData>,
     ) -> ConversationEvent {
         ConversationEvent {
             conversation_id,
@@ -1083,7 +1085,6 @@ mod tests {
             timestamp: OffsetDateTime::UNIX_EPOCH,
             schema_version: 7,
             kind,
-            model,
         }
     }
 
@@ -1094,11 +1095,10 @@ mod tests {
             ProviderId::from_str("openai").expect("the provider identifier should be valid"),
             ModelId::from_str("gpt-5.6").expect("the model identifier should be valid"),
         );
-        let model_data = ModelData::new(
-            ProviderId::from_str("another-provider")
-                .expect("the provider identifier should be valid"),
-            Map::from_iter([("native".to_owned(), Value::String("ignored".to_owned()))]),
-        )
+        let model_data = ModelData::new(Map::from_iter([(
+            "native".to_owned(),
+            Value::String("ignored".to_owned()),
+        )]))
         .expect("the model data should be valid");
         let conversation = Conversation::from_events(vec![
             conversation_event(
@@ -1107,13 +1107,13 @@ mod tests {
                 ConversationEventKind::User {
                     content: vec![UserContent::Text("Hello".to_owned())],
                 },
-                None,
             ),
             conversation_event(
                 conversation_id,
                 1,
                 ConversationEventKind::Model {
-                    source: source.clone(),
+                    model: ModelDetails::new(source.clone(), Some(model_data.clone()))
+                        .expect("the model details should be valid"),
                     event: ModelEvent::Communication(
                         ModelCommunication::new(
                             "Reasoning".to_owned(),
@@ -1123,19 +1123,18 @@ mod tests {
                         .expect("the model communication should be valid"),
                     ),
                 },
-                Some(model_data.clone()),
             ),
             conversation_event(
                 conversation_id,
                 2,
                 ConversationEventKind::Model {
-                    source,
-                    event: ModelEvent::AssistantResponse(
+                    model: ModelDetails::new(source, Some(model_data))
+                        .expect("the model details should be valid"),
+                    event: ModelEvent::Assistant(
                         AssistantResponse::new("Hello.".to_owned())
                             .expect("the assistant response should be valid"),
                     ),
                 },
-                Some(model_data),
             ),
         ])
         .expect("the conversation should be valid");
@@ -1192,7 +1191,6 @@ mod tests {
             ConversationEventKind::User {
                 content: vec![UserContent::Text("Hello".to_owned())],
             },
-            None,
         )])
         .expect("the conversation should be valid")
     }
@@ -1251,25 +1249,35 @@ mod tests {
         assert!(matches!(
             &first_event.kind,
             ConversationEventKind::Model {
-                source: event_source,
+                model: _,
                 event: ModelEvent::Communication(_),
-                ..
             }
-            if event_source == &source()
         ));
         assert!(matches!(
             &second_event.kind,
             ConversationEventKind::Model {
-                source: event_source,
-                event: ModelEvent::AssistantResponse(_),
-                ..
+                model: _,
+                event: ModelEvent::Assistant(_),
             }
-            if event_source == &source()
         ));
+        let ConversationEventKind::Model { model, .. } = &first_event.kind else {
+            panic!("the first event should be a model event");
+        };
+        assert_eq!(model.source(), &source());
+        let ConversationEventKind::Model { model, .. } = &second_event.kind else {
+            panic!("the second event should be a model event");
+        };
+        assert_eq!(model.source(), &source());
         assert_eq!(first_event.position, 1);
         assert_eq!(second_event.position, 2);
-        assert_eq!(first_event.model, None);
-        assert_eq!(second_event.model, None);
+        assert!(matches!(
+            &first_event.kind,
+            ConversationEventKind::Model { model, .. } if model.data().is_none()
+        ));
+        assert!(matches!(
+            &second_event.kind,
+            ConversationEventKind::Model { model, .. } if model.data().is_none()
+        ));
         assert!(model_events.next().await.is_none());
         server.join().expect("the mock server should stop");
     }
@@ -1351,7 +1359,7 @@ mod tests {
                 ..
             }
         ));
-        let ConversationEventKind::Problem { problem } = &model_event.kind else {
+        let ConversationEventKind::Problem { problem, .. } = &model_event.kind else {
             panic!("the output should be a model issue");
         };
         assert_eq!(problem.message(), "The model context limit was exceeded.");
@@ -1489,7 +1497,7 @@ mod tests {
         assert!(matches!(
             model_events.next().await,
             Some(Ok(ModelDriverEvent::Model {
-                event: ModelEvent::AssistantResponse(_),
+                event: ModelEvent::Assistant(_),
                 ..
             }))
         ));
@@ -1511,7 +1519,7 @@ mod tests {
         assert!(matches!(
             model_events.next().await,
             Some(Ok(ModelDriverEvent::Model {
-                event: ModelEvent::AssistantResponse(_),
+                event: ModelEvent::Assistant(_),
                 ..
             }))
         ));
@@ -1587,7 +1595,7 @@ mod tests {
         assert!(matches!(
             events.next().await,
             Some(Ok(ModelDriverEvent::Model {
-                event: ModelEvent::AssistantResponse(_),
+                event: ModelEvent::Assistant(_),
                 ..
             }))
         ));

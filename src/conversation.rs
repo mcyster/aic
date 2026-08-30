@@ -13,7 +13,7 @@ pub(crate) use event::{
     InvalidModelCommunication, ModelCommunication, ModelEvent, ModelEventImportance, UserContent,
 };
 pub(crate) use id::{ConversationEventId, ConversationId};
-pub(crate) use model::{ModelId, ModelSource, ProviderId};
+pub(crate) use model::{ModelDetails, ModelId, ModelSource, ProviderId};
 pub(crate) use model_data::{InvalidModelData, ModelData};
 pub(crate) use problem::{
     ConversationProblem, InvalidConversationProblem, InvocationError, ModelIssue,
@@ -173,7 +173,6 @@ mod tests {
             kind: ConversationEventKind::User {
                 content: vec![UserContent::Text(format!("event {position}"))],
             },
-            model: None,
         }
     }
 
@@ -246,12 +245,14 @@ mod tests {
             "timestamp": "2026-08-22T18:42:31.482Z",
             "schema_version": 7,
             "type": "model",
-            "source": {
-                "provider": "openai",
-                "model": "gpt-5.6"
+            "model": {
+                "source": {
+                    "provider": "openai",
+                    "model": "gpt-5.6"
+                }
             },
             "event": {
-                "type": "assistant_response",
+                "type": "assistant",
                 "message": "   "
             }
         }))
@@ -277,9 +278,11 @@ mod tests {
             "timestamp": "2026-08-22T18:42:31.482Z",
             "schema_version": 7,
             "type": "model",
-            "source": {
-                "provider": "openai",
-                "model": "gpt-5.6"
+            "model": {
+                "source": {
+                    "provider": "openai",
+                    "model": "gpt-5.6"
+                }
             },
             "event": {
                 "type": "communication",
@@ -310,9 +313,11 @@ mod tests {
             "timestamp": "2026-08-22T18:42:31.482Z",
             "schema_version": 8,
             "type": "problem",
-            "source": {
-                "provider": "openai",
-                "model": "gpt-5.6"
+            "model": {
+                "source": {
+                    "provider": "openai",
+                    "model": "gpt-5.6"
+                }
             },
             "problem": {
                 "category": "issue",
@@ -344,17 +349,16 @@ mod tests {
             "timestamp": "2026-08-22T18:42:31.482Z",
             "schema_version": 10,
             "type": "model",
-            "source": {
-                "provider": "openai",
-                "model": "gpt-5.6"
+            "model": {
+                "source": {
+                    "provider": "openai",
+                    "model": "gpt-5.6"
+                },
+                "data": {}
             },
             "event": {
-                "type": "assistant_response",
+                "type": "assistant",
                 "message": "The answer is 42."
-            },
-            "model": {
-                "provider": "openai",
-                "content": {}
             }
         }))
         .expect("derived deserialization should construct the conversation event");

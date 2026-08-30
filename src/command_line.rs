@@ -79,7 +79,7 @@ impl CommandLine {
 
 fn render_model_event(model_event: &ModelEvent) -> io::Result<()> {
     let prefix = match model_event {
-        ModelEvent::AssistantResponse(_) => "",
+        ModelEvent::Assistant(_) => "",
         ModelEvent::Communication(_) => "### ",
     };
     let mut standard_output = io::stdout().lock();

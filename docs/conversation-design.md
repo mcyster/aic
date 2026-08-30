@@ -101,10 +101,11 @@ enum ConversationEventKind {
         content: Vec<UserContent>,
     },
     Model {
-        source: ModelSource,
+        model: ModelDetails,
         event: ModelEvent,
     },
     Problem {
+        model: Option<ModelDetails>,
         problem: ConversationProblem,
     },
     ToolRequest(...),
@@ -115,7 +116,7 @@ enum ConversationEventKind {
 }
 ```
 
-`ConversationEvent` also carries an optional `ModelData` value on its envelope alongside the flattened kind. The portable kind contains the complete meaning of the event; the optional model data never does.
+`ModelDetails` keeps the model source and optional model-native data together. A model event always has model details; a model-associated problem has model details as well, while a future unrelated problem may use `None`. User events cannot carry model details. The portable kind contains the complete meaning of the event; model data never does.
 
 The vocabulary should grow only when a concrete repeated semantic need justifies another event type.
 
@@ -207,7 +208,6 @@ struct ConversationEvent {
     schema_version: u32,
     #[serde(flatten)]
     kind: ConversationEventKind,
-    model: Option<ModelData>,
 }
 ```
 
@@ -300,13 +300,13 @@ A failed model invocation never removes the already-durable `User` event.
 
 ## 9. ModelEvent
 
-`ModelEvent` records successful typed model output. Provenance belongs to the enclosing `ConversationEvent`, not to `ModelEvent`.
+`ModelEvent` records successful typed model output. Provenance and optional model-native data belong to `ModelDetails` on the enclosing `ConversationEventKind::Model`, not to `ModelEvent`.
 
 The durable common shape is:
 
 ```rust
 enum ModelEvent {
-    AssistantResponse(AssistantResponse),
+    Assistant(AssistantResponse),
     Communication(ModelCommunication),
 }
 
@@ -322,7 +322,7 @@ enum ModelEventImportance {
 }
 ```
 
-`AssistantResponse` is the actual response used for portable continuation and is always important. `ModelCommunication` carries auxiliary information with a subtype and importance.
+`ModelEvent::Assistant(AssistantResponse)` is the actual response used for portable continuation and is always important. `ModelEvent::Communication(ModelCommunication)` carries auxiliary information with a subtype and importance.
 
 ---
 
@@ -341,7 +341,7 @@ output.done
 but the semantic conversation may record:
 
 ```text
-Model(source=..., event=AssistantResponse(message="Hello"))
+Model(model=..., event=Assistant(AssistantResponse(message="Hello")))
 ```
 
 A driver emits detailed reasoning as a detailed communication, a reasoning summary as an interesting communication, and final output as an assistant response. Consumers such as the CLI choose which communications to present. Only assistant responses are replayed as assistant history.
@@ -473,9 +473,9 @@ Data is not model input by default.
 
 ## 17. Model-specific data
 
-The optional `ModelData` on the `ConversationEvent` envelope is the one channel for driver-native enrichment.
+The optional `ModelData` inside `ModelDetails` is the one channel for driver-native enrichment.
 
-It retains model/provider-specific information that is useful enough to preserve but does not justify a universal field. `ModelData` is opaque to the conversation and supports JSON serialization. The driver that creates it defines and interprets its contents, and another driver may ignore it safely. It retains its owning `ProviderId` so a driver can decide whether it knows how to interpret the content.
+It retains model/provider-specific information that is useful enough to preserve but does not justify a universal field. `ModelData` is opaque to the conversation and supports JSON serialization. `ModelDetails` keeps it with the owning `ModelSource`, so the driver can decide whether it knows how to interpret the content. The driver that creates it defines and interprets it, and another driver may ignore it safely.
 
 The portable event kind must contain the complete meaning of the event. `ModelData` may preserve native fidelity or improve continuation, but it must never be required to understand the conversation.
 
@@ -491,13 +491,13 @@ Cross-driver replay must continue to work from portable fields when model data i
 
 `ConversationProblem::Invocation` means the invocation machinery failed. `ModelDriverError` remains the detailed control-flow error. The turn service sanitizes it, appends the invocation problem, and returns the original error.
 
-A `Problem` is a top-level conversation event. It is not model output merely because it concerns a model invocation, so the problem kind does not carry a `ModelSource`.
+A `Problem` is a top-level conversation event. A model-associated problem carries `Some(ModelDetails)`; a future problem unrelated to a model may carry `None`. It is not model output merely because it concerns a model invocation.
 
 An invocation failure before a stream exists therefore leaves:
 
 ```text
 User(...)
-Problem(problem=Invocation(...))
+Problem(model=Some(...), problem=Invocation(...))
 ```
 
 If an established stream fails later, it leaves:
@@ -505,7 +505,7 @@ If an established stream fails later, it leaves:
 ```text
 User(...)
 Model(...completed semantic event...)
-Problem(problem=Invocation(...))
+Problem(model=Some(...), problem=Invocation(...))
 ```
 
 Completed semantic events already yielded remain valid conversation facts, and events already appended are not rolled back. Incomplete provider deltas that never formed a completed `ModelEvent` are discarded.
@@ -642,7 +642,7 @@ The important Phase 1 properties are:
 - input is a complete immutable conversation reconstructed from conversation events
 - the driver owns and exposes its stable provider/model source
 - invocation is asynchronous and stream-first
-- the stream yields zero or more completed `ConversationEvent`s, each with portable meaning and optional `ModelData`
+- the stream yields zero or more completed `ConversationEvent`s, each with portable meaning and any applicable `ModelDetails`
 - the consumer controls demand by polling for the next event
 - the caller owns the outer model/tool loop
 - expected failures are strongly typed
@@ -654,7 +654,7 @@ A caller that wants batch behavior can collect the stream. No separate batch int
 
 ## 23. Returned event persistence
 
-User input is appended before model invocation. The driver maps provider-native activity to complete `ConversationEvent`s, including provenance, optional `ModelData`, and canonical envelope metadata. The caller persists and may display each returned conversation event immediately while the invocation remains active.
+User input is appended before model invocation. The driver maps provider-native activity to complete `ConversationEvent`s, including `ModelDetails` where the event concerns a model, and canonical envelope metadata. The caller persists and may display each returned conversation event immediately while the invocation remains active.
 
 Provider protocol events and raw text deltas remain internal to the driver. They are not `ConversationEvent`s and are not persisted merely because they arrived. The driver aggregates those deltas and yields only completed semantic output such as an `AssistantResponse`, `ModelCommunication`, or `ModelIssue`.
 
@@ -666,7 +666,7 @@ User already durable
 await ModelDriver invocation
     ↓
 setup failure before stream
-    → append sanitized ConversationProblem::Invocation
+    → append sanitized Problem(model=Some(...), problem=Invocation(...))
     → return detailed ModelDriverError
 
 or
@@ -681,7 +681,7 @@ completed ConversationEvent
 later stream failure
     → completed events remain durable
     → incomplete provider deltas are discarded
-    → append sanitized ConversationProblem::Invocation
+    → append sanitized Problem(model=Some(...), problem=Invocation(...))
     → return detailed ModelDriverError
 ```
 

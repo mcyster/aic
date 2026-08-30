@@ -8,19 +8,14 @@ The original `ModelDriver` contract returned a batch of semantic model events on
 
 ## Decision
 
-One `ModelDriver::invoke` call represents one provider/model invocation and asynchronously establishes a stream of completed semantic `ModelDriverOutput`s. The intended interface is approximately:
+One `ModelDriver::invoke` call represents one provider/model invocation and asynchronously establishes a stream of completed semantic `ConversationEvent`s. The intended interface is approximately:
 
 ```rust
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 
-pub(crate) enum ModelDriverOutput {
-    Event(ModelEvent),
-    Issue(ModelIssue),
-}
-
 pub(crate) type ModelOutputStream =
-    BoxStream<'static, Result<ModelDriverOutput, ModelDriverError>>;
+    BoxStream<'static, Result<ConversationEvent, ModelDriverError>>;
 
 pub(crate) trait ModelDriver {
     fn source(&self) -> &ModelSource;
@@ -35,11 +30,11 @@ pub(crate) trait ModelDriver {
 }
 ```
 
-This has the conceptual shape `Future<Stream<ModelDriverOutput>>`, or `Mono<Flux<ModelDriverOutput>>` in Reactor terminology. The outer future constructs the request and establishes the provider invocation. It may fail before a stream exists because of request construction, authentication, connection, or HTTP errors. Once established, the stream yields `Result<ModelDriverOutput, ModelDriverError>` because the invocation may fail after streaming begins. The consumer controls demand by polling for the next output. A caller that needs batch behavior may collect the stream; no separate batch interface is required. ADR 0006 later renamed this stream payload to `ModelDriverEvent` and moved model-reported problems onto it as events.
+This has the conceptual shape `Future<Stream<ConversationEvent>>`, or `Mono<Flux<ConversationEvent>>` in Reactor terminology. The outer future constructs the request and establishes the provider invocation. It may fail before a stream exists because of request construction, authentication, connection, or HTTP errors. Once established, the stream yields `Result<ConversationEvent, ModelDriverError>` because the invocation may fail after streaming begins. The consumer controls demand by polling for the next event. A caller that needs batch behavior may collect the stream; no separate batch interface is required. ADR 0007 clarifies that provider-native intermediate events remain private to each concrete driver.
 
-For OpenAI, one invocation uses one REST request and one SSE response stream. Consuming several outputs from that stream does not make several model requests. Provider protocol events and raw text deltas remain private to the concrete driver. The driver aggregates provider deltas and yields only completed semantic output. `AssistantResponse` and `ModelCommunication` are successful model events; semantic model issues are separate driver outputs. Raw SSE deltas are not `ConversationEvent`s and are not persisted merely because they arrived.
+For OpenAI, one invocation uses one REST request and one SSE response stream. Consuming several events from that stream does not make several model requests. Provider protocol events, raw text deltas, and intermediate driver events remain private to the concrete driver. The driver aggregates provider deltas and returns only completed `ConversationEvent`s. `ModelEvent::Assistant` and `ModelEvent::Communication` are successful model events; semantic model issues are top-level problem events. Raw SSE deltas are not `ConversationEvent`s and are not persisted merely because they arrived.
 
-Completed semantic events may be wrapped as canonical `ConversationEvent`s, displayed, and appended incrementally while the provider invocation remains active. If the stream later fails, already yielded completed events remain valid conversation facts and already appended events are not rolled back. Incomplete provider deltas that never formed a completed `ModelEvent` are discarded. [Represent Model-Associated Problems as Conversation Events](2026-08-23-represent-model-associated-problems-as-conversation-events.md) defines how the caller records the stream error as a sanitized model-associated problem. This supersedes the previous contract under which every model event was withheld until the complete invocation succeeded and all model output was discarded after a late provider failure.
+Completed semantic `ConversationEvent`s may be displayed and appended incrementally while the provider invocation remains active. If the stream later fails, already yielded completed events remain valid conversation facts and already appended events are not rolled back. Incomplete provider deltas that never formed a completed `ModelEvent` are discarded. [Represent Model-Associated Problems as Conversation Events](2026-08-23-represent-model-associated-problems-as-conversation-events.md) defines how the caller records the stream error as a sanitized model-associated problem. This supersedes the previous contract under which every model event was withheld until the complete invocation succeeded and all model output was discarded after a late provider failure.
 
 ADR 0007 supersedes this decision's intermediate output shape: concrete drivers now keep provider-native intermediate events private and return complete `ConversationEvent`s.
 

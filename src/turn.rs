@@ -4,7 +4,7 @@ use futures_util::StreamExt;
 
 use crate::conversation::{
     ConversationEventKind, ConversationId, ConversationProblem, InvalidConversationProblem,
-    InvocationError, ModelEvent, UserContent, UserPrompt,
+    InvocationError, ModelDetails, ModelEvent, ModelSource, UserContent, UserPrompt,
 };
 use crate::model_driver::{ModelDriver, ModelDriverError};
 use crate::persistence::EventStore;
@@ -53,7 +53,6 @@ impl TurnService {
             ConversationEventKind::User {
                 content: vec![UserContent::Text(request.user_prompt.text().to_owned())],
             },
-            None,
         )?;
         conversation_identified(conversation_id);
 
@@ -67,6 +66,7 @@ impl TurnService {
             Err(error) => {
                 self.append_invocation_problem(
                     conversation_id,
+                    &source,
                     &error,
                     InvocationStage::BeforeStream,
                 )?;
@@ -79,6 +79,7 @@ impl TurnService {
                 Err(error) => {
                     self.append_invocation_problem(
                         conversation_id,
+                        &source,
                         &error,
                         InvocationStage::DuringStream,
                     )?;
@@ -92,7 +93,7 @@ impl TurnService {
                         .append_conversation_event(conversation_event)?;
                     report_progress(TurnProgress::EventCompleted { event })?;
                 }
-                ConversationEventKind::Problem { problem } => {
+                ConversationEventKind::Problem { problem, .. } => {
                     let problem = problem.clone();
                     self.event_store
                         .append_conversation_event(conversation_event)?;
@@ -104,6 +105,7 @@ impl TurnService {
                     );
                     self.append_invocation_problem(
                         conversation_id,
+                        &source,
                         &error,
                         InvocationStage::DuringStream,
                     )?;
@@ -118,14 +120,18 @@ impl TurnService {
     fn append_invocation_problem(
         &self,
         conversation_id: ConversationId,
+        source: &ModelSource,
         error: &ModelDriverError,
         stage: InvocationStage,
     ) -> TurnResultValue<()> {
         let problem = invocation_problem(error, stage)?;
+        let model = ModelDetails::new(source.clone(), None)?;
         self.event_store.append_new_conversation_event(
             conversation_id,
-            ConversationEventKind::Problem { problem },
-            None,
+            ConversationEventKind::Problem {
+                model: Some(model),
+                problem,
+            },
         )?;
         Ok(())
     }
@@ -185,9 +191,9 @@ mod tests {
     use super::{TurnProgress, TurnRequest, TurnService};
     use crate::conversation::{
         AssistantResponse, Conversation, ConversationEvent, ConversationEventKind, ConversationId,
-        ConversationProblem, InvocationError, ModelCommunication, ModelData, ModelEvent,
-        ModelEventImportance, ModelId, ModelIssue, ModelSource, ProviderId, UserContent,
-        UserPrompt,
+        ConversationProblem, InvocationError, ModelCommunication, ModelData, ModelDetails,
+        ModelEvent, ModelEventImportance, ModelId, ModelIssue, ModelSource, ProviderId,
+        UserContent, UserPrompt,
     };
     use crate::model_driver::{ModelDriver, ModelDriverError, ModelOutputStream};
     use crate::persistence::EventStore;
@@ -229,10 +235,10 @@ mod tests {
                                     + u64::try_from(event_index)
                                         .expect("the event index should fit in a position"),
                                 ConversationEventKind::Model {
-                                    source: source.clone(),
+                                    model: ModelDetails::new(source.clone(), data.clone())
+                                        .expect("the model details should be valid"),
                                     event,
                                 },
-                                data.clone(),
                             )
                         })
                         .map(Ok),
@@ -284,15 +290,19 @@ mod tests {
             let data = self.data.clone();
             let conversation_id = conversation.id();
             let position = next_position(conversation);
+            let source = self.source.clone();
             async move {
                 Ok(stream::once(async move {
                     Ok(ConversationEvent::new(
                         conversation_id,
                         position,
                         ConversationEventKind::Problem {
+                            model: Some(
+                                ModelDetails::new(source, data)
+                                    .expect("the model details should be valid"),
+                            ),
                             problem: ConversationProblem::Issue(issue),
                         },
-                        data,
                     ))
                 })
                 .boxed())
@@ -320,10 +330,10 @@ mod tests {
                         conversation_id,
                         position,
                         ConversationEventKind::Model {
-                            source,
+                            model: ModelDetails::new(source, None)
+                                .expect("the model details should be valid"),
                             event: completed_event,
                         },
-                        None,
                     )),
                     Err(ModelDriverError::Transport("late failure".to_owned())),
                 ])
@@ -340,11 +350,11 @@ mod tests {
         )
     }
 
-    fn model_data(provider: &str) -> ModelData {
-        ModelData::new(
-            ProviderId::from_str(provider).expect("the provider identifier should be valid"),
-            Map::from_iter([("response_id".to_owned(), Value::String("resp_1".to_owned()))]),
-        )
+    fn model_data() -> ModelData {
+        ModelData::new(Map::from_iter([(
+            "response_id".to_owned(),
+            Value::String("resp_1".to_owned()),
+        )]))
         .expect("the model data should be valid")
     }
 
@@ -359,7 +369,7 @@ mod tests {
     }
 
     fn assistant_response(message: &str) -> ModelEvent {
-        ModelEvent::AssistantResponse(
+        ModelEvent::Assistant(
             AssistantResponse::new(message.to_owned())
                 .expect("the assistant response should be valid"),
         )
@@ -377,7 +387,8 @@ mod tests {
         event: ModelEvent,
     ) -> ConversationEventKind {
         ConversationEventKind::Model {
-            source: source.clone(),
+            model: ModelDetails::new(source.clone(), None)
+                .expect("the model details should be valid"),
             event,
         }
     }
@@ -539,13 +550,13 @@ mod tests {
             )
         );
         let ConversationEventKind::Model {
-            source: event_source,
-            event: ModelEvent::AssistantResponse(_),
+            model: event_model,
+            event: ModelEvent::Assistant(_),
         } = &conversation.events()[2].kind
         else {
             panic!("the event should be an assistant response");
         };
-        assert_eq!(event_source, &source);
+        assert_eq!(event_model.source(), &source);
     }
 
     #[tokio::test]
@@ -584,7 +595,7 @@ mod tests {
             conversation.events()[0].kind,
             ConversationEventKind::User { .. }
         ));
-        let ConversationEventKind::Problem { problem } = &conversation.events()[1].kind else {
+        let ConversationEventKind::Problem { problem, .. } = &conversation.events()[1].kind else {
             panic!("the second event should be an invocation problem");
         };
         assert_eq!(
@@ -640,6 +651,7 @@ mod tests {
             &conversation.events()[1].kind,
             ConversationEventKind::Problem {
                 problem: ConversationProblem::Issue(ModelIssue::Refusal { .. }),
+                ..
             }
         ));
         let reports = reported_problems
@@ -658,7 +670,7 @@ mod tests {
             Box::new(RecordingModelDriver {
                 source: model_source("test-provider", "test-model"),
                 events: vec![assistant_response("Answer")],
-                data: Some(model_data("test-provider")),
+                data: Some(model_data()),
                 inputs: Arc::new(Mutex::new(Vec::new())),
             }),
         );
@@ -681,11 +693,10 @@ mod tests {
             conversation.events()[1].kind,
             ConversationEventKind::Model { .. }
         ));
-        assert_eq!(conversation.events()[0].model, None);
-        assert_eq!(
-            conversation.events()[1].model,
-            Some(model_data("test-provider"))
-        );
+        let ConversationEventKind::Model { model, .. } = &conversation.events()[1].kind else {
+            panic!("the event should be a model event");
+        };
+        assert_eq!(model.data(), Some(&model_data()));
     }
 
     #[tokio::test]
@@ -700,7 +711,7 @@ mod tests {
                 source: model_source("test-provider", "test-model"),
                 issue: ModelIssue::try_refusal("Refused.".to_owned())
                     .expect("the refusal should be valid"),
-                data: Some(model_data("test-provider")),
+                data: Some(model_data()),
             }),
         );
         let mut conversation_id = None;
@@ -722,9 +733,12 @@ mod tests {
             conversation.events()[1].kind,
             ConversationEventKind::Problem { .. }
         ));
+        let ConversationEventKind::Problem { model, .. } = &conversation.events()[1].kind else {
+            panic!("the event should be a problem event");
+        };
         assert_eq!(
-            conversation.events()[1].model,
-            Some(model_data("test-provider"))
+            model.as_ref().and_then(ModelDetails::data),
+            Some(&model_data())
         );
     }
 
@@ -768,6 +782,7 @@ mod tests {
             conversation.events()[2].kind,
             ConversationEventKind::Problem {
                 problem: ConversationProblem::Invocation(InvocationError::StreamInterrupted { .. }),
+                ..
             }
         ));
     }
