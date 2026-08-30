@@ -1,10 +1,6 @@
-# 0001: Begin with a Single Binary Package
+# Begin with a Single Binary Package
 
-## Status
-
-Accepted
-
-## Context
+## Why
 
 The project starts with one executable and one conversation command. Its provider and transport requirements are not yet known.
 

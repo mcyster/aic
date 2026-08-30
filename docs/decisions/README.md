@@ -1,9 +1,12 @@
-# Architecture Decisions
+# Decisions
 
-Architecture decision records preserve consequential choices and their context.
+This directory contains the small current set of significant project decisions
+and why they were made. Each filename states the decision rather than assigning
+it a sequence number.
 
-- [0001: Begin with a single binary package](0001-single-binary-package.md)
-- [0002: Introduce the ModelDriver boundary](0002-introduce-model-driver-boundary.md)
-- [0003: Conversation is the portable model input](0003-conversation-is-portable-model-input.md)
-- [0004: Use asynchronous streaming ModelDriver invocations](0004-use-asynchronous-streaming-model-driver-invocations.md)
-- [0005: Represent model-associated problems as conversation events](0005-represent-model-associated-problems-as-conversation-events.md)
+Decisions are intentionally concise. Detailed investigation belongs in a note
+and can be linked from the decision. When a decision is superseded, replace or
+remove it; Git retains the history.
+
+Browse the directory to discover individual decisions. This README intentionally
+does not maintain a file-by-file index.

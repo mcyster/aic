@@ -1,10 +1,6 @@
-# 0005: Represent Model-Associated Problems as Conversation Events
+# Represent Model-Associated Problems as Conversation Events
 
-## Status
-
-Accepted
-
-## Context
+## Why
 
 Model limitations and invocation failures both need a portable, sanitized durable representation. They remain distinct from detailed Rust control-flow errors, but both are facts associated with a selected model invocation and therefore have a meaningful `ModelSource`.
 

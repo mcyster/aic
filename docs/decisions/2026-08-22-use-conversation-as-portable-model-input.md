@@ -1,12 +1,8 @@
-# 0003: Conversation Is the Portable Model Input
+# Use Conversation as the Portable Model Input
 
-## Status
+## Why
 
-Accepted
-
-## Context
-
-ADR 0002 established that a `ModelDriver` receives an immutable view of the semantic Conversation Log and that continuation must not require provider-native history. That boundary is portable only if the conversation contains or immutably references all semantic state made visible to the model.
+[Introduce the ModelDriver Boundary](2026-08-16-introduce-model-driver-boundary.md) established that a `ModelDriver` receives an immutable view of the semantic Conversation Log and that continuation must not require provider-native history. That boundary is portable only if the conversation contains or immutably references all semantic state made visible to the model.
 
 Allowing `ModelDriver::invoke` to accept a separate bag of instructions, tool definitions, context, or other model-visible inputs would create unrecorded state. A later invocation could not reliably reconstruct what the model saw, and another compatible driver could not continue the conversation without mutable state or ambient configuration belonging to the original driver.
 

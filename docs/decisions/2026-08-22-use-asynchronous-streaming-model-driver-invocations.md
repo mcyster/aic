@@ -1,10 +1,6 @@
-# 0004: Use Asynchronous Streaming ModelDriver Invocations
+# Use Asynchronous Streaming ModelDriver Invocations
 
-## Status
-
-Accepted
-
-## Context
+## Why
 
 The original `ModelDriver` contract returned a batch of semantic model events only after an entire provider invocation succeeded. That contract could not expose completed semantic output incrementally or preserve it when a provider stream failed later.
 
@@ -43,7 +39,7 @@ This has the conceptual shape `Future<Stream<ModelDriverOutput>>`, or `Mono<Flux
 
 For OpenAI, one invocation uses one REST request and one SSE response stream. Consuming several outputs from that stream does not make several model requests. Provider protocol events and raw text deltas remain private to the concrete driver. The driver aggregates provider deltas and yields only completed semantic output. `AssistantResponse` and `ModelCommunication` are successful model events; semantic model issues are separate driver outputs. Raw SSE deltas are not `ConversationEvent`s and are not persisted merely because they arrived.
 
-Completed semantic events may be wrapped as canonical `ConversationEvent`s, displayed, and appended incrementally while the provider invocation remains active. If the stream later fails, already yielded completed events remain valid conversation facts and already appended events are not rolled back. Incomplete provider deltas that never formed a completed `ModelEvent` are discarded. ADR 0005 defines how the caller records the stream error as a sanitized model-associated problem. This supersedes the previous contract under which every model event was withheld until the complete invocation succeeded and all model output was discarded after a late provider failure.
+Completed semantic events may be wrapped as canonical `ConversationEvent`s, displayed, and appended incrementally while the provider invocation remains active. If the stream later fails, already yielded completed events remain valid conversation facts and already appended events are not rolled back. Incomplete provider deltas that never formed a completed `ModelEvent` are discarded. [Represent Model-Associated Problems as Conversation Events](2026-08-23-represent-model-associated-problems-as-conversation-events.md) defines how the caller records the stream error as a sanitized model-associated problem. This supersedes the previous contract under which every model event was withheld until the complete invocation succeeded and all model output was discarded after a late provider failure.
 
 Asynchronous operation is the architectural decision. Standard-library `Future` and async/await provide the language foundation. `futures-util` provides the conventional `BoxFuture`, `BoxStream`, and stream adapters. Tokio is the async runtime, and Reqwest uses its asynchronous client and streaming response support. Explicit `BoxFuture` return values support dynamic `Box<dyn ModelDriver>` dispatch, so `async-trait` is not currently required.
 
