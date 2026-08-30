@@ -11,8 +11,16 @@ The intended shape is approximately:
 ```rust
 struct ConversationEvent {
     // identity, position, timestamp, and schema
+    turn_id: ConversationTurnId,
+    turn_boundary: TurnBoundary,
     kind: ConversationEventKind,
     model: Option<ModelData>,
+}
+
+enum TurnBoundary {
+    Start,
+    Continue,
+    End,
 }
 
 enum ConversationEventKind {
@@ -24,6 +32,23 @@ enum ConversationEventKind {
 
 `Problem` remains a top-level conversation event. It is not model output merely
 because it concerns a model invocation.
+
+## Turns
+
+A conversation turn starts with a user prompt and ends with either an assistant
+response or a terminal problem. The boundary is recorded on that same
+`ConversationEvent`:
+
+- a user prompt starts the turn;
+- intermediate model activity and recoverable problems continue it;
+- an assistant response or terminal problem ends it.
+
+The ending event's kind determines whether the turn responded or failed. An
+assistant response creates one conversation event, not a response event followed
+by a separate turn-completion event.
+
+A `ConversationTurn` may be derived from the events sharing a turn identity. It
+is not another persisted conversation message.
 
 ## Model data
 
@@ -50,9 +75,9 @@ semantic events. A model-reported problem is an event on that stream, not a
 parallel output channel.
 
 The driver translates provider-native activity into portable semantics and may
-supply `ModelData`. The caller creates the durable envelope, adds provenance,
-and persists it. `ModelDriverError` remains operational control flow; the
-caller may also record an appropriate sanitized `Problem`.
+supply `ModelData`. The caller creates the durable envelope, adds provenance
+and turn information, and persists it. `ModelDriverError` remains operational
+control flow; the caller may also record an appropriate sanitized `Problem`.
 
 Do not make a provider-native event the only durable record. Reconstructing a
 conversation must never require the original driver or its historical version.
@@ -65,6 +90,7 @@ should be refined from concrete cases without adding speculative hierarchy.
 
 ## Complete when
 
-The types make the portable Conversation meaning and optional model data
-visibly separate, problems remain top-level events, and switching drivers never
-requires the previous driver to read the conversation.
+The types visibly separate portable Conversation meaning, optional model data,
+and turn boundaries. Problems remain top-level events, one event can end a turn,
+and switching drivers never requires the previous driver to read the
+conversation.
