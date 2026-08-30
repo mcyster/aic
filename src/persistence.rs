@@ -6,15 +6,11 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::conversation::{
-    Conversation, ConversationEvent, ConversationEventId, ConversationEventKind, ConversationId,
-    ModelData,
+    Conversation, ConversationEvent, ConversationEventKind, ConversationId, ModelData,
 };
-
-const SCHEMA_VERSION: u32 = 10;
 
 pub(crate) struct EventStore {
     root_directory: PathBuf,
@@ -59,7 +55,7 @@ impl EventStore {
         Ok(conversation)
     }
 
-    pub(crate) fn append_conversation_event(
+    pub(crate) fn append_new_conversation_event(
         &self,
         conversation_id: ConversationId,
         kind: ConversationEventKind,
@@ -83,15 +79,12 @@ impl EventStore {
             }
             conversation.events().last().map(|event| event.position)
         };
-        let conversation_event = ConversationEvent {
+        let conversation_event = ConversationEvent::new(
             conversation_id,
-            position: next_position(previous_position)?,
-            id: ConversationEventId::new(),
-            timestamp: OffsetDateTime::now_utc(),
-            schema_version: SCHEMA_VERSION,
+            next_position(previous_position)?,
             kind,
             model,
-        };
+        );
         write_json_atomically(
             &event_path(
                 &events_directory,
@@ -101,6 +94,38 @@ impl EventStore {
             &conversation_event,
         )?;
         Ok(conversation_event)
+    }
+
+    pub(crate) fn append_conversation_event(&self, event: ConversationEvent) -> io::Result<()> {
+        let conversation_directory = self.conversation_directory(event.conversation_id);
+        create_private_directory(&conversation_directory)?;
+        let events_directory = conversation_directory.join("events");
+        create_private_directory(&events_directory)?;
+        let mut existing_events = self.load_conversation_events(event.conversation_id)?;
+        let previous_position = if existing_events.is_empty() {
+            None
+        } else {
+            Conversation::from_events(existing_events.clone())
+                .map_err(invalid_conversation_data)?;
+            existing_events.last().map(|event| event.position)
+        };
+        let expected_position = next_position(previous_position)?;
+        if event.position != expected_position {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "expected conversation event position {expected_position}, found {}",
+                    event.position
+                ),
+            ));
+        }
+        existing_events.push(event.clone());
+        Conversation::from_events(existing_events).map_err(invalid_conversation_data)?;
+        write_json_atomically(
+            &event_path(&events_directory, event.position, &event.id.storage_key()),
+            &event,
+        )?;
+        Ok(())
     }
 
     fn load_conversation_events(
@@ -184,12 +209,11 @@ mod tests {
     use std::str::FromStr;
 
     use serde_json::{Map, Value};
-    use time::OffsetDateTime;
 
     use super::EventStore;
     use crate::conversation::{
-        AssistantResponse, ConversationEventKind, ConversationId, ModelData, ModelEvent, ModelId,
-        ModelSource, ProviderId, UserContent,
+        AssistantResponse, ConversationEvent, ConversationEventKind, ConversationId, ModelData,
+        ModelEvent, ModelId, ModelSource, ProviderId, UserContent,
     };
 
     fn temporary_store() -> EventStore {
@@ -203,7 +227,7 @@ mod tests {
         let conversation_id = ConversationId::new();
 
         let first_event = store
-            .append_conversation_event(
+            .append_new_conversation_event(
                 conversation_id,
                 ConversationEventKind::User {
                     content: vec![UserContent::Text("first".to_owned())],
@@ -212,7 +236,7 @@ mod tests {
             )
             .expect("the first event should be persisted");
         let second_event = store
-            .append_conversation_event(
+            .append_new_conversation_event(
                 conversation_id,
                 ConversationEventKind::User {
                     content: vec![UserContent::Text("second".to_owned())],
@@ -224,11 +248,11 @@ mod tests {
         assert_eq!(first_event.conversation_id, conversation_id);
         assert_eq!(first_event.position, 0);
         assert_eq!(first_event.schema_version, 10);
-        assert_ne!(first_event.timestamp, OffsetDateTime::UNIX_EPOCH);
+        assert_ne!(first_event.timestamp, time::OffsetDateTime::UNIX_EPOCH);
         assert_eq!(second_event.conversation_id, conversation_id);
         assert_eq!(second_event.position, 1);
         assert_eq!(second_event.schema_version, 10);
-        assert_ne!(second_event.timestamp, OffsetDateTime::UNIX_EPOCH);
+        assert_ne!(second_event.timestamp, time::OffsetDateTime::UNIX_EPOCH);
         assert_ne!(second_event.id, first_event.id);
 
         let conversation = store
@@ -264,21 +288,23 @@ mod tests {
         )
         .expect("the model data should be valid");
 
-        let appended_event = store
-            .append_conversation_event(
-                conversation_id,
-                ConversationEventKind::Model {
-                    source,
-                    event: ModelEvent::AssistantResponse(
-                        AssistantResponse::new("The answer is 42.".to_owned())
-                            .expect("the assistant response should be valid"),
-                    ),
-                },
-                Some(model_data.clone()),
-            )
+        let model_event = ConversationEvent::new(
+            conversation_id,
+            0,
+            ConversationEventKind::Model {
+                source,
+                event: ModelEvent::AssistantResponse(
+                    AssistantResponse::new("The answer is 42.".to_owned())
+                        .expect("the assistant response should be valid"),
+                ),
+            },
+            Some(model_data.clone()),
+        );
+        store
+            .append_conversation_event(model_event.clone())
             .expect("the model event should be persisted");
 
-        assert_eq!(appended_event.model, Some(model_data.clone()));
+        assert_eq!(model_event.model, Some(model_data.clone()));
         let conversation = store
             .load_conversation(conversation_id)
             .expect("the conversation should load");

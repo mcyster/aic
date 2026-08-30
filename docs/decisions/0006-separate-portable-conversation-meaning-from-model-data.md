@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted; the driver-output ownership is amended by ADR 0007.
 
 ## Context
 
@@ -28,7 +28,7 @@ The portable kind contains the complete meaning of the event. `AssistantResponse
 
 There is no `Other` problem kind. A newly understood semantic problem receives a specific shared `ModelIssue` kind, while unusable provider output (`InvocationError::InvalidProviderResponse`) and unclassified invocation failure (`InvocationError::ProviderFailure`) retain their distinct existing meanings.
 
-A `ModelDriver` receives the portable `Conversation` and produces one stream of `ModelDriverEvent` values: a portable `ModelEvent` or a model-reported problem (`ModelIssue`), each optionally accompanied by `ModelData`. `ModelDriverError` remains operational control flow; the caller may also record an appropriate sanitized `Problem`. The caller creates the durable envelope, adds provenance, and persists it.
+A `ModelDriver` receives the portable `Conversation` and produces one stream of complete `ConversationEvent` values. Provider-specific intermediate events are internal to the concrete driver. `ModelDriverError` remains operational control flow; the caller may also record an appropriate sanitized `Problem`. The caller persists returned conversation events.
 
 ## Consequences
 
@@ -36,4 +36,4 @@ Portable conversation meaning and optional model data are visibly separate, and 
 
 Events persist at schema version 10. Earlier problem events load without their source, and earlier events load without their extensions, because the conversation no longer models those fields. Events persisted with `ModelIssue::Other` no longer deserialize; no production driver ever emitted them.
 
-This decision supersedes the extension mechanism described in ADR 0005 and restates its problem surface without `ModelSource`, and it renames the stream payload that ADR 0004 called `ModelDriverOutput`.
+This decision supersedes the extension mechanism described in ADR 0005 and restates its problem surface without `ModelSource`. ADR 0007 amends the stream boundary so `ModelDriverEvent` is internal to each driver and the public stream returns `ConversationEvent`s.

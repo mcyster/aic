@@ -88,7 +88,7 @@ Large or binary content belongs in a content store and is referenced by a strong
 
 ### Model
 
-`Model` combines successful typed semantic `ModelEvent` output with the relevant `ModelSource`. `ModelSource` contains validated provider and model identities. Provenance belongs to the canonical `ConversationEvent`, not the `ModelEvent`, because the caller knows which driver it invoked and records that source on every event. Full invocation configuration is not repeated on each event.
+`Model` combines successful typed semantic `ModelEvent` output with the relevant `ModelSource`. `ModelSource` contains validated provider and model identities. Provenance belongs to the canonical `ConversationEvent`, not the `ModelEvent`, because the driver knows its configured source and records it while constructing the returned event. Full invocation configuration is not repeated on each event.
 
 `AssistantResponse` is the model's actual response to the conversation. It participates in portable continuation and is always `Important`. `ModelCommunication` records auxiliary model-produced information such as detailed reasoning, reasoning summaries, status, or emerging concepts that do not yet justify another typed variant. Communications are persisted but are not automatically replayed as assistant responses.
 
@@ -102,7 +102,7 @@ Both model-event variants retain meaningful portable messages, and the portable 
 
 There is no `Other` problem kind. A newly understood semantic problem receives a specific shared kind, while unusable provider output and unclassified invocation failure retain their distinct existing meanings. Problems are not automatically projected into every provider request; each driver decides how a retained problem should inform a later model.
 
-`ModelDriverError` is not durable conversation state. It carries detailed Rust control-flow information from invocation setup or stream consumption. The turn service converts it into a sanitized `ConversationProblem::Invocation`, appends that canonical problem fact, and then returns the original error. A driver reports a model issue as a problem event on its output stream, and the turn service persists it as `ConversationProblem::Issue`, optionally alongside driver-supplied `ModelData`. Raw provider bodies, credentials, stack traces, and sensitive request data are not copied into durable problems.
+`ModelDriverError` is not durable conversation state. It carries detailed Rust control-flow information from invocation setup or stream consumption. The turn service converts it into a sanitized `ConversationProblem::Invocation`, creates and appends that canonical problem fact, and then returns the original error. A driver converts a model issue into a top-level `ConversationEvent` before returning it, optionally with driver-supplied `ModelData`. Raw provider bodies, credentials, stack traces, and sensitive request data are not copied into durable problems.
 
 For example, several provider events may project to one response:
 
@@ -157,9 +157,9 @@ Event positions must not be used as semantic identifiers.
 
 ## Durability And Projection
 
-User input is appended before model invocation. The asynchronous invocation establishes one provider/model request and returns a stream of completed semantic `ModelDriverEvent`s. The consumer controls demand by polling that stream for its next event; receiving several events does not represent several model requests.
+User input is appended before model invocation. The asynchronous invocation establishes one provider/model request and returns a stream of completed semantic `ConversationEvent`s. The consumer controls demand by polling that stream for its next event; receiving several events does not represent several model requests.
 
-The caller may combine each yielded event with the invoked driver's `ModelSource`, assign persistence metadata, keep any driver-supplied `ModelData` on the envelope, display it, and append the resulting `ConversationEvent` while the invocation remains active. If invocation setup or the stream fails, the caller appends a sanitized `ConversationProblem::Invocation` and returns the detailed `ModelDriverError`. Completed semantic events already yielded remain valid conversation facts and appended events are not rolled back. Provider deltas that did not form a completed `ModelEvent` are discarded.
+The driver combines each completed semantic result with its `ModelSource`, optional `ModelData`, and envelope metadata before returning it. The caller persists and may display each returned `ConversationEvent` while the invocation remains active. If invocation setup or the stream fails, the caller creates and appends a sanitized `ConversationProblem::Invocation` and returns the detailed `ModelDriverError`. Completed semantic events already yielded remain valid conversation facts and appended events are not rolled back. Provider deltas that did not form a completed `ModelEvent` are discarded.
 
 This supersedes the earlier batch contract in which all model events were returned only after the complete invocation succeeded and all model output was discarded on a late provider failure. A caller that needs batch behavior can collect the stream; no separate batch interface is required.
 

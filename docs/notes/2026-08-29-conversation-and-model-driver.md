@@ -25,8 +25,9 @@ accompanied by opaque `ModelData` it defines. Provider request types, SSE
 events, raw deltas, response identifiers, and transport diagnostics remain
 inside the concrete driver.
 
-The caller owns canonical `ConversationEvent` envelopes, persistence, tool
-execution, retries, cancellation, and the outer orchestration loop. A future
+The driver owns returned canonical `ConversationEvent` envelopes and their
+provenance. The caller owns persistence, tool execution, retries, cancellation,
+and the outer orchestration loop. A future
 `Agent` may coordinate multiple invocations, delegation, workflows, and
 approvals above this boundary; it is not the provider integration abstraction.
 
@@ -49,8 +50,8 @@ See [Conversation Is the Portable Model Input](../decisions/2026-08-22-use-conve
 
 A provider invocation may produce many protocol events, but the rest of `tog`
 consumes completed semantic outputs. The driver aggregates raw deltas privately
-and exposes an asynchronous stream of `ModelDriverEvent` values, where a
-model-reported problem is an event on the same stream as portable model output.
+and exposes an asynchronous stream of `ConversationEvent` values, where a
+model-reported problem is an event on the same stream as model output.
 
 This replaced the earlier batch interface. Completed outputs can be persisted
 immediately and remain valid if the provider stream later fails. Incomplete

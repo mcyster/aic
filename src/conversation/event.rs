@@ -9,6 +9,8 @@ use super::{
     InvalidModelData, ModelData, ModelSource,
 };
 
+pub(crate) const SCHEMA_VERSION: u32 = 10;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ConversationEvent {
     pub(crate) conversation_id: ConversationId,
@@ -24,6 +26,23 @@ pub(crate) struct ConversationEvent {
 }
 
 impl ConversationEvent {
+    pub(crate) fn new(
+        conversation_id: ConversationId,
+        position: u64,
+        kind: ConversationEventKind,
+        model: Option<ModelData>,
+    ) -> Self {
+        Self {
+            conversation_id,
+            position,
+            id: ConversationEventId::new(),
+            timestamp: OffsetDateTime::now_utc(),
+            schema_version: SCHEMA_VERSION,
+            kind,
+            model,
+        }
+    }
+
     pub(super) fn ensure_valid(&self) -> Result<(), InvalidConversationEvent> {
         self.kind
             .ensure_valid()

@@ -6,7 +6,7 @@ use crate::conversation::{
     ConversationEventKind, ConversationId, ConversationProblem, InvalidConversationProblem,
     InvocationError, ModelEvent, UserContent, UserPrompt,
 };
-use crate::model_driver::{ModelDriver, ModelDriverError, ModelDriverEvent};
+use crate::model_driver::{ModelDriver, ModelDriverError};
 use crate::persistence::EventStore;
 
 pub(crate) type TurnResultValue<T> = Result<T, Box<dyn Error>>;
@@ -48,7 +48,7 @@ impl TurnService {
             }
             None => ConversationId::new(),
         };
-        self.event_store.append_conversation_event(
+        self.event_store.append_new_conversation_event(
             conversation_id,
             ConversationEventKind::User {
                 content: vec![UserContent::Text(request.user_prompt.text().to_owned())],
@@ -62,8 +62,8 @@ impl TurnService {
         report_progress(TurnProgress::InvocationStarted {
             model: source.model().as_str().to_owned(),
         })?;
-        let mut driver_events = match self.model_driver.invoke(&conversation).await {
-            Ok(driver_events) => driver_events,
+        let mut conversation_events = match self.model_driver.invoke(&conversation).await {
+            Ok(conversation_events) => conversation_events,
             Err(error) => {
                 self.append_invocation_problem(
                     conversation_id,
@@ -73,9 +73,9 @@ impl TurnService {
                 return Err(Box::new(error));
             }
         };
-        while let Some(driver_event) = driver_events.next().await {
-            let driver_event = match driver_event {
-                Ok(driver_event) => driver_event,
+        while let Some(conversation_event) = conversation_events.next().await {
+            let conversation_event = match conversation_event {
+                Ok(conversation_event) => conversation_event,
                 Err(error) => {
                     self.append_invocation_problem(
                         conversation_id,
@@ -85,30 +85,29 @@ impl TurnService {
                     return Err(Box::new(error));
                 }
             };
-            match driver_event {
-                ModelDriverEvent::Model { event, data } => {
-                    self.event_store.append_conversation_event(
-                        conversation_id,
-                        ConversationEventKind::Model {
-                            source: source.clone(),
-                            event: event.clone(),
-                        },
-                        data,
-                    )?;
+            match &conversation_event.kind {
+                ConversationEventKind::Model { event, .. } => {
+                    let event = event.clone();
+                    self.event_store
+                        .append_conversation_event(conversation_event)?;
                     report_progress(TurnProgress::EventCompleted { event })?;
                 }
-                ModelDriverEvent::Problem { problem, data } => {
-                    let conversation_problem = ConversationProblem::Issue(problem);
-                    self.event_store.append_conversation_event(
+                ConversationEventKind::Problem { problem } => {
+                    let problem = problem.clone();
+                    self.event_store
+                        .append_conversation_event(conversation_event)?;
+                    report_progress(TurnProgress::ProblemCompleted { problem })?;
+                }
+                ConversationEventKind::User { .. } => {
+                    let error = ModelDriverError::InvalidResponse(
+                        "the model driver returned a user conversation event".to_owned(),
+                    );
+                    self.append_invocation_problem(
                         conversation_id,
-                        ConversationEventKind::Problem {
-                            problem: conversation_problem.clone(),
-                        },
-                        data,
+                        &error,
+                        InvocationStage::DuringStream,
                     )?;
-                    report_progress(TurnProgress::ProblemCompleted {
-                        problem: conversation_problem,
-                    })?;
+                    return Err(Box::new(error));
                 }
             }
         }
@@ -123,7 +122,7 @@ impl TurnService {
         stage: InvocationStage,
     ) -> TurnResultValue<()> {
         let problem = invocation_problem(error, stage)?;
-        self.event_store.append_conversation_event(
+        self.event_store.append_new_conversation_event(
             conversation_id,
             ConversationEventKind::Problem { problem },
             None,
@@ -185,12 +184,12 @@ mod tests {
 
     use super::{TurnProgress, TurnRequest, TurnService};
     use crate::conversation::{
-        AssistantResponse, Conversation, ConversationEventKind, ConversationId,
+        AssistantResponse, Conversation, ConversationEvent, ConversationEventKind, ConversationId,
         ConversationProblem, InvocationError, ModelCommunication, ModelData, ModelEvent,
         ModelEventImportance, ModelId, ModelIssue, ModelSource, ProviderId, UserContent,
         UserPrompt,
     };
-    use crate::model_driver::{ModelDriver, ModelDriverError, ModelDriverEvent, ModelOutputStream};
+    use crate::model_driver::{ModelDriver, ModelDriverError, ModelOutputStream};
     use crate::persistence::EventStore;
 
     struct RecordingModelDriver {
@@ -215,13 +214,26 @@ mod tests {
                 .push(conversation.clone());
             let events = self.events.clone();
             let data = self.data.clone();
+            let conversation_id = conversation.id();
+            let source = self.source.clone();
+            let first_position = next_position(conversation);
             async move {
                 Ok(stream::iter(
                     events
                         .into_iter()
-                        .map(move |event| ModelDriverEvent::Model {
-                            event,
-                            data: data.clone(),
+                        .enumerate()
+                        .map(move |(event_index, event)| {
+                            ConversationEvent::new(
+                                conversation_id,
+                                first_position
+                                    + u64::try_from(event_index)
+                                        .expect("the event index should fit in a position"),
+                                ConversationEventKind::Model {
+                                    source: source.clone(),
+                                    event,
+                                },
+                                data.clone(),
+                            )
                         })
                         .map(Ok),
                 )
@@ -266,16 +278,22 @@ mod tests {
 
         fn invoke<'invoke>(
             &'invoke self,
-            _conversation: &'invoke Conversation,
+            conversation: &'invoke Conversation,
         ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
             let issue = self.issue.clone();
             let data = self.data.clone();
+            let conversation_id = conversation.id();
+            let position = next_position(conversation);
             async move {
                 Ok(stream::once(async move {
-                    Ok(ModelDriverEvent::Problem {
-                        problem: issue,
+                    Ok(ConversationEvent::new(
+                        conversation_id,
+                        position,
+                        ConversationEventKind::Problem {
+                            problem: ConversationProblem::Issue(issue),
+                        },
                         data,
-                    })
+                    ))
                 })
                 .boxed())
             }
@@ -290,15 +308,23 @@ mod tests {
 
         fn invoke<'invoke>(
             &'invoke self,
-            _conversation: &'invoke Conversation,
+            conversation: &'invoke Conversation,
         ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
             let completed_event = self.completed_event.clone();
+            let conversation_id = conversation.id();
+            let position = next_position(conversation);
+            let source = self.source.clone();
             async move {
                 Ok(stream::iter(vec![
-                    Ok(ModelDriverEvent::Model {
-                        event: completed_event,
-                        data: None,
-                    }),
+                    Ok(ConversationEvent::new(
+                        conversation_id,
+                        position,
+                        ConversationEventKind::Model {
+                            source,
+                            event: completed_event,
+                        },
+                        None,
+                    )),
                     Err(ModelDriverError::Transport("late failure".to_owned())),
                 ])
                 .boxed())
@@ -320,6 +346,16 @@ mod tests {
             Map::from_iter([("response_id".to_owned(), Value::String("resp_1".to_owned()))]),
         )
         .expect("the model data should be valid")
+    }
+
+    fn next_position(conversation: &Conversation) -> u64 {
+        conversation
+            .events()
+            .last()
+            .expect("the conversation should have an event")
+            .position
+            .checked_add(1)
+            .expect("the conversation should have an available position")
     }
 
     fn assistant_response(message: &str) -> ModelEvent {

@@ -9,13 +9,26 @@ use reqwest::StatusCode;
 use serde_json::{Map, Value, json};
 
 use crate::conversation::{
-    AssistantResponse, Conversation, ConversationEventKind, InvalidAssistantResponse,
-    InvalidConversationProblem, InvalidModelCommunication, ModelCommunication, ModelEvent,
-    ModelEventImportance, ModelId, ModelIssue, ModelSource, ProviderId, UserContent,
+    AssistantResponse, Conversation, ConversationEvent, ConversationEventKind, ConversationId,
+    ConversationProblem, InvalidAssistantResponse, InvalidConversationProblem,
+    InvalidModelCommunication, ModelCommunication, ModelData, ModelEvent, ModelEventImportance,
+    ModelId, ModelIssue, ModelSource, ProviderId, UserContent,
 };
-use crate::model_driver::{ModelDriver, ModelDriverError, ModelDriverEvent, ModelOutputStream};
+use crate::model_driver::{ModelDriver, ModelDriverError, ModelOutputStream};
 
 type ResponseByteStream = BoxStream<'static, Result<Vec<u8>, ModelDriverError>>;
+type ProviderOutputStream = BoxStream<'static, Result<ModelDriverEvent, ModelDriverError>>;
+
+enum ModelDriverEvent {
+    Model {
+        event: ModelEvent,
+        data: Option<ModelData>,
+    },
+    Problem {
+        problem: ModelIssue,
+        data: Option<ModelData>,
+    },
+}
 
 pub(crate) struct OpenAiModelDriver {
     http_client: Client,
@@ -70,8 +83,19 @@ impl ModelDriver for OpenAiModelDriver {
             .json(&request_body)
             .build();
         let http_client = self.http_client.clone();
+        let conversation_id = conversation.id();
+        let next_position = conversation
+            .events()
+            .last()
+            .and_then(|event| event.position.checked_add(1));
+        let source = self.source.clone();
 
         async move {
+            let next_position = next_position.ok_or_else(|| {
+                ModelDriverError::InvalidResponse(
+                    "the conversation has no available position for model output".to_owned(),
+                )
+            })?;
             let request =
                 request.map_err(|error| ModelDriverError::InvalidRequest(error.to_string()))?;
             let response = http_client
@@ -85,7 +109,12 @@ impl ModelDriver for OpenAiModelDriver {
                     .await
                     .map_err(|error| ModelDriverError::Transport(error.to_string()))?;
                 return match classify_response_failure(response_status, response_body) {
-                    Ok(issue) => Ok(model_issue_stream(issue)),
+                    Ok(issue) => Ok(conversation_event_stream(
+                        model_issue_stream(issue),
+                        conversation_id,
+                        next_position,
+                        source,
+                    )),
                     Err(error) => Err(error),
                 };
             }
@@ -98,7 +127,12 @@ impl ModelDriver for OpenAiModelDriver {
                         .map_err(|error| ModelDriverError::Transport(error.to_string()))
                 })
                 .boxed();
-            Ok(model_output_stream(response_bytes))
+            Ok(conversation_event_stream(
+                model_output_stream(response_bytes),
+                conversation_id,
+                next_position,
+                source,
+            ))
         }
         .boxed()
     }
@@ -165,13 +199,100 @@ fn is_context_limit_payload(payload: &Value) -> bool {
         .any(|code| matches!(code, "context_length_exceeded" | "context_window_exceeded"))
 }
 
-fn model_issue_stream(issue: ModelIssue) -> ModelOutputStream {
+fn model_issue_stream(issue: ModelIssue) -> ProviderOutputStream {
     stream::once(async move {
         Ok(ModelDriverEvent::Problem {
             problem: issue,
             data: None,
         })
     })
+    .boxed()
+}
+
+struct ConversationEventStreamState {
+    provider_events: ProviderOutputStream,
+    conversation_id: ConversationId,
+    next_position: u64,
+    source: ModelSource,
+    terminated: bool,
+}
+
+fn conversation_event_stream(
+    provider_events: ProviderOutputStream,
+    conversation_id: ConversationId,
+    next_position: u64,
+    source: ModelSource,
+) -> ModelOutputStream {
+    stream::unfold(
+        ConversationEventStreamState {
+            provider_events,
+            conversation_id,
+            next_position,
+            source,
+            terminated: false,
+        },
+        |mut state| async move {
+            if state.terminated {
+                return None;
+            }
+            match state.provider_events.next().await {
+                Some(Ok(ModelDriverEvent::Model { event, data })) => {
+                    let conversation_event = ConversationEvent::new(
+                        state.conversation_id,
+                        state.next_position,
+                        ConversationEventKind::Model {
+                            source: state.source.clone(),
+                            event,
+                        },
+                        data,
+                    );
+                    state.next_position = match state.next_position.checked_add(1) {
+                        Some(next_position) => next_position,
+                        None => {
+                            state.terminated = true;
+                            return Some((
+                                Err(ModelDriverError::InvalidResponse(
+                                    "the model output exceeded available conversation positions"
+                                        .to_owned(),
+                                )),
+                                state,
+                            ));
+                        }
+                    };
+                    Some((Ok(conversation_event), state))
+                }
+                Some(Ok(ModelDriverEvent::Problem { problem, data })) => {
+                    let conversation_event = ConversationEvent::new(
+                        state.conversation_id,
+                        state.next_position,
+                        ConversationEventKind::Problem {
+                            problem: ConversationProblem::Issue(problem),
+                        },
+                        data,
+                    );
+                    state.next_position = match state.next_position.checked_add(1) {
+                        Some(next_position) => next_position,
+                        None => {
+                            state.terminated = true;
+                            return Some((
+                                Err(ModelDriverError::InvalidResponse(
+                                    "the model output exceeded available conversation positions"
+                                        .to_owned(),
+                                )),
+                                state,
+                            ));
+                        }
+                    };
+                    Some((Ok(conversation_event), state))
+                }
+                Some(Err(error)) => {
+                    state.terminated = true;
+                    Some((Err(error), state))
+                }
+                None => None,
+            }
+        },
+    )
     .boxed()
 }
 
@@ -282,7 +403,7 @@ enum ResponseEnd {
     DoneSentinel,
 }
 
-fn model_output_stream(response_bytes: ResponseByteStream) -> ModelOutputStream {
+fn model_output_stream(response_bytes: ResponseByteStream) -> ProviderOutputStream {
     let state = OpenAiStreamState {
         response_bytes,
         decoder: ServerSentEventDecoder::default(),
@@ -938,14 +1059,15 @@ mod tests {
 
     use crate::conversation::{
         AssistantResponse, Conversation, ConversationEvent, ConversationEventId,
-        ConversationEventKind, ConversationId, ModelCommunication, ModelData, ModelEvent,
-        ModelEventImportance, ModelId, ModelIssue, ModelSource, ProviderId, UserContent,
+        ConversationEventKind, ConversationId, ConversationProblem, ModelCommunication, ModelData,
+        ModelEvent, ModelEventImportance, ModelId, ModelIssue, ModelSource, ProviderId,
+        UserContent,
     };
-    use crate::model_driver::{ModelDriver, ModelDriverError, ModelDriverEvent};
+    use crate::model_driver::{ModelDriver, ModelDriverError};
 
     use super::{
-        OpenAiModelDriver, ResponseByteStream, classify_response_failure, model_communication,
-        model_output_stream, semantic_input,
+        ModelDriverEvent, OpenAiModelDriver, ResponseByteStream, classify_response_failure,
+        model_communication, model_output_stream, semantic_input,
     };
 
     fn conversation_event(
@@ -1083,7 +1205,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoke_returns_a_future_that_establishes_one_model_event_stream() {
+    async fn invoke_returns_a_future_that_establishes_one_conversation_event_stream() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("the mock server should bind");
         let address = listener
             .local_addr()
@@ -1127,19 +1249,27 @@ mod tests {
             .expect("the answer should be valid");
 
         assert!(matches!(
-            first_event,
-            ModelDriverEvent::Model {
+            &first_event.kind,
+            ConversationEventKind::Model {
+                source: event_source,
                 event: ModelEvent::Communication(_),
                 ..
             }
+            if event_source == &source()
         ));
         assert!(matches!(
-            second_event,
-            ModelDriverEvent::Model {
+            &second_event.kind,
+            ConversationEventKind::Model {
+                source: event_source,
                 event: ModelEvent::AssistantResponse(_),
                 ..
             }
+            if event_source == &source()
         ));
+        assert_eq!(first_event.position, 1);
+        assert_eq!(second_event.position, 2);
+        assert_eq!(first_event.model, None);
+        assert_eq!(second_event.model, None);
         assert!(model_events.next().await.is_none());
         server.join().expect("the mock server should stop");
     }
@@ -1215,16 +1345,16 @@ mod tests {
             .expect("the context-limit issue should be valid");
 
         assert!(matches!(
-            &model_event,
-            ModelDriverEvent::Problem {
-                problem: ModelIssue::ContextLimitExceeded { .. },
+            &model_event.kind,
+            ConversationEventKind::Problem {
+                problem: ConversationProblem::Issue(ModelIssue::ContextLimitExceeded { .. }),
                 ..
             }
         ));
-        let ModelDriverEvent::Problem { problem: issue, .. } = model_event else {
+        let ConversationEventKind::Problem { problem } = &model_event.kind else {
             panic!("the output should be a model issue");
         };
-        assert_eq!(issue.message(), "The model context limit was exceeded.");
+        assert_eq!(problem.message(), "The model context limit was exceeded.");
         assert!(model_events.next().await.is_none());
         server.join().expect("the mock server should stop");
     }

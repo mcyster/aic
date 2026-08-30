@@ -34,13 +34,13 @@ Conversation Log
     cross-model / cross-provider contract
 ```
 
-A `ModelDriver` consumes an immutable reference to the reconstructed conversation. One asynchronous invocation establishes a stream that yields completed typed model outputs:
+A `ModelDriver` consumes an immutable reference to the reconstructed conversation. One asynchronous invocation establishes a stream that yields completed `ConversationEvent`s:
 
 ```text
 immutable Conversation
     → asynchronous ModelDriver invocation
-    → stream of completed ModelDriverEvents
-    → caller maps each driver event to its conversation event kind, adds provenance and envelope metadata, and keeps any ModelData
+    → stream of completed ConversationEvents
+    → caller persists and presents each returned event
     → ConversationEvents appended incrementally
 ```
 
@@ -618,19 +618,8 @@ The intended interface is approximately:
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 
-enum ModelDriverEvent {
-    Model {
-        event: ModelEvent,
-        data: Option<ModelData>,
-    },
-    Problem {
-        problem: ModelIssue,
-        data: Option<ModelData>,
-    },
-}
-
 type ModelOutputStream =
-    BoxStream<'static, Result<ModelDriverEvent, ModelDriverError>>;
+    BoxStream<'static, Result<ConversationEvent, ModelDriverError>>;
 
 trait ModelDriver {
     fn source(&self) -> &ModelSource;
@@ -645,7 +634,7 @@ trait ModelDriver {
 }
 ```
 
-This is conceptually `Future<Stream<ModelDriverEvent>>`, or `Mono<Flux<ModelDriverEvent>>` in Reactor terminology. The outer future establishes the provider invocation and returns its stream. Request construction, authentication, connection, or HTTP failure may prevent a stream from being established. The established stream yields `Result<ModelDriverEvent, ModelDriverError>` because provider invocation may also fail after streaming has begun. A model-reported problem is an event on that stream, not a parallel output channel.
+This is conceptually `Future<Stream<ConversationEvent>>`, or `Mono<Flux<ConversationEvent>>` in Reactor terminology. The outer future establishes the provider invocation and returns its stream. Request construction, authentication, connection, or HTTP failure may prevent a stream from being established. The established stream yields `Result<ConversationEvent, ModelDriverError>` because provider invocation may also fail after streaming has begun. A model-reported problem is a `ConversationEvent` on that stream, not a parallel output channel.
 
 The important Phase 1 properties are:
 
@@ -653,7 +642,7 @@ The important Phase 1 properties are:
 - input is a complete immutable conversation reconstructed from conversation events
 - the driver owns and exposes its stable provider/model source
 - invocation is asynchronous and stream-first
-- the stream yields zero or more completed typed model events or model-reported problems, each with optional `ModelData`
+- the stream yields zero or more completed `ConversationEvent`s, each with portable meaning and optional `ModelData`
 - the consumer controls demand by polling for the next event
 - the caller owns the outer model/tool loop
 - expected failures are strongly typed
@@ -665,7 +654,7 @@ A caller that wants batch behavior can collect the stream. No separate batch int
 
 ## 23. Returned event persistence
 
-User input is appended before model invocation. The caller maps each completed driver event to either `ConversationEventKind::Model` or `ConversationEventKind::Problem`, adds the invoked driver's source for model events, keeps any `ModelData` on the envelope, and adds canonical envelope metadata, then may display and append the resulting conversation event immediately while the invocation remains active.
+User input is appended before model invocation. The driver maps provider-native activity to complete `ConversationEvent`s, including provenance, optional `ModelData`, and canonical envelope metadata. The caller persists and may display each returned conversation event immediately while the invocation remains active.
 
 Provider protocol events and raw text deltas remain internal to the driver. They are not `ConversationEvent`s and are not persisted merely because they arrived. The driver aggregates those deltas and yields only completed semantic output such as an `AssistantResponse`, `ModelCommunication`, or `ModelIssue`.
 
@@ -686,10 +675,8 @@ await ModelDriver invocation
     ↓
 poll stream
     ↓
-completed ModelDriverEvent
-    → map to model event or problem
-    → add ModelSource, optional ModelData, and envelope metadata
-    → display and append ConversationEvent
+completed ConversationEvent
+    → display and append the returned event
     ↓
 later stream failure
     → completed events remain durable
@@ -707,10 +694,10 @@ This supersedes the previous batch contract, which returned all model events onl
 An established invocation yields typed model-associated semantic facts incrementally:
 
 ```rust
-Result<ModelDriverEvent, ModelDriverError>
+Result<ConversationEvent, ModelDriverError>
 ```
 
-This supports assistant responses, auxiliary communications, and model-reported problems without allowing a driver to produce caller-owned conversation events. Invocation errors enter the `ConversationEventKind::Problem` surface only after caller-owned sanitization. Stream polling supplies demand and natural backpressure at this boundary.
+This supports assistant responses, auxiliary communications, and model-reported problems as one conversation-event stream. The driver owns construction of returned conversation envelopes; provider-specific intermediate events remain private to the driver. Invocation errors enter the `ConversationEventKind::Problem` surface only after caller-owned sanitization. Stream polling supplies demand and natural backpressure at this boundary.
 
 ---
 
@@ -721,7 +708,7 @@ Expected model failures are explicit both while establishing the invocation and 
 ```rust
 BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>>
 
-BoxStream<'static, Result<ModelDriverEvent, ModelDriverError>>
+BoxStream<'static, Result<ConversationEvent, ModelDriverError>>
 ```
 
 A small error model might begin with:
@@ -961,7 +948,7 @@ provider errors
 
 No OpenAI SDK/API type crosses the ModelDriver boundary.
 
-The implementation emits typed model outputs rather than exposing raw OpenAI protocol events or assigning canonical conversation provenance.
+The implementation returns typed `ConversationEvent`s rather than exposing raw OpenAI protocol events. Provider-native intermediate events remain private to the implementation.
 
 ---
 
@@ -973,7 +960,7 @@ Support enough to exercise the semantic architecture:
 basic text input/output
 Responses API invocation
 streaming response consumption
-polymorphic ModelDriverEvents
+polymorphic ConversationEvents
 aggregated exposed reasoning
 event importance
 function/tool requests
@@ -1080,7 +1067,7 @@ At a high level, an implementation should need to:
 1. translate semantic conversation to provider input
 2. call the provider
 3. interpret provider output
-4. yield completed typed ModelDriverEvents or a typed error
+4. yield completed ConversationEvents or a typed error
 5. expose its configured provider/model source
 6. optionally emit useful traces
 ```
@@ -1147,8 +1134,8 @@ For example:
 
 ```text
 ModelDriver
-    → semantic ModelDriverEvent stream
-    → caller adds canonical envelope
+    → semantic ConversationEvent stream
+    → caller persists returned ConversationEvents
     → optional ConversationEvent publication bus
 
 concrete driver
@@ -1353,9 +1340,9 @@ invoke OpenAiModelDriver
 
 asynchronously establish one OpenAI Responses request and SSE stream
 
-yield completed semantic ModelDriverEvents as provider deltas are aggregated
+yield completed semantic ConversationEvents as provider deltas are aggregated
 
-add ModelSource and append resulting ConversationEvents incrementally
+construct and append resulting ConversationEvents incrementally
 
 retain appended completed events after a later stream failure
 
