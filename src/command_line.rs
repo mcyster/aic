@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::conversation::{
-    ConversationId, ModelEvent, ModelEventImportance, ModelId, ModelProblem,
+    ConversationId, ConversationProblem, ModelEvent, ModelEventImportance, ModelId,
 };
 use crate::openai::OpenAiModelDriver;
 use crate::persistence::EventStore;
@@ -87,7 +87,7 @@ fn render_model_event(model_event: &ModelEvent) -> io::Result<()> {
     standard_output.flush()
 }
 
-fn render_model_problem(problem: &ModelProblem) -> io::Result<()> {
+fn render_model_problem(problem: &ConversationProblem) -> io::Result<()> {
     let mut standard_output = io::stdout().lock();
     writeln!(standard_output, "### {}", problem.message())?;
     standard_output.flush()

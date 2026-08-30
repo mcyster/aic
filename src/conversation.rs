@@ -1,7 +1,8 @@
 mod event;
 mod id;
 mod model;
-mod model_problem;
+mod model_data;
+mod problem;
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -13,7 +14,10 @@ pub(crate) use event::{
 };
 pub(crate) use id::{ConversationEventId, ConversationId};
 pub(crate) use model::{ModelId, ModelSource, ProviderId};
-pub(crate) use model_problem::{InvalidModelProblem, InvocationError, ModelIssue, ModelProblem};
+pub(crate) use model_data::{InvalidModelData, ModelData};
+pub(crate) use problem::{
+    ConversationProblem, InvalidConversationProblem, InvocationError, ModelIssue,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Conversation {
@@ -46,7 +50,6 @@ impl Conversation {
             }
 
             event
-                .kind
                 .ensure_valid()
                 .map_err(|error| InvalidConversation::InvalidEvent {
                     position: event.position,
@@ -170,6 +173,7 @@ mod tests {
             kind: ConversationEventKind::User {
                 content: vec![UserContent::Text(format!("event {position}"))],
             },
+            model: None,
         }
     }
 
@@ -248,8 +252,7 @@ mod tests {
             },
             "event": {
                 "type": "assistant_response",
-                "message": "   ",
-                "extensions": {}
+                "message": "   "
             }
         }))
         .expect("derived deserialization should construct the conversation event");
@@ -282,8 +285,7 @@ mod tests {
                 "type": "communication",
                 "message": "reasoning",
                 "importance": "detailed",
-                "subtype": "   ",
-                "extensions": {}
+                "subtype": "   "
             }
         }))
         .expect("derived deserialization should construct the conversation event");
@@ -326,9 +328,78 @@ mod tests {
             Conversation::from_events(vec![conversation_event]),
             Err(InvalidConversation::InvalidEvent {
                 position: 0,
-                reason: "model problem message must not be empty".to_owned(),
+                reason: "conversation problem message must not be empty".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn conversation_rejects_empty_deserialized_model_data() {
+        let conversation_id = ConversationId::new();
+        let event_id = ConversationEventId::new();
+        let conversation_event: ConversationEvent = serde_json::from_value(json!({
+            "conversation_id": conversation_id,
+            "position": 0,
+            "id": event_id,
+            "timestamp": "2026-08-22T18:42:31.482Z",
+            "schema_version": 10,
+            "type": "model",
+            "source": {
+                "provider": "openai",
+                "model": "gpt-5.6"
+            },
+            "event": {
+                "type": "assistant_response",
+                "message": "The answer is 42."
+            },
+            "model": {
+                "provider": "openai",
+                "content": {}
+            }
+        }))
+        .expect("derived deserialization should construct the conversation event");
+
+        assert_eq!(
+            Conversation::from_events(vec![conversation_event]),
+            Err(InvalidConversation::InvalidEvent {
+                position: 0,
+                reason: "model data content must not be empty".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn conversation_loads_problem_events_from_earlier_schema_versions() {
+        let conversation_id = ConversationId::new();
+        let event_id = ConversationEventId::new();
+        let conversation_event: ConversationEvent = serde_json::from_value(json!({
+            "conversation_id": conversation_id,
+            "position": 0,
+            "id": event_id,
+            "timestamp": "2026-08-22T18:42:31.482Z",
+            "schema_version": 9,
+            "type": "problem",
+            "source": {
+                "provider": "openai",
+                "model": "gpt-5.6"
+            },
+            "problem": {
+                "category": "invocation",
+                "detail": {
+                    "type": "transport",
+                    "message": "The model provider could not be reached."
+                }
+            }
+        }))
+        .expect("the earlier problem event should deserialize");
+
+        let conversation = Conversation::from_events(vec![conversation_event])
+            .expect("the conversation should be valid");
+
+        assert!(matches!(
+            conversation.events()[0].kind,
+            ConversationEventKind::Problem { .. }
+        ));
     }
 
     #[test]

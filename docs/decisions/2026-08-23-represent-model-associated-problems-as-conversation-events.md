@@ -14,6 +14,8 @@ Use `ConversationEventKind::Problem { source, problem }` as the one durable prob
 
 A concrete driver yields `ModelDriverOutput::Issue` when it can translate provider-specific information into portable semantics. The turn service wraps it as `ModelProblem::Issue`. `ModelDriverError` remains the detailed error returned by the invocation future or stream. The turn service converts that error into a sanitized invocation problem, appends it under the invoked driver's source, and then returns the original error for Rust control flow.
 
+ADR 0006 supersedes the `ModelSource` on the problem kind, the `ModelIssue::Other` extension channel, and the `ModelDriverOutput::Issue` output shape: problems are now stream events named `ConversationProblem`, and model-specific data lives in envelope-level `ModelData`.
+
 Durable problem messages must not contain credentials, authorization headers, raw provider bodies, stack traces, sensitive request data, or diagnostics without portable conversational meaning. Detailed diagnostics may remain in `ModelDriverError` and application logging.
 
 ## Consequences

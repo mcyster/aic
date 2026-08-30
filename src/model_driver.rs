@@ -4,13 +4,19 @@ use std::fmt::{Display, Formatter};
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 
-use crate::conversation::{Conversation, ModelEvent, ModelIssue, ModelSource};
+use crate::conversation::{Conversation, ModelData, ModelEvent, ModelIssue, ModelSource};
 
-pub(crate) type ModelOutputStream = BoxStream<'static, Result<ModelDriverOutput, ModelDriverError>>;
+pub(crate) type ModelOutputStream = BoxStream<'static, Result<ModelDriverEvent, ModelDriverError>>;
 
-pub(crate) enum ModelDriverOutput {
-    Event(ModelEvent),
-    Issue(ModelIssue),
+pub(crate) enum ModelDriverEvent {
+    Model {
+        event: ModelEvent,
+        data: Option<ModelData>,
+    },
+    Problem {
+        problem: ModelIssue,
+        data: Option<ModelData>,
+    },
 }
 
 pub(crate) trait ModelDriver {

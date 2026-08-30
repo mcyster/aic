@@ -3,10 +3,10 @@ use std::error::Error;
 use futures_util::StreamExt;
 
 use crate::conversation::{
-    ConversationEventKind, ConversationId, InvalidModelProblem, InvocationError, ModelEvent,
-    ModelProblem, ModelSource, UserContent, UserPrompt,
+    ConversationEventKind, ConversationId, ConversationProblem, InvalidConversationProblem,
+    InvocationError, ModelEvent, UserContent, UserPrompt,
 };
-use crate::model_driver::{ModelDriver, ModelDriverError, ModelDriverOutput};
+use crate::model_driver::{ModelDriver, ModelDriverError, ModelDriverEvent};
 use crate::persistence::EventStore;
 
 pub(crate) type TurnResultValue<T> = Result<T, Box<dyn Error>>;
@@ -19,7 +19,7 @@ pub(crate) struct TurnRequest {
 pub(crate) enum TurnProgress {
     InvocationStarted { model: String },
     EventCompleted { event: ModelEvent },
-    ProblemCompleted { problem: ModelProblem },
+    ProblemCompleted { problem: ConversationProblem },
 }
 
 pub(crate) struct TurnService {
@@ -53,6 +53,7 @@ impl TurnService {
             ConversationEventKind::User {
                 content: vec![UserContent::Text(request.user_prompt.text().to_owned())],
             },
+            None,
         )?;
         conversation_identified(conversation_id);
 
@@ -61,52 +62,53 @@ impl TurnService {
         report_progress(TurnProgress::InvocationStarted {
             model: source.model().as_str().to_owned(),
         })?;
-        let mut model_outputs = match self.model_driver.invoke(&conversation).await {
-            Ok(model_outputs) => model_outputs,
+        let mut driver_events = match self.model_driver.invoke(&conversation).await {
+            Ok(driver_events) => driver_events,
             Err(error) => {
                 self.append_invocation_problem(
                     conversation_id,
-                    &source,
                     &error,
                     InvocationStage::BeforeStream,
                 )?;
                 return Err(Box::new(error));
             }
         };
-        while let Some(model_output) = model_outputs.next().await {
-            let model_output = match model_output {
-                Ok(model_output) => model_output,
+        while let Some(driver_event) = driver_events.next().await {
+            let driver_event = match driver_event {
+                Ok(driver_event) => driver_event,
                 Err(error) => {
                     self.append_invocation_problem(
                         conversation_id,
-                        &source,
                         &error,
                         InvocationStage::DuringStream,
                     )?;
                     return Err(Box::new(error));
                 }
             };
-            match model_output {
-                ModelDriverOutput::Event(model_event) => {
+            match driver_event {
+                ModelDriverEvent::Model { event, data } => {
                     self.event_store.append_conversation_event(
                         conversation_id,
                         ConversationEventKind::Model {
                             source: source.clone(),
-                            event: model_event.clone(),
+                            event: event.clone(),
                         },
+                        data,
                     )?;
-                    report_progress(TurnProgress::EventCompleted { event: model_event })?;
+                    report_progress(TurnProgress::EventCompleted { event })?;
                 }
-                ModelDriverOutput::Issue(issue) => {
-                    let problem = ModelProblem::Issue(issue);
+                ModelDriverEvent::Problem { problem, data } => {
+                    let conversation_problem = ConversationProblem::Issue(problem);
                     self.event_store.append_conversation_event(
                         conversation_id,
                         ConversationEventKind::Problem {
-                            source: source.clone(),
-                            problem: problem.clone(),
+                            problem: conversation_problem.clone(),
                         },
+                        data,
                     )?;
-                    report_progress(TurnProgress::ProblemCompleted { problem })?;
+                    report_progress(TurnProgress::ProblemCompleted {
+                        problem: conversation_problem,
+                    })?;
                 }
             }
         }
@@ -117,17 +119,14 @@ impl TurnService {
     fn append_invocation_problem(
         &self,
         conversation_id: ConversationId,
-        source: &ModelSource,
         error: &ModelDriverError,
         stage: InvocationStage,
     ) -> TurnResultValue<()> {
         let problem = invocation_problem(error, stage)?;
         self.event_store.append_conversation_event(
             conversation_id,
-            ConversationEventKind::Problem {
-                source: source.clone(),
-                problem,
-            },
+            ConversationEventKind::Problem { problem },
+            None,
         )?;
         Ok(())
     }
@@ -142,7 +141,7 @@ enum InvocationStage {
 fn invocation_problem(
     error: &ModelDriverError,
     stage: InvocationStage,
-) -> Result<ModelProblem, InvalidModelProblem> {
+) -> Result<ConversationProblem, InvalidConversationProblem> {
     let invocation_error = match error {
         ModelDriverError::Authentication(_) => InvocationError::try_authentication(
             "The model provider could not authenticate the invocation.".to_owned(),
@@ -171,7 +170,7 @@ fn invocation_problem(
             "The model provider failed the invocation.".to_owned(),
         )?,
     };
-    Ok(ModelProblem::Invocation(invocation_error))
+    Ok(ConversationProblem::Invocation(invocation_error))
 }
 
 #[cfg(test)]
@@ -186,18 +185,18 @@ mod tests {
 
     use super::{TurnProgress, TurnRequest, TurnService};
     use crate::conversation::{
-        AssistantResponse, Conversation, ConversationEventKind, ConversationId, InvocationError,
-        ModelCommunication, ModelEvent, ModelEventImportance, ModelId, ModelIssue, ModelProblem,
-        ModelSource, ProviderId, UserContent, UserPrompt,
+        AssistantResponse, Conversation, ConversationEventKind, ConversationId,
+        ConversationProblem, InvocationError, ModelCommunication, ModelData, ModelEvent,
+        ModelEventImportance, ModelId, ModelIssue, ModelSource, ProviderId, UserContent,
+        UserPrompt,
     };
-    use crate::model_driver::{
-        ModelDriver, ModelDriverError, ModelDriverOutput, ModelOutputStream,
-    };
+    use crate::model_driver::{ModelDriver, ModelDriverError, ModelDriverEvent, ModelOutputStream};
     use crate::persistence::EventStore;
 
     struct RecordingModelDriver {
         source: ModelSource,
         events: Vec<ModelEvent>,
+        data: Option<ModelData>,
         inputs: Arc<Mutex<Vec<Conversation>>>,
     }
 
@@ -215,8 +214,18 @@ mod tests {
                 .expect("the model input list should lock")
                 .push(conversation.clone());
             let events = self.events.clone();
+            let data = self.data.clone();
             async move {
-                Ok(stream::iter(events.into_iter().map(ModelDriverOutput::Event).map(Ok)).boxed())
+                Ok(stream::iter(
+                    events
+                        .into_iter()
+                        .map(move |event| ModelDriverEvent::Model {
+                            event,
+                            data: data.clone(),
+                        })
+                        .map(Ok),
+                )
+                .boxed())
             }
             .boxed()
         }
@@ -247,6 +256,7 @@ mod tests {
     struct IssueModelDriver {
         source: ModelSource,
         issue: ModelIssue,
+        data: Option<ModelData>,
     }
 
     impl ModelDriver for IssueModelDriver {
@@ -259,8 +269,15 @@ mod tests {
             _conversation: &'invoke Conversation,
         ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
             let issue = self.issue.clone();
+            let data = self.data.clone();
             async move {
-                Ok(stream::once(async move { Ok(ModelDriverOutput::Issue(issue)) }).boxed())
+                Ok(stream::once(async move {
+                    Ok(ModelDriverEvent::Problem {
+                        problem: issue,
+                        data,
+                    })
+                })
+                .boxed())
             }
             .boxed()
         }
@@ -278,7 +295,10 @@ mod tests {
             let completed_event = self.completed_event.clone();
             async move {
                 Ok(stream::iter(vec![
-                    Ok(ModelDriverOutput::Event(completed_event)),
+                    Ok(ModelDriverEvent::Model {
+                        event: completed_event,
+                        data: None,
+                    }),
                     Err(ModelDriverError::Transport("late failure".to_owned())),
                 ])
                 .boxed())
@@ -294,22 +314,25 @@ mod tests {
         )
     }
 
+    fn model_data(provider: &str) -> ModelData {
+        ModelData::new(
+            ProviderId::from_str(provider).expect("the provider identifier should be valid"),
+            Map::from_iter([("response_id".to_owned(), Value::String("resp_1".to_owned()))]),
+        )
+        .expect("the model data should be valid")
+    }
+
     fn assistant_response(message: &str) -> ModelEvent {
         ModelEvent::AssistantResponse(
-            AssistantResponse::new(message.to_owned(), Map::new())
+            AssistantResponse::new(message.to_owned())
                 .expect("the assistant response should be valid"),
         )
     }
 
     fn communication(message: &str, importance: ModelEventImportance) -> ModelEvent {
         ModelEvent::Communication(
-            ModelCommunication::new(
-                message.to_owned(),
-                importance,
-                "test".to_owned(),
-                Map::from_iter([("custom".to_owned(), Value::Bool(true))]),
-            )
-            .expect("the model communication should be valid"),
+            ModelCommunication::new(message.to_owned(), importance, "test".to_owned())
+                .expect("the model communication should be valid"),
         )
     }
 
@@ -342,6 +365,7 @@ mod tests {
             Box::new(RecordingModelDriver {
                 source: first_source.clone(),
                 events: vec![assistant_response("First answer")],
+                data: None,
                 inputs: Arc::new(Mutex::new(Vec::new())),
             }),
         );
@@ -365,6 +389,7 @@ mod tests {
             Box::new(RecordingModelDriver {
                 source: model_source("second-provider", "second-model"),
                 events: vec![assistant_response("Second answer")],
+                data: None,
                 inputs: Arc::clone(&second_inputs),
             }),
         );
@@ -415,6 +440,7 @@ mod tests {
                     communication("Thinking", ModelEventImportance::Detailed),
                     assistant_response("Answer"),
                 ],
+                data: None,
                 inputs: Arc::new(Mutex::new(Vec::new())),
             }),
         );
@@ -522,18 +548,16 @@ mod tests {
             conversation.events()[0].kind,
             ConversationEventKind::User { .. }
         ));
-        let ConversationEventKind::Problem { source, problem } = &conversation.events()[1].kind
-        else {
+        let ConversationEventKind::Problem { problem } = &conversation.events()[1].kind else {
             panic!("the second event should be an invocation problem");
         };
-        assert_eq!(source, service.model_driver.source());
         assert_eq!(
             problem.message(),
             "The model provider failed the invocation."
         );
         assert!(matches!(
             problem,
-            ModelProblem::Invocation(InvocationError::ProviderFailure { .. })
+            ConversationProblem::Invocation(InvocationError::ProviderFailure { .. })
         ));
     }
 
@@ -545,9 +569,10 @@ mod tests {
         let service = TurnService::new(
             EventStore::new(root_directory).expect("the event store should be created"),
             Box::new(IssueModelDriver {
-                source: source.clone(),
+                source,
                 issue: ModelIssue::try_refusal("Refused.".to_owned())
                     .expect("the refusal should be valid"),
+                data: None,
             }),
         );
         let reported_problems = Arc::new(Mutex::new(Vec::new()));
@@ -578,15 +603,93 @@ mod tests {
         assert!(matches!(
             &conversation.events()[1].kind,
             ConversationEventKind::Problem {
-                source: event_source,
-                problem: ModelProblem::Issue(ModelIssue::Refusal { .. }),
-            } if event_source == &source
+                problem: ConversationProblem::Issue(ModelIssue::Refusal { .. }),
+            }
         ));
         let reports = reported_problems
             .lock()
             .expect("the problem report list should lock");
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].message(), "Refused.");
+    }
+
+    #[tokio::test]
+    async fn model_data_supplied_with_a_model_event_is_persisted_on_the_envelope() {
+        let root_directory =
+            std::env::temp_dir().join(format!("tog-model-data-test-{}", uuid::Uuid::now_v7()));
+        let service = TurnService::new(
+            EventStore::new(root_directory).expect("the event store should be created"),
+            Box::new(RecordingModelDriver {
+                source: model_source("test-provider", "test-model"),
+                events: vec![assistant_response("Answer")],
+                data: Some(model_data("test-provider")),
+                inputs: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+        let mut conversation_id = None;
+
+        service
+            .execute(
+                turn_request(None, "Question"),
+                |identified_conversation_id| conversation_id = Some(identified_conversation_id),
+                |_| Ok(()),
+            )
+            .await
+            .expect("the turn should complete");
+
+        let conversation = service
+            .event_store
+            .load_conversation(conversation_id.expect("the turn should identify its conversation"))
+            .expect("the conversation should load");
+        assert!(matches!(
+            conversation.events()[1].kind,
+            ConversationEventKind::Model { .. }
+        ));
+        assert_eq!(conversation.events()[0].model, None);
+        assert_eq!(
+            conversation.events()[1].model,
+            Some(model_data("test-provider"))
+        );
+    }
+
+    #[tokio::test]
+    async fn model_data_supplied_with_a_model_problem_is_persisted_on_the_envelope() {
+        let root_directory = std::env::temp_dir().join(format!(
+            "tog-problem-model-data-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let service = TurnService::new(
+            EventStore::new(root_directory).expect("the event store should be created"),
+            Box::new(IssueModelDriver {
+                source: model_source("test-provider", "test-model"),
+                issue: ModelIssue::try_refusal("Refused.".to_owned())
+                    .expect("the refusal should be valid"),
+                data: Some(model_data("test-provider")),
+            }),
+        );
+        let mut conversation_id = None;
+
+        service
+            .execute(
+                turn_request(None, "Question"),
+                |identified_conversation_id| conversation_id = Some(identified_conversation_id),
+                |_| Ok(()),
+            )
+            .await
+            .expect("the model issue turn should complete");
+
+        let conversation = service
+            .event_store
+            .load_conversation(conversation_id.expect("the turn should identify its conversation"))
+            .expect("the conversation should load");
+        assert!(matches!(
+            conversation.events()[1].kind,
+            ConversationEventKind::Problem { .. }
+        ));
+        assert_eq!(
+            conversation.events()[1].model,
+            Some(model_data("test-provider"))
+        );
     }
 
     #[tokio::test]
@@ -628,8 +731,7 @@ mod tests {
         assert!(matches!(
             conversation.events()[2].kind,
             ConversationEventKind::Problem {
-                problem: ModelProblem::Invocation(InvocationError::StreamInterrupted { .. }),
-                ..
+                problem: ConversationProblem::Invocation(InvocationError::StreamInterrupted { .. }),
             }
         ));
     }
@@ -649,6 +751,7 @@ mod tests {
             Box::new(RecordingModelDriver {
                 source: model_source("test-provider", "test-model"),
                 events: Vec::new(),
+                data: None,
                 inputs: Arc::clone(&inputs),
             }),
         );
