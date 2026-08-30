@@ -1375,7 +1375,7 @@ The objective is to prove semantic portability and the ModelDriver boundary befo
 
 # Documentation
 
-## 47. Relationship to ADR 0001
+## 47. Relationship to the Single Binary Decision
 
 The early `ModelDriver` abstraction is a deliberate exception to the normal rule against speculative provider abstractions.
 
@@ -1387,7 +1387,7 @@ Keep it small.
 
 Let future implementations change it.
 
-ADR 0001 or related architecture notes should explicitly record this rationale so the exception is deliberate rather than accidental.
+The [single binary decision](decisions/2026-08-08-begin-with-single-binary-package.md) or related architecture notes should explicitly record this rationale so the exception is deliberate rather than accidental.
 
 ---
 
@@ -1401,4 +1401,4 @@ If OpenAI Responses exposes assumptions that conflict with the design, document 
 
 The shorter `docs/conversation.md` should describe the stable semantic conversation model and should not imply that a durable ModelDriver run log is required for Phase 1.
 
-Major future architectural changes should be captured in ADRs where useful.
+Major future architectural changes should be captured as concise decisions when useful.

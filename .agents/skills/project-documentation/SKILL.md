@@ -16,10 +16,11 @@ because an LLM can summarize it.
 - `docs/plans/` contains intended work. A plan describes what should change and the
   important choices involved; it is not evidence that the work has been completed.
 - `docs/notes/` contains developing thoughts, brainstorming, discussions,
-  investigations, experiments, and useful conclusions from AI conversations.
-- `docs/decisions/` contains significant decisions and why they were made. These are
-  sometimes called architecture decision records elsewhere, but no formal ADR
-  vocabulary or process is required.
+  investigations, experiments, and useful conclusions from AI conversations. Notes
+  are working history: they may be incomplete, superseded, or wrong, and are not
+  authoritative.
+- `docs/decisions/` contains the small current set of significant decisions and why
+  they were made. Decisions should be shorter and easier to scan than notes.
 
 Add more specific areas such as `docs/designs/` or `docs/architecture/` only when
 the project has enough durable material to justify them. Do not create empty
@@ -45,6 +46,10 @@ Do not date-prefix everything. Dates distinguish historical notes and decisions
 from living descriptions. Use the date the note or decision was first recorded;
 ordinary revisions do not rename the file.
 
+Do not add status metadata to notes. Their date and location already communicate
+that they are historical working material. Do not maintain a README that lists each
+note or decision; browse the directories directly.
+
 ## Write for human readers
 
 Lead with the point. Preserve the result of the thinking rather than its chronology.
@@ -67,6 +72,11 @@ preferences, and open questions when the distinction matters.
 For AI-assisted investigations, synthesize a durable note. Do not save a raw chat
 transcript unless the exact exchange is itself important evidence. A human reader
 should understand the note without access to the original conversation.
+
+Keep a decision focused on the decision, its essential reasoning, and important
+consequences. Link to a note for deeper investigation rather than copying the note
+into the decision. Keep only current decisions in `docs/decisions/`. When one is
+superseded, replace or remove it in the same change; Git retains the old decision.
 
 ## Keep architecture visible
 
@@ -102,7 +112,7 @@ Read relevant code and nearby documents before writing. Update an existing docum
 instead of creating a competing account when they cover the same subject. Link to
 code, issues, plans, notes, or decisions when the link saves meaningful rediscovery.
 
-Treat Git as the history. Keep documents about the project as it is understood now,
-except where a historical decision or investigation is intentionally being
-preserved. When implementation changes make durable documentation untrue, update the
-documentation in the same change.
+Treat Git as the history. Notes may preserve historical investigation, while plans,
+decisions, and durable project documentation should reflect current intent. When
+implementation changes make durable documentation untrue, update the documentation
+in the same change.
