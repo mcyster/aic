@@ -9,9 +9,10 @@ use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
 pub(crate) use event::{
-    AssistantResponse, ConversationEvent, ConversationEventKind, ConversationRecordKind,
-    DriverEventEnvelope, InvalidAssistantResponse, InvalidModelCommunication, ModelCommunication,
-    ModelEvent, ModelEventImportance, TurnOutcome, UserContent,
+    AssistantResponse, ConversationEvent, ConversationEventError, ConversationEventExtension,
+    ConversationEventKind, ConversationEventRecord, DriverEventEnvelope, InvalidAssistantResponse,
+    InvalidModelCommunication, ModelCommunication, ModelEvent, ModelEventImportance,
+    StoredConversationEventKind, TurnOutcome, UserContent,
 };
 pub(crate) use id::{
     ConversationCommandId, ConversationEventId, ConversationId, ConversationTurnId,
@@ -26,11 +27,13 @@ pub(crate) use problem::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Conversation {
     id: ConversationId,
-    events: Vec<ConversationEvent>,
+    events: Vec<ConversationEventRecord>,
 }
 
 impl Conversation {
-    pub(crate) fn from_events(events: Vec<ConversationEvent>) -> Result<Self, InvalidConversation> {
+    pub(crate) fn from_events(
+        events: Vec<ConversationEventRecord>,
+    ) -> Result<Self, InvalidConversation> {
         let conversation_id = events
             .first()
             .map(|event| event.conversation_id)
@@ -75,7 +78,7 @@ impl Conversation {
         self.id
     }
 
-    pub(crate) fn events(&self) -> &[ConversationEvent] {
+    pub(crate) fn events(&self) -> &[ConversationEventRecord] {
         &self.events
     }
 }
@@ -167,19 +170,19 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{
-        Conversation, ConversationCommandId, ConversationEvent, ConversationEventId,
-        ConversationEventKind, ConversationId, ConversationRecordKind, ConversationTurnId,
-        InvalidConversation, InvalidUserPrompt, UserContent, UserPrompt,
+        Conversation, ConversationCommandId, ConversationEventId, ConversationEventKind,
+        ConversationEventRecord, ConversationId, ConversationTurnId, InvalidConversation,
+        InvalidUserPrompt, StoredConversationEventKind, UserContent, UserPrompt,
     };
 
-    fn user_event(conversation_id: ConversationId, position: u64) -> ConversationEvent {
-        ConversationEvent {
+    fn user_event(conversation_id: ConversationId, position: u64) -> ConversationEventRecord {
+        ConversationEventRecord {
             conversation_id,
             position,
             id: ConversationEventId::new(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
             schema_version: 7,
-            kind: ConversationRecordKind::Event(ConversationEventKind::User {
+            kind: StoredConversationEventKind::Shared(ConversationEventKind::User {
                 caused_by: Some(ConversationCommandId::new()),
                 content: vec![UserContent::Text(format!("event {position}"))],
             }),
@@ -264,7 +267,7 @@ mod tests {
     fn conversation_rejects_invalid_deserialized_model_events() {
         let conversation_id = ConversationId::new();
         let event_id = ConversationEventId::new();
-        let conversation_event: ConversationEvent = serde_json::from_value(json!({
+        let conversation_event: ConversationEventRecord = serde_json::from_value(json!({
             "conversation_id": conversation_id,
             "position": 0,
             "id": event_id,
@@ -296,7 +299,7 @@ mod tests {
     fn conversation_rejects_invalid_deserialized_model_communications() {
         let conversation_id = ConversationId::new();
         let event_id = ConversationEventId::new();
-        let conversation_event: ConversationEvent = serde_json::from_value(json!({
+        let conversation_event: ConversationEventRecord = serde_json::from_value(json!({
             "conversation_id": conversation_id,
             "position": 0,
             "id": event_id,
@@ -332,7 +335,7 @@ mod tests {
     fn conversation_rejects_invalid_deserialized_model_problems() {
         let conversation_id = ConversationId::new();
         let event_id = ConversationEventId::new();
-        let conversation_event: ConversationEvent = serde_json::from_value(json!({
+        let conversation_event: ConversationEventRecord = serde_json::from_value(json!({
             "conversation_id": conversation_id,
             "position": 0,
             "id": event_id,
@@ -370,7 +373,7 @@ mod tests {
     fn conversation_rejects_empty_deserialized_model_data() {
         let conversation_id = ConversationId::new();
         let event_id = ConversationEventId::new();
-        let conversation_event: ConversationEvent = serde_json::from_value(json!({
+        let conversation_event: ConversationEventRecord = serde_json::from_value(json!({
             "conversation_id": conversation_id,
             "position": 0,
             "id": event_id,
@@ -403,7 +406,7 @@ mod tests {
     fn conversation_loads_problem_events_from_earlier_schema_versions() {
         let conversation_id = ConversationId::new();
         let event_id = ConversationEventId::new();
-        let conversation_event: ConversationEvent = serde_json::from_value(json!({
+        let conversation_event: ConversationEventRecord = serde_json::from_value(json!({
             "conversation_id": conversation_id,
             "position": 0,
             "id": event_id,
@@ -429,7 +432,7 @@ mod tests {
 
         assert!(matches!(
             conversation.events()[0].kind,
-            ConversationRecordKind::Event(ConversationEventKind::Problem { .. })
+            StoredConversationEventKind::Shared(ConversationEventKind::Problem { .. })
         ));
     }
 

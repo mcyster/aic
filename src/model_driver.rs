@@ -5,26 +5,18 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 
 use crate::conversation::{
-    Conversation, ConversationEventKind, ConversationTurnId, DriverEventEnvelope, ModelSource,
+    Conversation, ConversationEvent, ConversationEventExtension, ConversationTurnId,
+    DriverEventEnvelope, ModelSource,
 };
 
-pub(crate) type ModelOutputStream = BoxStream<'static, Result<ModelDriverOutput, ModelDriverError>>;
-
-pub(crate) enum ModelDriverOutput {
-    Event(ConversationEventKind),
-    Driver(Box<dyn DriverEvent>),
-}
-
-pub(crate) trait DriverEvent: Send {
-    fn to_envelope(&self) -> Result<DriverEventEnvelope, ModelDriverError>;
-}
+pub(crate) type ModelOutputStream = BoxStream<'static, Result<ConversationEvent, ModelDriverError>>;
 
 #[allow(dead_code)]
 pub(crate) trait DriverEventDecoder {
     fn decode_event(
         &self,
         envelope: &DriverEventEnvelope,
-    ) -> Result<Box<dyn DriverEvent>, DriverEventDecodeError>;
+    ) -> Result<Box<dyn ConversationEventExtension>, DriverEventDecodeError>;
 }
 
 pub(crate) trait ModelDriver: DriverEventDecoder {

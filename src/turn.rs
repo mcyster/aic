@@ -3,11 +3,11 @@ use std::error::Error;
 use futures_util::StreamExt;
 
 use crate::conversation::{
-    ConversationCommandId, ConversationEventKind, ConversationId, ConversationProblem,
-    ConversationTurnId, InvalidConversationProblem, InvocationError, ModelDetails, ModelSource,
-    UserContent, UserPrompt,
+    ConversationCommandId, ConversationEvent, ConversationEventKind, ConversationId,
+    ConversationProblem, ConversationTurnId, InvalidConversationProblem, InvocationError,
+    ModelDetails, ModelSource, UserContent, UserPrompt,
 };
-use crate::model_driver::{ModelDriver, ModelDriverError, ModelDriverOutput};
+use crate::model_driver::{ModelDriver, ModelDriverError};
 use crate::persistence::EventStore;
 
 pub(crate) type TurnResultValue<T> = Result<T, Box<dyn Error>>;
@@ -53,17 +53,17 @@ impl TurnService {
         let user_message_command_id = ConversationCommandId::new();
         self.event_store.append_new_conversation_event(
             conversation_id,
-            ConversationEventKind::UserMessageRequested {
+            ConversationEvent::Shared(ConversationEventKind::UserMessageRequested {
                 command_id: user_message_command_id,
                 content: user_content.clone(),
-            },
+            }),
         )?;
         self.event_store.append_new_conversation_event(
             conversation_id,
-            ConversationEventKind::User {
+            ConversationEvent::Shared(ConversationEventKind::User {
                 caused_by: Some(user_message_command_id),
                 content: user_content,
-            },
+            }),
         )?;
         conversation_identified(conversation_id);
 
@@ -71,11 +71,11 @@ impl TurnService {
         let turn_id = ConversationTurnId::new();
         self.event_store.append_new_conversation_event(
             conversation_id,
-            ConversationEventKind::TurnRequested {
+            ConversationEvent::Shared(ConversationEventKind::TurnRequested {
                 command_id: ConversationCommandId::new(),
                 turn_id,
                 model: source.clone(),
-            },
+            }),
         )?;
         let conversation = self.event_store.load_conversation(conversation_id)?;
         report_progress(TurnProgress::InvocationStarted {
@@ -117,17 +117,19 @@ impl TurnService {
                 )));
             }
             match driver_output {
-                ModelDriverOutput::Driver(event) => {
-                    self.event_store
-                        .append_driver_event(conversation_id, event.as_ref())?;
+                ConversationEvent::Extension(event) => {
+                    self.event_store.append_new_conversation_event(
+                        conversation_id,
+                        ConversationEvent::Extension(event),
+                    )?;
                 }
-                ModelDriverOutput::Event(conversation_kind) => match &conversation_kind {
+                ConversationEvent::Shared(conversation_kind) => match &conversation_kind {
                     ConversationEventKind::Assistant { .. }
                     | ConversationEventKind::Communication { .. } => {
                         ensure_event_belongs_to_turn(&conversation_kind, turn_id)?;
                         self.event_store.append_new_conversation_event(
                             conversation_id,
-                            conversation_kind.clone(),
+                            ConversationEvent::Shared(conversation_kind.clone()),
                         )?;
                         report_progress(TurnProgress::EventCompleted {
                             event: conversation_kind,
@@ -136,8 +138,10 @@ impl TurnService {
                     ConversationEventKind::Problem { problem, .. } => {
                         ensure_event_belongs_to_turn(&conversation_kind, turn_id)?;
                         let problem = problem.clone();
-                        self.event_store
-                            .append_new_conversation_event(conversation_id, conversation_kind)?;
+                        self.event_store.append_new_conversation_event(
+                            conversation_id,
+                            ConversationEvent::Shared(conversation_kind),
+                        )?;
                         report_progress(TurnProgress::ProblemCompleted { problem })?;
                     }
                     ConversationEventKind::TurnCompleted { .. } => {
@@ -149,8 +153,10 @@ impl TurnService {
                             return Err(Box::new(error));
                         }
                         turn_completed = true;
-                        self.event_store
-                            .append_new_conversation_event(conversation_id, conversation_kind)?;
+                        self.event_store.append_new_conversation_event(
+                            conversation_id,
+                            ConversationEvent::Shared(conversation_kind),
+                        )?;
                     }
                     _ => {
                         let error = ModelDriverError::InvalidResponse(
@@ -195,12 +201,12 @@ impl TurnService {
         let model = ModelDetails::new(source.clone(), None)?;
         self.event_store.append_new_conversation_event(
             conversation_id,
-            ConversationEventKind::Problem {
+            ConversationEvent::Shared(ConversationEventKind::Problem {
                 turn_id: Some(turn_id),
                 invocation_id: None,
                 model: Some(model),
                 problem,
-            },
+            }),
         )?;
         Ok(())
     }
@@ -292,14 +298,15 @@ mod tests {
 
     use super::{TurnRequest, TurnService};
     use crate::conversation::{
-        AssistantResponse, Conversation, ConversationEventKind, ConversationId,
-        ConversationProblem, ConversationRecordKind, ConversationTurnId, DriverEventEnvelope,
-        InvocationError, ModelCommunication, ModelDetails, ModelEventImportance, ModelId,
-        ModelInvocationId, ModelIssue, ModelSource, ProviderId, TurnOutcome, UserPrompt,
+        AssistantResponse, Conversation, ConversationEvent, ConversationEventError,
+        ConversationEventExtension, ConversationEventKind, ConversationEventRecord, ConversationId,
+        ConversationProblem, ConversationTurnId, DriverEventEnvelope, InvocationError,
+        ModelCommunication, ModelDetails, ModelEventImportance, ModelId, ModelInvocationId,
+        ModelIssue, ModelSource, ProviderId, StoredConversationEventKind, TurnOutcome, UserPrompt,
     };
     use crate::model_driver::{
-        DriverEvent, DriverEventDecodeError, DriverEventDecoder, ModelDriver, ModelDriverError,
-        ModelDriverOutput, ModelOutputStream,
+        DriverEventDecodeError, DriverEventDecoder, ModelDriver, ModelDriverError,
+        ModelOutputStream,
     };
     use crate::persistence::EventStore;
 
@@ -321,26 +328,38 @@ mod tests {
         turn_id: ConversationTurnId,
     }
 
-    impl DriverEvent for TestInvocationRequested {
-        fn to_envelope(&self) -> Result<DriverEventEnvelope, ModelDriverError> {
-            DriverEventEnvelope::new(
-                "test".to_owned(),
-                "1".to_owned(),
-                "model_invocation_requested".to_owned(),
-                1,
-                "Test model invocation was requested.".to_owned(),
-                serde_json::json!({
-                    "invocation_id": self.invocation_id,
-                    "turn_id": self.turn_id,
-                }),
-            )
-            .map_err(|error| ModelDriverError::InvalidResponse(error.to_string()))
+    impl ConversationEventExtension for TestInvocationRequested {
+        fn driver_name(&self) -> &str {
+            "test"
+        }
+
+        fn driver_version(&self) -> &str {
+            "1"
+        }
+
+        fn event_type(&self) -> &str {
+            "model_invocation_requested"
+        }
+
+        fn event_schema_version(&self) -> u32 {
+            1
+        }
+
+        fn description(&self) -> &str {
+            "Test model invocation was requested."
+        }
+
+        fn serialize_payload(&self) -> Result<serde_json::Value, ConversationEventError> {
+            Ok(serde_json::json!({
+                "invocation_id": self.invocation_id,
+                "turn_id": self.turn_id,
+            }))
         }
     }
 
     fn unsupported_event(
         _event: &DriverEventEnvelope,
-    ) -> Result<Box<dyn DriverEvent>, DriverEventDecodeError> {
+    ) -> Result<Box<dyn ConversationEventExtension>, DriverEventDecodeError> {
         Err(DriverEventDecodeError::UnsupportedDriver)
     }
 
@@ -363,12 +382,13 @@ mod tests {
                 .lock()
                 .expect("the invocation list should lock")
                 .push((turn_id, invocation_id));
-            let mut outputs = vec![Ok(ModelDriverOutput::Driver(
-                Box::new(TestInvocationRequested {
+            let mut outputs = vec![Ok(ConversationEvent::Extension(Box::new(
+                TestInvocationRequested {
                     invocation_id,
                     turn_id,
-                }) as Box<dyn DriverEvent>,
-            ))];
+                },
+            )
+                as Box<dyn ConversationEventExtension>))];
             let semantic_outputs = self
                 .outputs
                 .iter()
@@ -386,9 +406,9 @@ mod tests {
             outputs.extend(
                 semantic_outputs
                     .into_iter()
-                    .map(|output| Ok(ModelDriverOutput::Event(output))),
+                    .map(|output| Ok(ConversationEvent::Shared(output))),
             );
-            outputs.push(Ok(ModelDriverOutput::Event(
+            outputs.push(Ok(ConversationEvent::Shared(
                 ConversationEventKind::TurnCompleted {
                     turn_id,
                     outcome: turn_outcome,
@@ -402,7 +422,7 @@ mod tests {
         fn decode_event(
             &self,
             event: &DriverEventEnvelope,
-        ) -> Result<Box<dyn DriverEvent>, DriverEventDecodeError> {
+        ) -> Result<Box<dyn ConversationEventExtension>, DriverEventDecodeError> {
             unsupported_event(event)
         }
     }
@@ -429,7 +449,7 @@ mod tests {
         fn decode_event(
             &self,
             event: &DriverEventEnvelope,
-        ) -> Result<Box<dyn DriverEvent>, DriverEventDecodeError> {
+        ) -> Result<Box<dyn ConversationEventExtension>, DriverEventDecodeError> {
             unsupported_event(event)
         }
     }
@@ -452,7 +472,7 @@ mod tests {
             let invocation_id = ModelInvocationId::new();
             async move {
                 Ok(stream::iter(vec![
-                    Ok(ModelDriverOutput::Event(assistant_kind(
+                    Ok(ConversationEvent::Shared(assistant_kind(
                         "Completed answer",
                         &source,
                         turn_id,
@@ -470,7 +490,7 @@ mod tests {
         fn decode_event(
             &self,
             event: &DriverEventEnvelope,
-        ) -> Result<Box<dyn DriverEvent>, DriverEventDecodeError> {
+        ) -> Result<Box<dyn ConversationEventExtension>, DriverEventDecodeError> {
             unsupported_event(event)
         }
     }
@@ -548,8 +568,8 @@ mod tests {
         .expect("the event store should be created")
     }
 
-    fn event_kind(event: &crate::conversation::ConversationEvent) -> &ConversationEventKind {
-        let ConversationRecordKind::Event(kind) = &event.kind else {
+    fn event_kind(event: &ConversationEventRecord) -> &ConversationEventKind {
+        let StoredConversationEventKind::Shared(kind) = &event.kind else {
             panic!("the record should be a conversation event");
         };
         kind
@@ -592,7 +612,7 @@ mod tests {
         assert_eq!(log.len(), 7);
         assert!(matches!(
             &log[0].kind,
-            ConversationRecordKind::Event(kind) if kind.is_command()
+            StoredConversationEventKind::Shared(kind) if kind.is_command()
         ));
         assert!(matches!(
             event_kind(&log[1]),
@@ -602,7 +622,10 @@ mod tests {
             event_kind(&log[2]),
             ConversationEventKind::TurnRequested { .. }
         ));
-        assert!(matches!(log[3].kind, ConversationRecordKind::Driver(_)));
+        assert!(matches!(
+            log[3].kind,
+            StoredConversationEventKind::Extension(_)
+        ));
         assert!(matches!(
             event_kind(&log[4]),
             ConversationEventKind::Communication { .. }

@@ -14,7 +14,7 @@ use super::{
 pub(crate) const SCHEMA_VERSION: u32 = 11;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct ConversationEvent {
+pub(crate) struct ConversationEventRecord {
     pub(crate) conversation_id: ConversationId,
     pub(crate) position: u64,
     pub(crate) id: ConversationEventId,
@@ -22,10 +22,10 @@ pub(crate) struct ConversationEvent {
     pub(crate) timestamp: OffsetDateTime,
     pub(crate) schema_version: u32,
     #[serde(flatten)]
-    pub(crate) kind: ConversationRecordKind,
+    pub(crate) kind: StoredConversationEventKind,
 }
 
-impl ConversationEvent {
+impl ConversationEventRecord {
     pub(crate) fn new(
         conversation_id: ConversationId,
         position: u64,
@@ -37,7 +37,7 @@ impl ConversationEvent {
             id: ConversationEventId::new(),
             timestamp: OffsetDateTime::now_utc(),
             schema_version: SCHEMA_VERSION,
-            kind: ConversationRecordKind::Event(kind),
+            kind: StoredConversationEventKind::Shared(kind),
         }
     }
 
@@ -52,7 +52,7 @@ impl ConversationEvent {
             id: ConversationEventId::new(),
             timestamp: OffsetDateTime::now_utc(),
             schema_version: SCHEMA_VERSION,
-            kind: ConversationRecordKind::Driver(event),
+            kind: StoredConversationEventKind::Extension(event),
         }
     }
 
@@ -61,18 +61,69 @@ impl ConversationEvent {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(untagged)]
-pub(crate) enum ConversationRecordKind {
-    Event(ConversationEventKind),
-    Driver(DriverEventEnvelope),
+pub(crate) enum ConversationEvent {
+    Shared(ConversationEventKind),
+    Extension(Box<dyn ConversationEventExtension>),
 }
 
-impl ConversationRecordKind {
+pub(crate) trait ConversationEventExtension: Send {
+    fn driver_name(&self) -> &str;
+
+    fn driver_version(&self) -> &str;
+
+    fn event_type(&self) -> &str;
+
+    fn event_schema_version(&self) -> u32;
+
+    fn description(&self) -> &str;
+
+    fn serialize_payload(&self) -> Result<Value, ConversationEventError>;
+
+    fn to_envelope(&self) -> Result<DriverEventEnvelope, ConversationEventError> {
+        DriverEventEnvelope::new(
+            self.driver_name().to_owned(),
+            self.driver_version().to_owned(),
+            self.event_type().to_owned(),
+            self.event_schema_version(),
+            self.description().to_owned(),
+            self.serialize_payload()?,
+        )
+        .map_err(ConversationEventError::InvalidEnvelope)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ConversationEventError {
+    InvalidEnvelope(InvalidDriverEventEnvelope),
+    Serialization(String),
+}
+
+impl Display for ConversationEventError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidEnvelope(error) => Display::fmt(error, formatter),
+            Self::Serialization(message) => write!(
+                formatter,
+                "conversation event serialization failed: {message}"
+            ),
+        }
+    }
+}
+
+impl Error for ConversationEventError {}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum StoredConversationEventKind {
+    Shared(ConversationEventKind),
+    Extension(DriverEventEnvelope),
+}
+
+impl StoredConversationEventKind {
     pub(super) fn ensure_valid(&self) -> Result<(), InvalidConversationEventKind> {
         match self {
-            Self::Event(event) => event.ensure_valid(),
-            Self::Driver(event) => event
+            Self::Shared(event) => event.ensure_valid(),
+            Self::Extension(event) => event
                 .ensure_valid()
                 .map_err(InvalidConversationEventKind::DriverEvent),
         }

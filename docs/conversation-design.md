@@ -666,22 +666,22 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 
 type ModelOutputStream =
-    BoxStream<'static, Result<ModelDriverOutput, ModelDriverError>>;
+    BoxStream<'static, Result<ConversationEvent, ModelDriverError>>;
 
-enum ModelDriverOutput {
-    Event(ConversationEventKind),
-    Driver(Box<dyn DriverEvent>),
-}
-
-trait DriverEvent: Send {
-    fn to_envelope(&self) -> Result<DriverEventEnvelope, ModelDriverError>;
+trait ConversationEventExtension: Send {
+    fn driver_name(&self) -> &str;
+    fn driver_version(&self) -> &str;
+    fn event_type(&self) -> &str;
+    fn event_schema_version(&self) -> u32;
+    fn description(&self) -> &str;
+    fn serialize_payload(&self) -> Result<Value, ConversationEventError>;
 }
 
 trait DriverEventDecoder {
     fn decode_event(
         &self,
         envelope: &DriverEventEnvelope,
-    ) -> Result<Box<dyn DriverEvent>, DriverEventDecodeError>;
+    ) -> Result<Box<dyn ConversationEventExtension>, DriverEventDecodeError>;
 }
 
 trait ModelDriver: DriverEventDecoder {
@@ -698,7 +698,7 @@ trait ModelDriver: DriverEventDecoder {
 }
 ```
 
-This is conceptually `Future<Stream<ModelDriverOutput>>`, or `Mono<Flux<ModelDriverOutput>>` in Reactor terminology. The caller supplies only the immutable conversation and turn identity. The driver creates invocation identities, driver events, and invocation-specific data. Shared semantic events remain concrete and portable. Driver output is appended through the shared record boundary.
+This is conceptually `Future<Stream<ConversationEvent>>`, or `Mono<Flux<ConversationEvent>>` in Reactor terminology. The caller supplies only the immutable conversation and turn identity. The driver creates invocation identities, driver events, and invocation-specific data. Shared semantic events remain concrete and portable. Every output is a conversation event and is appended through the shared record boundary.
 
 The important Phase 1 properties are:
 
@@ -706,7 +706,7 @@ The important Phase 1 properties are:
 - input is a complete immutable conversation reconstructed from conversation events
 - the driver owns and exposes its stable provider/model source
 - invocation is asynchronous and stream-first
-- the stream yields driver-defined records, portable semantic event kinds, and an explicit `TurnCompleted`
+- the stream yields driver-defined records, portable semantic events, and an explicit `TurnCompleted`
 - the consumer controls demand by polling for the next event
 - the caller owns the outer model/tool loop and turn request
 - the driver owns invocation identities and invocation-specific records
@@ -759,7 +759,7 @@ This supersedes the previous batch contract, which returned all model events onl
 An established invocation yields typed driver records and semantic facts incrementally:
 
 ```rust
-Result<ModelDriverOutput, ModelDriverError>
+Result<ConversationEvent, ModelDriverError>
 ```
 
 This supports assistant responses, auxiliary communications, model-reported problems, driver-defined invocation events, and explicit turn completion. The append boundary owns durable envelope construction. Stored driver envelopes remain opaque when their decoder is unavailable. Stream polling supplies demand and natural backpressure at this boundary. Stream exhaustion without `TurnCompleted` is incomplete execution, not success.

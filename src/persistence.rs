@@ -9,9 +9,9 @@ use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 use crate::conversation::{
-    Conversation, ConversationEvent, ConversationEventKind, ConversationId, ConversationRecordKind,
+    Conversation, ConversationEvent, ConversationEventRecord, ConversationId,
+    StoredConversationEventKind,
 };
-use crate::model_driver::DriverEvent;
 
 pub(crate) struct EventStore {
     root_directory: PathBuf,
@@ -49,11 +49,12 @@ impl EventStore {
             .load_conversation_log(conversation_id)?
             .into_iter()
             .filter_map(|mut event| match event.kind {
-                ConversationRecordKind::Event(kind) if !kind.is_command() => {
-                    event.kind = ConversationRecordKind::Event(kind);
+                StoredConversationEventKind::Shared(kind) if !kind.is_command() => {
+                    event.kind = StoredConversationEventKind::Shared(kind);
                     Some(event)
                 }
-                ConversationRecordKind::Event(_) | ConversationRecordKind::Driver(_) => None,
+                StoredConversationEventKind::Shared(_)
+                | StoredConversationEventKind::Extension(_) => None,
             })
             .collect();
         let conversation = Conversation::from_events(events).map_err(invalid_conversation_data)?;
@@ -69,32 +70,30 @@ impl EventStore {
     pub(crate) fn load_conversation_log(
         &self,
         conversation_id: ConversationId,
-    ) -> io::Result<Vec<ConversationEvent>> {
+    ) -> io::Result<Vec<ConversationEventRecord>> {
         self.load_conversation_events(conversation_id)
     }
 
     pub(crate) fn append_new_conversation_event(
         &self,
         conversation_id: ConversationId,
-        kind: ConversationEventKind,
-    ) -> io::Result<ConversationEvent> {
-        self.append_new_record(conversation_id, ConversationRecordKind::Event(kind))
-    }
-
-    pub(crate) fn append_driver_event(
-        &self,
-        conversation_id: ConversationId,
-        event: &dyn DriverEvent,
-    ) -> io::Result<ConversationEvent> {
-        let envelope = event.to_envelope().map_err(io::Error::other)?;
-        self.append_new_record(conversation_id, ConversationRecordKind::Driver(envelope))
+        event: ConversationEvent,
+    ) -> io::Result<ConversationEventRecord> {
+        let kind = match event {
+            ConversationEvent::Shared(kind) => StoredConversationEventKind::Shared(kind),
+            ConversationEvent::Extension(event) => event
+                .to_envelope()
+                .map(StoredConversationEventKind::Extension)
+                .map_err(io::Error::other)?,
+        };
+        self.append_new_record(conversation_id, kind)
     }
 
     fn append_new_record(
         &self,
         conversation_id: ConversationId,
-        kind: ConversationRecordKind,
-    ) -> io::Result<ConversationEvent> {
+        kind: StoredConversationEventKind,
+    ) -> io::Result<ConversationEventRecord> {
         let conversation_directory = self.conversation_directory(conversation_id);
         create_private_directory(&conversation_directory)?;
         let events_directory = conversation_directory.join("events");
@@ -114,10 +113,12 @@ impl EventStore {
             conversation.events().last().map(|event| event.position)
         };
         let conversation_event = match kind {
-            ConversationRecordKind::Event(kind) => {
-                ConversationEvent::new(conversation_id, next_position(previous_position)?, kind)
-            }
-            ConversationRecordKind::Driver(event) => ConversationEvent::new_driver(
+            StoredConversationEventKind::Shared(kind) => ConversationEventRecord::new(
+                conversation_id,
+                next_position(previous_position)?,
+                kind,
+            ),
+            StoredConversationEventKind::Extension(event) => ConversationEventRecord::new_driver(
                 conversation_id,
                 next_position(previous_position)?,
                 event,
@@ -137,10 +138,10 @@ impl EventStore {
     fn load_conversation_events(
         &self,
         conversation_id: ConversationId,
-    ) -> io::Result<Vec<ConversationEvent>> {
+    ) -> io::Result<Vec<ConversationEventRecord>> {
         let mut events =
             read_json_directory(&self.conversation_directory(conversation_id).join("events"))?;
-        events.sort_by_key(|event: &ConversationEvent| event.position);
+        events.sort_by_key(|event: &ConversationEventRecord| event.position);
         Ok(events)
     }
 
@@ -218,9 +219,9 @@ mod tests {
 
     use super::EventStore;
     use crate::conversation::{
-        AssistantResponse, ConversationCommandId, ConversationEventKind, ConversationId,
-        ConversationTurnId, ModelData, ModelDetails, ModelId, ModelInvocationId, ModelSource,
-        ProviderId, UserContent,
+        AssistantResponse, ConversationCommandId, ConversationEvent, ConversationEventKind,
+        ConversationId, ConversationTurnId, ModelData, ModelDetails, ModelId, ModelInvocationId,
+        ModelSource, ProviderId, UserContent,
     };
 
     fn temporary_store() -> EventStore {
@@ -236,19 +237,19 @@ mod tests {
         let first_event = store
             .append_new_conversation_event(
                 conversation_id,
-                ConversationEventKind::User {
+                ConversationEvent::Shared(ConversationEventKind::User {
                     caused_by: Some(ConversationCommandId::new()),
                     content: vec![UserContent::Text("first".to_owned())],
-                },
+                }),
             )
             .expect("the first event should be persisted");
         let second_event = store
             .append_new_conversation_event(
                 conversation_id,
-                ConversationEventKind::User {
+                ConversationEvent::Shared(ConversationEventKind::User {
                     caused_by: Some(ConversationCommandId::new()),
                     content: vec![UserContent::Text("second".to_owned())],
-                },
+                }),
             )
             .expect("the second event should be persisted");
 
@@ -298,14 +299,14 @@ mod tests {
         let model_event = store
             .append_new_conversation_event(
                 conversation_id,
-                ConversationEventKind::Assistant {
+                ConversationEvent::Shared(ConversationEventKind::Assistant {
                     turn_id: ConversationTurnId::new(),
                     invocation_id: ModelInvocationId::new(),
                     model: ModelDetails::new(source, Some(model_data))
                         .expect("the model details should be valid"),
                     response: AssistantResponse::new("The answer is 42.".to_owned())
                         .expect("the assistant response should be valid"),
-                },
+                }),
             )
             .expect("the model event should be persisted");
 
