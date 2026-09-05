@@ -10,9 +10,9 @@ use std::str::FromStr;
 
 pub(crate) use event::{
     AssistantResponse, ConversationEvent, ConversationEventError, ConversationEventExtension,
-    ConversationEventKind, ConversationEventRecord, DriverEventEnvelope, InvalidAssistantResponse,
-    InvalidModelCommunication, ModelCommunication, ModelEvent, ModelEventImportance,
-    StoredConversationEventKind, TurnOutcome, UserContent,
+    ConversationEventKind, ConversationEventRecord, DriverEventEnvelope, DriverEventReadError,
+    DriverEventReader, InvalidAssistantResponse, InvalidModelCommunication, ModelCommunication,
+    ModelEvent, ModelEventImportance, StoredConversationEventKind, TurnOutcome, UserContent,
 };
 pub(crate) use id::{
     ConversationCommandId, ConversationEventId, ConversationId, ConversationTurnId,

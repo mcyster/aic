@@ -4,8 +4,7 @@ use futures_util::StreamExt;
 
 use crate::conversation::{
     ConversationCommandId, ConversationEvent, ConversationEventKind, ConversationId,
-    ConversationProblem, ConversationTurnId, InvalidConversationProblem, InvocationError,
-    ModelDetails, ModelSource, UserContent, UserPrompt,
+    ConversationProblem, ConversationTurnId, UserContent, UserPrompt,
 };
 use crate::model_driver::{ModelDriver, ModelDriverError};
 use crate::persistence::EventStore;
@@ -84,35 +83,17 @@ impl TurnService {
 
         let mut conversation_events = match self.model_driver.invoke(&conversation, turn_id).await {
             Ok(conversation_events) => conversation_events,
-            Err(error) => {
-                self.append_invocation_problem(
-                    conversation_id,
-                    turn_id,
-                    &source,
-                    &error,
-                    InvocationStage::BeforeStream,
-                )?;
-                return Err(Box::new(error));
-            }
+            Err(error) => return Err(Box::new(error)),
         };
 
         let mut turn_completed = false;
         while let Some(conversation_event) = conversation_events.next().await {
             let driver_output = match conversation_event {
                 Ok(driver_output) => driver_output,
-                Err(error) => {
-                    self.append_invocation_problem(
-                        conversation_id,
-                        turn_id,
-                        &source,
-                        &error,
-                        InvocationStage::DuringStream,
-                    )?;
-                    return Err(Box::new(error));
-                }
+                Err(error) => return Err(Box::new(error)),
             };
             if turn_completed {
-                return Err(Box::new(ModelDriverError::InvalidResponse(
+                return Err(Box::new(ModelDriverError::InvalidOutput(
                     "the model driver emitted output after completing the turn".to_owned(),
                 )));
             }
@@ -147,7 +128,7 @@ impl TurnService {
                     ConversationEventKind::TurnCompleted { .. } => {
                         ensure_event_belongs_to_turn(&conversation_kind, turn_id)?;
                         if turn_completed {
-                            let error = ModelDriverError::InvalidResponse(
+                            let error = ModelDriverError::InvalidOutput(
                                 "the model driver completed the turn more than once".to_owned(),
                             );
                             return Err(Box::new(error));
@@ -159,16 +140,9 @@ impl TurnService {
                         )?;
                     }
                     _ => {
-                        let error = ModelDriverError::InvalidResponse(
+                        let error = ModelDriverError::InvalidOutput(
                             "the model driver returned an invalid conversation event".to_owned(),
                         );
-                        self.append_invocation_problem(
-                            conversation_id,
-                            turn_id,
-                            &source,
-                            &error,
-                            InvocationStage::DuringStream,
-                        )?;
                         return Err(Box::new(error));
                     }
                 },
@@ -176,84 +150,10 @@ impl TurnService {
         }
 
         if !turn_completed {
-            let error = ModelDriverError::IncompleteTurn;
-            self.append_invocation_problem(
-                conversation_id,
-                turn_id,
-                &source,
-                &error,
-                InvocationStage::DuringStream,
-            )?;
-            return Err(Box::new(error));
+            return Err(Box::new(ModelDriverError::IncompleteTurn));
         }
         Ok(())
     }
-
-    fn append_invocation_problem(
-        &self,
-        conversation_id: ConversationId,
-        turn_id: ConversationTurnId,
-        source: &ModelSource,
-        error: &ModelDriverError,
-        stage: InvocationStage,
-    ) -> TurnResultValue<()> {
-        let problem = invocation_problem(error, stage)?;
-        let model = ModelDetails::new(source.clone(), None)?;
-        self.event_store.append_new_conversation_event(
-            conversation_id,
-            ConversationEvent::Shared(ConversationEventKind::Problem {
-                turn_id: Some(turn_id),
-                invocation_id: None,
-                model: Some(model),
-                problem,
-            }),
-        )?;
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy)]
-enum InvocationStage {
-    BeforeStream,
-    DuringStream,
-}
-
-fn invocation_problem(
-    error: &ModelDriverError,
-    stage: InvocationStage,
-) -> Result<ConversationProblem, InvalidConversationProblem> {
-    let invocation_error = match error {
-        ModelDriverError::Authentication(_) => InvocationError::try_authentication(
-            "The model provider could not authenticate the invocation.".to_owned(),
-        )?,
-        ModelDriverError::RateLimited(_) => InvocationError::try_rate_limited(
-            "The model provider rate-limited the invocation.".to_owned(),
-        )?,
-        ModelDriverError::Transport(_) if matches!(stage, InvocationStage::DuringStream) => {
-            InvocationError::try_stream_interrupted(
-                "The model response stream was interrupted.".to_owned(),
-            )?
-        }
-        ModelDriverError::Transport(_) => {
-            InvocationError::try_transport("The model provider could not be reached.".to_owned())?
-        }
-        ModelDriverError::InvalidRequest(_) => InvocationError::try_invalid_request(
-            "The model invocation request was invalid.".to_owned(),
-        )?,
-        ModelDriverError::InvalidResponse(_) => InvocationError::try_invalid_provider_response(
-            "The model provider returned an invalid response.".to_owned(),
-        )?,
-        ModelDriverError::StreamInterrupted(_) => InvocationError::try_stream_interrupted(
-            "The model response stream was interrupted.".to_owned(),
-        )?,
-        ModelDriverError::Provider(_) => InvocationError::try_provider_failure(
-            "The model provider failed the invocation.".to_owned(),
-        )?,
-        ModelDriverError::IncompleteTurn => InvocationError::try_provider_failure(
-            "The model provider did not complete the invocation.".to_owned(),
-        )?,
-    };
-    Ok(ConversationProblem::Invocation(invocation_error))
 }
 
 fn ensure_event_belongs_to_turn(
@@ -269,18 +169,18 @@ fn ensure_event_belongs_to_turn(
             ..
         } => *turn_id,
         ConversationEventKind::Problem { turn_id: None, .. } => {
-            return Err(ModelDriverError::InvalidResponse(
+            return Err(ModelDriverError::InvalidOutput(
                 "the model driver returned a problem without a turn".to_owned(),
             ));
         }
         _ => {
-            return Err(ModelDriverError::InvalidResponse(
+            return Err(ModelDriverError::InvalidOutput(
                 "the model driver returned an invalid conversation event".to_owned(),
             ));
         }
     };
     if actual_turn_id != expected_turn_id {
-        return Err(ModelDriverError::InvalidResponse(
+        return Err(ModelDriverError::InvalidOutput(
             "the model driver returned an event for another turn".to_owned(),
         ));
     }
@@ -297,17 +197,16 @@ mod tests {
     use futures_util::{FutureExt, StreamExt};
 
     use super::{TurnRequest, TurnService};
+    use crate::conversation::DriverEventReadError;
+    use crate::conversation::DriverEventReader;
     use crate::conversation::{
         AssistantResponse, Conversation, ConversationEvent, ConversationEventError,
         ConversationEventExtension, ConversationEventKind, ConversationEventRecord, ConversationId,
-        ConversationProblem, ConversationTurnId, DriverEventEnvelope, InvocationError,
-        ModelCommunication, ModelDetails, ModelEventImportance, ModelId, ModelInvocationId,
-        ModelIssue, ModelSource, ProviderId, StoredConversationEventKind, TurnOutcome, UserPrompt,
+        ConversationProblem, ConversationTurnId, DriverEventEnvelope, ModelCommunication,
+        ModelDetails, ModelEventImportance, ModelId, ModelInvocationId, ModelIssue, ModelSource,
+        ProviderId, StoredConversationEventKind, TurnOutcome, UserPrompt,
     };
-    use crate::model_driver::{
-        DriverEventDecodeError, DriverEventDecoder, ModelDriver, ModelDriverError,
-        ModelOutputStream,
-    };
+    use crate::model_driver::{ModelDriver, ModelDriverError, ModelOutputStream};
     use crate::persistence::EventStore;
 
     enum TestOutput {
@@ -357,10 +256,11 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn unsupported_event(
         _event: &DriverEventEnvelope,
-    ) -> Result<Box<dyn ConversationEventExtension>, DriverEventDecodeError> {
-        Err(DriverEventDecodeError::UnsupportedDriver)
+    ) -> Result<Box<dyn ConversationEventExtension>, DriverEventReadError> {
+        Err(DriverEventReadError::UnsupportedDriver)
     }
 
     impl ModelDriver for RecordingModelDriver {
@@ -418,11 +318,11 @@ mod tests {
         }
     }
 
-    impl DriverEventDecoder for RecordingModelDriver {
-        fn decode_event(
+    impl DriverEventReader for RecordingModelDriver {
+        fn read_event(
             &self,
             event: &DriverEventEnvelope,
-        ) -> Result<Box<dyn ConversationEventExtension>, DriverEventDecodeError> {
+        ) -> Result<Box<dyn ConversationEventExtension>, DriverEventReadError> {
             unsupported_event(event)
         }
     }
@@ -441,15 +341,15 @@ mod tests {
             _conversation: &'invoke Conversation,
             _turn_id: ConversationTurnId,
         ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
-            async { Err(ModelDriverError::Provider("failure".to_owned())) }.boxed()
+            async { Err(ModelDriverError::InvalidOutput("failure".to_owned())) }.boxed()
         }
     }
 
-    impl DriverEventDecoder for FailingModelDriver {
-        fn decode_event(
+    impl DriverEventReader for FailingModelDriver {
+        fn read_event(
             &self,
             event: &DriverEventEnvelope,
-        ) -> Result<Box<dyn ConversationEventExtension>, DriverEventDecodeError> {
+        ) -> Result<Box<dyn ConversationEventExtension>, DriverEventReadError> {
             unsupported_event(event)
         }
     }
@@ -478,7 +378,7 @@ mod tests {
                         turn_id,
                         invocation_id,
                     ))),
-                    Err(ModelDriverError::Transport("late failure".to_owned())),
+                    Err(ModelDriverError::InvalidOutput("late failure".to_owned())),
                 ])
                 .boxed())
             }
@@ -486,11 +386,11 @@ mod tests {
         }
     }
 
-    impl DriverEventDecoder for LateFailingModelDriver {
-        fn decode_event(
+    impl DriverEventReader for LateFailingModelDriver {
+        fn read_event(
             &self,
             event: &DriverEventEnvelope,
-        ) -> Result<Box<dyn ConversationEventExtension>, DriverEventDecodeError> {
+        ) -> Result<Box<dyn ConversationEventExtension>, DriverEventReadError> {
             unsupported_event(event)
         }
     }
@@ -660,7 +560,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_invocation_records_problem_without_completion() {
+    async fn interface_failure_does_not_synthesize_problem_or_completion() {
         let service = TurnService::new(
             new_store(),
             Box::new(FailingModelDriver {
@@ -683,14 +583,7 @@ mod tests {
             .event_store
             .load_conversation_log(conversation_id.expect("the conversation should be identified"))
             .expect("the log should load");
-        assert!(matches!(
-            event_kind(&log[3]),
-            ConversationEventKind::Problem {
-                problem: ConversationProblem::Invocation(InvocationError::ProviderFailure { .. }),
-                ..
-            }
-        ));
-        assert_eq!(log.len(), 4);
+        assert_eq!(log.len(), 3);
     }
 
     #[tokio::test]
@@ -762,10 +655,6 @@ mod tests {
             event_kind(&log[3]),
             ConversationEventKind::Assistant { .. }
         ));
-        assert!(matches!(
-            event_kind(&log[4]),
-            ConversationEventKind::Problem { .. }
-        ));
-        assert_eq!(log.len(), 5);
+        assert_eq!(log.len(), 4);
     }
 }

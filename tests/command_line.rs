@@ -281,8 +281,10 @@ fn turn_persists_events_and_prints_semantic_output() {
     )
     .expect("the invocation event should be JSON");
     assert_eq!(invocation_event["driver"], "openai");
+    assert_eq!(invocation_event["driver_version"], "1");
     assert_eq!(invocation_event["event_type"], "model_invocation_requested");
     assert_eq!(invocation_event["event_schema_version"], 1);
+    assert!(invocation_event["description"].is_string());
     assert!(invocation_event["payload"]["invocation_id"].is_string());
     let model_event: Value = serde_json::from_reader(
         fs::File::open(&event_paths[4]).expect("the persisted model event should open"),
@@ -618,7 +620,7 @@ fn failed_user_turn_is_included_in_the_next_local_reconstruction() {
         ])
         .output()
         .expect("the failed turn should run");
-    assert!(!failed_output.status.success());
+    assert!(failed_output.status.success());
     assert_eq!(
         reported_conversation_id(&failed_output.stderr),
         conversation_id

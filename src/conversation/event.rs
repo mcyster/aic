@@ -92,6 +92,36 @@ pub(crate) trait ConversationEventExtension: Send {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) trait DriverEventReader {
+    fn read_event(
+        &self,
+        envelope: &DriverEventEnvelope,
+    ) -> Result<Box<dyn ConversationEventExtension>, DriverEventReadError>;
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum DriverEventReadError {
+    UnsupportedDriver,
+    UnsupportedEvent,
+    InvalidPayload(String),
+}
+
+impl Display for DriverEventReadError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedDriver => write!(formatter, "the driver does not own this event"),
+            Self::UnsupportedEvent => write!(formatter, "the driver does not own this event type"),
+            Self::InvalidPayload(message) => {
+                write!(formatter, "invalid driver event payload: {message}")
+            }
+        }
+    }
+}
+
+impl Error for DriverEventReadError {}
+
 #[derive(Debug)]
 pub(crate) enum ConversationEventError {
     InvalidEnvelope(InvalidDriverEventEnvelope),
@@ -176,6 +206,10 @@ impl DriverEventEnvelope {
 
     pub(crate) fn event_schema_version(&self) -> u32 {
         self.event_schema_version
+    }
+
+    pub(crate) fn description(&self) -> &str {
+        &self.description
     }
 
     pub(crate) fn payload(&self) -> &Value {

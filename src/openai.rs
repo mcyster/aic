@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
 use futures_util::future::BoxFuture;
@@ -12,19 +13,54 @@ use serde_json::{Map, Value, json};
 use crate::conversation::{
     AssistantResponse, Conversation, ConversationEvent, ConversationEventError,
     ConversationEventExtension, ConversationEventKind, ConversationProblem, ConversationTurnId,
-    DriverEventEnvelope, InvalidAssistantResponse, InvalidConversationProblem,
-    InvalidModelCommunication, InvalidModelData, ModelCommunication, ModelData, ModelDetails,
-    ModelEvent, ModelEventImportance, ModelId, ModelInvocationId, ModelIssue, ModelSource,
-    ProviderId, StoredConversationEventKind, TurnOutcome, UserContent,
+    DriverEventEnvelope, DriverEventReadError, DriverEventReader, InvalidAssistantResponse,
+    InvalidConversationProblem, InvalidModelCommunication, InvalidModelData, InvocationError,
+    ModelCommunication, ModelData, ModelDetails, ModelEvent, ModelEventImportance, ModelId,
+    ModelInvocationId, ModelIssue, ModelSource, ProviderId, StoredConversationEventKind,
+    TurnOutcome, UserContent,
 };
 use crate::model_driver::{
-    DriverEventDecodeError, DriverEventDecoder, ModelDriver, ModelDriverError, ModelOutputStream,
+    ModelDriver, ModelDriverError as SharedModelDriverError, ModelOutputStream,
 };
 
 type ResponseByteStream = BoxStream<'static, Result<Vec<u8>, ModelDriverError>>;
 type ProviderOutputStream = BoxStream<'static, Result<ModelDriverEvent, ModelDriverError>>;
 
 const OPEN_AI_DRIVER_VERSION: &str = "1";
+
+type ModelDriverError = OpenAiError;
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum OpenAiError {
+    Authentication(String),
+    RateLimited(String),
+    Transport(String),
+    InvalidRequest(String),
+    InvalidResponse(String),
+    StreamInterrupted(String),
+    Provider(String),
+}
+
+impl Display for OpenAiError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Authentication(message) => write!(formatter, "authentication failed: {message}"),
+            Self::RateLimited(message) => write!(formatter, "rate limited: {message}"),
+            Self::Transport(message) => write!(formatter, "model transport failed: {message}"),
+            Self::InvalidRequest(message) => write!(formatter, "invalid model request: {message}"),
+            Self::InvalidResponse(message) => {
+                write!(formatter, "invalid model response: {message}")
+            }
+            Self::StreamInterrupted(message) => write!(
+                formatter,
+                "model response stream was interrupted: {message}"
+            ),
+            Self::Provider(message) => write!(formatter, "model provider failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for OpenAiError {}
 
 enum ModelDriverEvent {
     Model {
@@ -107,7 +143,7 @@ impl ModelDriver for OpenAiModelDriver {
         &'invoke self,
         conversation: &'invoke Conversation,
         turn_id: ConversationTurnId,
-    ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
+    ) -> BoxFuture<'invoke, Result<ModelOutputStream, SharedModelDriverError>> {
         let invocation_id = ModelInvocationId::new();
         let invocation_event = OpenAiInvocationRequested {
             invocation_id,
@@ -138,7 +174,14 @@ impl ModelDriver for OpenAiModelDriver {
                 Ok(request) => request,
                 Err(error) => {
                     let error = ModelDriverError::InvalidRequest(error.to_string());
-                    return Ok(invocation_error_stream(invocation_event, error));
+                    return Ok(invocation_error_stream(
+                        invocation_event,
+                        turn_id,
+                        invocation_id,
+                        &source,
+                        error,
+                        FailureStage::BeforeStream,
+                    ));
                 }
             };
             let response = match http_client.execute(request).await {
@@ -146,16 +189,29 @@ impl ModelDriver for OpenAiModelDriver {
                 Err(error) => {
                     return Ok(invocation_error_stream(
                         invocation_event,
+                        turn_id,
+                        invocation_id,
+                        &source,
                         ModelDriverError::Transport(error.to_string()),
+                        FailureStage::BeforeStream,
                     ));
                 }
             };
             let response_status = response.status();
             if !response_status.is_success() {
-                let response_body = response
-                    .text()
-                    .await
-                    .map_err(|error| ModelDriverError::Transport(error.to_string()))?;
+                let response_body = match response.text().await {
+                    Ok(response_body) => response_body,
+                    Err(error) => {
+                        return Ok(invocation_error_stream(
+                            invocation_event,
+                            turn_id,
+                            invocation_id,
+                            &source,
+                            ModelDriverError::Transport(error.to_string()),
+                            FailureStage::BeforeStream,
+                        ));
+                    }
+                };
                 return match classify_response_failure(response_status, response_body) {
                     Ok(issue) => Ok(conversation_event_stream(
                         model_issue_stream(issue),
@@ -164,7 +220,14 @@ impl ModelDriver for OpenAiModelDriver {
                         source,
                         Box::new(invocation_event),
                     )),
-                    Err(error) => Ok(invocation_error_stream(invocation_event, error)),
+                    Err(error) => Ok(invocation_error_stream(
+                        invocation_event,
+                        turn_id,
+                        invocation_id,
+                        &source,
+                        error,
+                        FailureStage::BeforeStream,
+                    )),
                 };
             }
 
@@ -188,22 +251,22 @@ impl ModelDriver for OpenAiModelDriver {
     }
 }
 
-impl DriverEventDecoder for OpenAiModelDriver {
-    fn decode_event(
+impl DriverEventReader for OpenAiModelDriver {
+    fn read_event(
         &self,
         envelope: &DriverEventEnvelope,
-    ) -> Result<Box<dyn ConversationEventExtension>, DriverEventDecodeError> {
-        if envelope.driver() != "openai" || envelope.driver_version() != OPEN_AI_DRIVER_VERSION {
-            return Err(DriverEventDecodeError::UnsupportedDriver);
+    ) -> Result<Box<dyn ConversationEventExtension>, DriverEventReadError> {
+        if envelope.driver() != "openai" {
+            return Err(DriverEventReadError::UnsupportedDriver);
         }
         if envelope.event_type() != "model_invocation_requested"
             || envelope.event_schema_version() != 1
         {
-            return Err(DriverEventDecodeError::UnsupportedEvent);
+            return Err(DriverEventReadError::UnsupportedEvent);
         }
         serde_json::from_value::<OpenAiInvocationRequested>(envelope.payload().clone())
             .map(|event| Box::new(event) as Box<dyn ConversationEventExtension>)
-            .map_err(|error| DriverEventDecodeError::InvalidPayload(error.to_string()))
+            .map_err(|error| DriverEventReadError::InvalidPayload(error.to_string()))
     }
 }
 
@@ -293,17 +356,35 @@ struct ConversationEventStreamState {
     invocation_id: ModelInvocationId,
     source: ModelSource,
     invocation_event: Option<Box<dyn ConversationEventExtension>>,
+    pending_events: VecDeque<ConversationEvent>,
     turn_failed: bool,
     terminated: bool,
 }
 
 fn invocation_error_stream(
     invocation_event: OpenAiInvocationRequested,
+    turn_id: ConversationTurnId,
+    invocation_id: ModelInvocationId,
+    source: &ModelSource,
     error: ModelDriverError,
+    failure_stage: FailureStage,
 ) -> ModelOutputStream {
     stream::iter([
         Ok(ConversationEvent::Extension(Box::new(invocation_event))),
-        Err(error),
+        Ok(ConversationEvent::Shared(ConversationEventKind::Problem {
+            turn_id: Some(turn_id),
+            invocation_id: Some(invocation_id),
+            model: Some(
+                ModelDetails::new(source.clone(), None).expect("the model details should be valid"),
+            ),
+            problem: provider_problem(&error, failure_stage),
+        })),
+        Ok(ConversationEvent::Shared(
+            ConversationEventKind::TurnCompleted {
+                turn_id,
+                outcome: TurnOutcome::Failed,
+            },
+        )),
     ])
     .boxed()
 }
@@ -322,10 +403,14 @@ fn conversation_event_stream(
             invocation_id,
             source,
             invocation_event: Some(invocation_event),
+            pending_events: VecDeque::new(),
             turn_failed: false,
             terminated: false,
         },
         |mut state| async move {
+            if let Some(event) = state.pending_events.pop_front() {
+                return Some((Ok(event), state));
+            }
             if state.terminated {
                 return None;
             }
@@ -343,8 +428,18 @@ fn conversation_event_stream(
                     let driver_output = match driver_output {
                         Ok(driver_output) => driver_output,
                         Err(error) => {
+                            state.pending_events = failure_events(
+                                state.turn_id,
+                                state.invocation_id,
+                                &state.source,
+                                error,
+                                FailureStage::DuringStream,
+                            );
                             state.terminated = true;
-                            return Some((Err(error), state));
+                            return state
+                                .pending_events
+                                .pop_front()
+                                .map(|event| (Ok(event), state));
                         }
                     };
                     if matches!(
@@ -356,8 +451,18 @@ fn conversation_event_stream(
                     Some((Ok(driver_output), state))
                 }
                 Some(Err(error)) => {
+                    state.pending_events = failure_events(
+                        state.turn_id,
+                        state.invocation_id,
+                        &state.source,
+                        error,
+                        FailureStage::DuringStream,
+                    );
                     state.terminated = true;
-                    Some((Err(error), state))
+                    state
+                        .pending_events
+                        .pop_front()
+                        .map(|event| (Ok(event), state))
                 }
                 None => {
                     state.terminated = true;
@@ -379,6 +484,69 @@ fn conversation_event_stream(
         },
     )
     .boxed()
+}
+
+#[derive(Clone, Copy)]
+enum FailureStage {
+    BeforeStream,
+    DuringStream,
+}
+
+fn failure_events(
+    turn_id: ConversationTurnId,
+    invocation_id: ModelInvocationId,
+    source: &ModelSource,
+    error: ModelDriverError,
+    failure_stage: FailureStage,
+) -> VecDeque<ConversationEvent> {
+    VecDeque::from([
+        ConversationEvent::Shared(ConversationEventKind::Problem {
+            turn_id: Some(turn_id),
+            invocation_id: Some(invocation_id),
+            model: Some(
+                ModelDetails::new(source.clone(), None).expect("the model details should be valid"),
+            ),
+            problem: provider_problem(&error, failure_stage),
+        }),
+        ConversationEvent::Shared(ConversationEventKind::TurnCompleted {
+            turn_id,
+            outcome: TurnOutcome::Failed,
+        }),
+    ])
+}
+
+fn provider_problem(error: &ModelDriverError, failure_stage: FailureStage) -> ConversationProblem {
+    let invocation_error = match error {
+        ModelDriverError::Authentication(_) => InvocationError::try_authentication(
+            "The model provider could not authenticate the invocation.".to_owned(),
+        ),
+        ModelDriverError::RateLimited(_) => InvocationError::try_rate_limited(
+            "The model provider rate-limited the invocation.".to_owned(),
+        ),
+        ModelDriverError::Transport(_) if matches!(failure_stage, FailureStage::DuringStream) => {
+            InvocationError::try_stream_interrupted(
+                "The model response stream was interrupted.".to_owned(),
+            )
+        }
+        ModelDriverError::Transport(_) => {
+            InvocationError::try_transport("The model provider could not be reached.".to_owned())
+        }
+        ModelDriverError::InvalidRequest(_) => InvocationError::try_invalid_request(
+            "The model invocation request was invalid.".to_owned(),
+        ),
+        ModelDriverError::InvalidResponse(_) => InvocationError::try_invalid_provider_response(
+            "The model provider returned an invalid response.".to_owned(),
+        ),
+        ModelDriverError::StreamInterrupted(_) => InvocationError::try_stream_interrupted(
+            "The model response stream was interrupted.".to_owned(),
+        ),
+        ModelDriverError::Provider(_) => InvocationError::try_provider_failure(
+            "The model provider failed the invocation.".to_owned(),
+        ),
+    };
+    ConversationProblem::Invocation(
+        invocation_error.expect("the sanitized provider problem should be valid"),
+    )
 }
 
 fn translate_model_driver_event(
@@ -1184,11 +1352,11 @@ mod tests {
         ModelEventImportance, ModelId, ModelInvocationId, ModelIssue, ModelSource, ProviderId,
         StoredConversationEventKind, UserContent,
     };
-    use crate::model_driver::{ModelDriver, ModelDriverError};
+    use crate::model_driver::ModelDriver;
 
     use super::{
-        ModelDriverEvent, OpenAiModelDriver, ResponseByteStream, classify_response_failure,
-        model_communication, model_output_stream, semantic_input,
+        ModelDriverError, ModelDriverEvent, OpenAiModelDriver, ResponseByteStream,
+        classify_response_failure, model_communication, model_output_stream, semantic_input,
     };
 
     fn conversation_event(
@@ -1420,7 +1588,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_early_http_failure_produces_no_model_stream() {
+    async fn an_early_http_failure_produces_problem_and_completion() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("the mock server should bind");
         let address = listener
             .local_addr()
@@ -1454,8 +1622,17 @@ mod tests {
         ));
         assert!(matches!(
             model_events.next().await,
-            Some(Err(ModelDriverError::Authentication(_)))
+            Some(Ok(ConversationEvent::Shared(
+                ConversationEventKind::Problem { .. }
+            )))
         ));
+        assert!(matches!(
+            model_events.next().await,
+            Some(Ok(ConversationEvent::Shared(
+                ConversationEventKind::TurnCompleted { .. }
+            )))
+        ));
+        assert!(model_events.next().await.is_none());
         server.join().expect("the mock server should stop");
     }
 

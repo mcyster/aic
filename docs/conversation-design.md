@@ -677,14 +677,14 @@ trait ConversationEventExtension: Send {
     fn serialize_payload(&self) -> Result<Value, ConversationEventError>;
 }
 
-trait DriverEventDecoder {
-    fn decode_event(
+trait DriverEventReader {
+    fn read_event(
         &self,
         envelope: &DriverEventEnvelope,
-    ) -> Result<Box<dyn ConversationEventExtension>, DriverEventDecodeError>;
+    ) -> Result<Box<dyn ConversationEventExtension>, DriverEventReadError>;
 }
 
-trait ModelDriver: DriverEventDecoder {
+trait ModelDriver: DriverEventReader {
     fn source(&self) -> &ModelSource;
 
     fn invoke<'invoke>(
