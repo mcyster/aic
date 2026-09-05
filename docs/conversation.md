@@ -58,16 +58,19 @@ Fact record
 
 For example, `UserMessageRequested` records input received by the system and `User` records the accepted conversation content. `TurnRequested` starts agent work, while `TurnCompleted` records its terminal outcome. A driver-defined invocation record carries its stable `ModelInvocationId`; produced model facts reference that identifier.
 
-The intended record vocabulary is:
+The shared event vocabulary is organized by command or fact:
 
 ```text
-UserMessageRequested
-User
-TurnRequested
-Assistant
-Communication
-Problem
-TurnCompleted
+Command
+    UserMessageRequested
+    TurnRequested
+
+Fact
+    User
+    Assistant
+    Communication
+    Problem
+    TurnCompleted
 ToolRequest
 ToolResponse
 Context

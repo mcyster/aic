@@ -211,7 +211,8 @@ mod tests {
     use super::EventStore;
     use crate::conversation::{
         AssistantResponse, ConversationCommandId, ConversationEvent, ConversationEventKind,
-        ConversationId, ConversationTurnId, ModelData, ModelInvocationId, UserContent,
+        ConversationFact, ConversationId, ConversationTurnId, ModelData, ModelInvocationId,
+        UserContent,
     };
 
     fn temporary_store() -> EventStore {
@@ -227,19 +228,19 @@ mod tests {
         let first_event = store
             .append_new_conversation_event(
                 conversation_id,
-                ConversationEvent::Shared(ConversationEventKind::User {
+                ConversationEvent::Shared(ConversationEventKind::Fact(ConversationFact::User {
                     caused_by: Some(ConversationCommandId::new()),
                     content: vec![UserContent::Text("first".to_owned())],
-                }),
+                })),
             )
             .expect("the first event should be persisted");
         let second_event = store
             .append_new_conversation_event(
                 conversation_id,
-                ConversationEvent::Shared(ConversationEventKind::User {
+                ConversationEvent::Shared(ConversationEventKind::Fact(ConversationFact::User {
                     caused_by: Some(ConversationCommandId::new()),
                     content: vec![UserContent::Text("second".to_owned())],
-                }),
+                })),
             )
             .expect("the second event should be persisted");
 
@@ -285,13 +286,15 @@ mod tests {
         let model_event = store
             .append_new_conversation_event(
                 conversation_id,
-                ConversationEvent::Shared(ConversationEventKind::Assistant {
-                    turn_id: ConversationTurnId::new(),
-                    invocation_id: ModelInvocationId::new(),
-                    data: Some(model_data),
-                    response: AssistantResponse::new("The answer is 42.".to_owned())
-                        .expect("the assistant response should be valid"),
-                }),
+                ConversationEvent::Shared(ConversationEventKind::Fact(
+                    ConversationFact::Assistant {
+                        turn_id: ConversationTurnId::new(),
+                        invocation_id: ModelInvocationId::new(),
+                        data: Some(model_data),
+                        response: AssistantResponse::new("The answer is 42.".to_owned())
+                            .expect("the assistant response should be valid"),
+                    },
+                )),
             )
             .expect("the model event should be persisted");
 

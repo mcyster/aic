@@ -12,12 +12,12 @@ use serde_json::{Map, Value, json};
 
 use crate::conversation::{
     AssistantResponse, Conversation, ConversationEvent, ConversationEventClass,
-    ConversationEventError, ConversationEventExtension, ConversationEventKind, ConversationProblem,
-    ConversationTurnId, DriverEventEnvelope, DriverEventReadError, DriverEventReader,
-    InvalidAssistantResponse, InvalidConversationProblem, InvalidModelCommunication,
-    InvocationError, ModelCommunication, ModelData, ModelEvent, ModelEventImportance, ModelId,
-    ModelInvocationId, ModelIssue, ModelSource, ProviderId, StoredConversationEventKind,
-    TurnOutcome, UserContent,
+    ConversationEventError, ConversationEventExtension, ConversationEventKind, ConversationFact,
+    ConversationProblem, ConversationTurnId, DriverEventEnvelope, DriverEventReadError,
+    DriverEventReader, InvalidAssistantResponse, InvalidConversationProblem,
+    InvalidModelCommunication, InvocationError, ModelCommunication, ModelData, ModelEvent,
+    ModelEventImportance, ModelId, ModelInvocationId, ModelIssue, ModelSource, ProviderId,
+    StoredConversationEventKind, TurnOutcome, UserContent,
 };
 use crate::model_driver::{ModelDriver, ModelDriverError, ModelOutputStream};
 
@@ -267,10 +267,9 @@ fn semantic_input(conversation: &Conversation) -> Value {
             .events()
             .iter()
             .filter_map(|conversation_event| match &conversation_event.kind {
-                StoredConversationEventKind::Shared(ConversationEventKind::User {
-                    content,
-                    ..
-                }) => {
+                StoredConversationEventKind::Shared(ConversationEventKind::Fact(
+                    ConversationFact::User { content, .. },
+                )) => {
                     let text = content
                         .iter()
                         .map(|content| match content {
@@ -280,17 +279,11 @@ fn semantic_input(conversation: &Conversation) -> Value {
                         .join("\n");
                     Some(json!({ "role": "user", "content": text }))
                 }
-                StoredConversationEventKind::Shared(ConversationEventKind::Assistant {
-                    response,
-                    ..
-                }) => Some(json!({ "role": "assistant", "content": response.message() })),
-                StoredConversationEventKind::Shared(
-                    ConversationEventKind::UserMessageRequested { .. }
-                    | ConversationEventKind::TurnRequested { .. }
-                    | ConversationEventKind::Communication { .. }
-                    | ConversationEventKind::Problem { .. }
-                    | ConversationEventKind::TurnCompleted { .. },
-                )
+                StoredConversationEventKind::Shared(ConversationEventKind::Fact(
+                    ConversationFact::Assistant { response, .. },
+                )) => Some(json!({ "role": "assistant", "content": response.message() })),
+                StoredConversationEventKind::Shared(ConversationEventKind::Command(_))
+                | StoredConversationEventKind::Shared(ConversationEventKind::Fact(_))
                 | StoredConversationEventKind::Extension(_) => None,
             })
             .collect(),
@@ -357,18 +350,20 @@ fn invocation_error_stream(
 ) -> ModelOutputStream {
     stream::iter([
         Ok(ConversationEvent::Extension(Box::new(invocation_event))),
-        Ok(ConversationEvent::Shared(ConversationEventKind::Problem {
-            turn_id: Some(turn_id),
-            invocation_id: Some(invocation_id),
-            data: None,
-            problem: provider_problem(&error, failure_stage),
-        })),
-        Ok(ConversationEvent::Shared(
-            ConversationEventKind::TurnCompleted {
+        Ok(ConversationEvent::Shared(ConversationEventKind::Fact(
+            ConversationFact::Problem {
+                turn_id: Some(turn_id),
+                invocation_id: Some(invocation_id),
+                data: None,
+                problem: provider_problem(&error, failure_stage),
+            },
+        ))),
+        Ok(ConversationEvent::Shared(ConversationEventKind::Fact(
+            ConversationFact::TurnCompleted {
                 turn_id,
                 outcome: TurnOutcome::Failed,
             },
-        )),
+        ))),
     ])
     .boxed()
 }
@@ -424,7 +419,9 @@ fn conversation_event_stream(
                     };
                     if matches!(
                         &driver_output,
-                        ConversationEvent::Shared(ConversationEventKind::Problem { .. })
+                        ConversationEvent::Shared(ConversationEventKind::Fact(
+                            ConversationFact::Problem { .. }
+                        ))
                     ) {
                         state.turn_failed = true;
                     }
@@ -446,8 +443,8 @@ fn conversation_event_stream(
                 None => {
                     state.terminated = true;
                     Some((
-                        Ok(ConversationEvent::Shared(
-                            ConversationEventKind::TurnCompleted {
+                        Ok(ConversationEvent::Shared(ConversationEventKind::Fact(
+                            ConversationFact::TurnCompleted {
                                 turn_id: state.turn_id,
                                 outcome: if state.turn_failed {
                                     TurnOutcome::Failed
@@ -455,7 +452,7 @@ fn conversation_event_stream(
                                     TurnOutcome::Succeeded
                                 },
                             },
-                        )),
+                        ))),
                         state,
                     ))
                 }
@@ -478,16 +475,18 @@ fn failure_events(
     failure_stage: FailureStage,
 ) -> VecDeque<ConversationEvent> {
     VecDeque::from([
-        ConversationEvent::Shared(ConversationEventKind::Problem {
+        ConversationEvent::Shared(ConversationEventKind::Fact(ConversationFact::Problem {
             turn_id: Some(turn_id),
             invocation_id: Some(invocation_id),
             data: None,
             problem: provider_problem(&error, failure_stage),
-        }),
-        ConversationEvent::Shared(ConversationEventKind::TurnCompleted {
-            turn_id,
-            outcome: TurnOutcome::Failed,
-        }),
+        })),
+        ConversationEvent::Shared(ConversationEventKind::Fact(
+            ConversationFact::TurnCompleted {
+                turn_id,
+                outcome: TurnOutcome::Failed,
+            },
+        )),
     ])
 }
 
@@ -532,27 +531,27 @@ fn translate_model_driver_event(
 ) -> Result<ConversationEvent, OpenAiError> {
     let kind = match driver_event {
         ModelDriverEvent::Model { event, data } => match event {
-            ModelEvent::Assistant(response) => ConversationEventKind::Assistant {
+            ModelEvent::Assistant(response) => ConversationFact::Assistant {
                 turn_id,
                 invocation_id,
                 data,
                 response,
             },
-            ModelEvent::Communication(communication) => ConversationEventKind::Communication {
+            ModelEvent::Communication(communication) => ConversationFact::Communication {
                 turn_id,
                 invocation_id,
                 data,
                 communication,
             },
         },
-        ModelDriverEvent::Problem { problem, data } => ConversationEventKind::Problem {
+        ModelDriverEvent::Problem { problem, data } => ConversationFact::Problem {
             turn_id: Some(turn_id),
             invocation_id: Some(invocation_id),
             data,
             problem: ConversationProblem::Issue(problem),
         },
     };
-    Ok(ConversationEvent::Shared(kind))
+    Ok(ConversationEvent::Shared(ConversationEventKind::Fact(kind)))
 }
 
 #[derive(Default)]
@@ -1316,9 +1315,9 @@ mod tests {
 
     use crate::conversation::{
         AssistantResponse, Conversation, ConversationEvent, ConversationEventId,
-        ConversationEventKind, ConversationEventRecord, ConversationId, ConversationProblem,
-        ConversationTurnId, ModelCommunication, ModelData, ModelEvent, ModelEventImportance,
-        ModelId, ModelInvocationId, ModelIssue, ModelSource, ProviderId,
+        ConversationEventKind, ConversationEventRecord, ConversationFact, ConversationId,
+        ConversationProblem, ConversationTurnId, ModelCommunication, ModelData, ModelEvent,
+        ModelEventImportance, ModelId, ModelInvocationId, ModelIssue, ModelSource, ProviderId,
         StoredConversationEventKind, UserContent,
     };
     use crate::model_driver::ModelDriver;
@@ -1357,15 +1356,15 @@ mod tests {
             conversation_event(
                 conversation_id,
                 0,
-                ConversationEventKind::User {
+                ConversationEventKind::Fact(ConversationFact::User {
                     caused_by: None,
                     content: vec![UserContent::Text("Hello".to_owned())],
-                },
+                }),
             ),
             conversation_event(
                 conversation_id,
                 1,
-                ConversationEventKind::Communication {
+                ConversationEventKind::Fact(ConversationFact::Communication {
                     turn_id,
                     invocation_id,
                     data: Some(model_data.clone()),
@@ -1375,18 +1374,18 @@ mod tests {
                         "reasoning".to_owned(),
                     )
                     .expect("the model communication should be valid"),
-                },
+                }),
             ),
             conversation_event(
                 conversation_id,
                 2,
-                ConversationEventKind::Assistant {
+                ConversationEventKind::Fact(ConversationFact::Assistant {
                     turn_id,
                     invocation_id,
                     data: Some(model_data),
                     response: AssistantResponse::new("Hello.".to_owned())
                         .expect("the assistant response should be valid"),
-                },
+                }),
             ),
         ])
         .expect("the conversation should be valid");
@@ -1447,10 +1446,10 @@ mod tests {
         Conversation::from_events(vec![conversation_event(
             conversation_id,
             0,
-            ConversationEventKind::User {
+            ConversationEventKind::Fact(ConversationFact::User {
                 caused_by: None,
                 content: vec![UserContent::Text("Hello".to_owned())],
-            },
+            }),
         )])
         .expect("the conversation should be valid")
     }
@@ -1518,25 +1517,25 @@ mod tests {
 
         assert!(matches!(
             &first_event,
-            ConversationEventKind::Communication { .. }
+            ConversationEventKind::Fact(ConversationFact::Communication { .. })
         ));
         assert!(matches!(
             &second_event,
-            ConversationEventKind::Assistant { .. }
+            ConversationEventKind::Fact(ConversationFact::Assistant { .. })
         ));
         assert!(matches!(
             &first_event,
-            ConversationEventKind::Communication { data, .. } if data.is_none()
+            ConversationEventKind::Fact(ConversationFact::Communication { data, .. }) if data.is_none()
         ));
         assert!(matches!(
             &second_event,
-            ConversationEventKind::Assistant { data, .. } if data.is_none()
+            ConversationEventKind::Fact(ConversationFact::Assistant { data, .. }) if data.is_none()
         ));
         assert!(matches!(
             model_events.next().await,
-            Some(Ok(ConversationEvent::Shared(
-                ConversationEventKind::TurnCompleted { .. }
-            )))
+            Some(Ok(ConversationEvent::Shared(ConversationEventKind::Fact(
+                ConversationFact::TurnCompleted { .. }
+            ))))
         ));
         assert!(model_events.next().await.is_none());
         server.join().expect("the mock server should stop");
@@ -1577,15 +1576,15 @@ mod tests {
         ));
         assert!(matches!(
             model_events.next().await,
-            Some(Ok(ConversationEvent::Shared(
-                ConversationEventKind::Problem { .. }
-            )))
+            Some(Ok(ConversationEvent::Shared(ConversationEventKind::Fact(
+                ConversationFact::Problem { .. }
+            ))))
         ));
         assert!(matches!(
             model_events.next().await,
-            Some(Ok(ConversationEvent::Shared(
-                ConversationEventKind::TurnCompleted { .. }
-            )))
+            Some(Ok(ConversationEvent::Shared(ConversationEventKind::Fact(
+                ConversationFact::TurnCompleted { .. }
+            ))))
         ));
         assert!(model_events.next().await.is_none());
         server.join().expect("the mock server should stop");
@@ -1639,20 +1638,21 @@ mod tests {
 
         assert!(matches!(
             &model_event,
-            ConversationEventKind::Problem {
+            ConversationEventKind::Fact(ConversationFact::Problem {
                 problem: ConversationProblem::Issue(ModelIssue::ContextLimitExceeded { .. }),
                 ..
-            }
+            })
         ));
-        let ConversationEventKind::Problem { problem, .. } = &model_event else {
+        let ConversationEventKind::Fact(ConversationFact::Problem { problem, .. }) = &model_event
+        else {
             panic!("the output should be a model issue");
         };
         assert_eq!(problem.message(), "The model context limit was exceeded.");
         assert!(matches!(
             model_events.next().await,
-            Some(Ok(ConversationEvent::Shared(
-                ConversationEventKind::TurnCompleted { .. }
-            )))
+            Some(Ok(ConversationEvent::Shared(ConversationEventKind::Fact(
+                ConversationFact::TurnCompleted { .. }
+            ))))
         ));
         assert!(model_events.next().await.is_none());
         server.join().expect("the mock server should stop");

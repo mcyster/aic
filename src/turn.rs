@@ -3,8 +3,9 @@ use std::error::Error;
 use futures_util::StreamExt;
 
 use crate::conversation::{
-    ConversationCommandId, ConversationEvent, ConversationEventKind, ConversationId,
-    ConversationProblem, ConversationTurnId, UserContent, UserPrompt,
+    ConversationCommand, ConversationCommandId, ConversationEvent, ConversationEventKind,
+    ConversationFact, ConversationId, ConversationProblem, ConversationTurnId, UserContent,
+    UserPrompt,
 };
 use crate::model_driver::{ModelDriver, ModelDriverError};
 use crate::persistence::EventStore;
@@ -52,17 +53,19 @@ impl TurnService {
         let user_message_command_id = ConversationCommandId::new();
         self.event_store.append_new_conversation_event(
             conversation_id,
-            ConversationEvent::Shared(ConversationEventKind::UserMessageRequested {
-                command_id: user_message_command_id,
-                content: user_content.clone(),
-            }),
+            ConversationEvent::Shared(ConversationEventKind::Command(
+                ConversationCommand::UserMessageRequested {
+                    command_id: user_message_command_id,
+                    content: user_content.clone(),
+                },
+            )),
         )?;
         self.event_store.append_new_conversation_event(
             conversation_id,
-            ConversationEvent::Shared(ConversationEventKind::User {
+            ConversationEvent::Shared(ConversationEventKind::Fact(ConversationFact::User {
                 caused_by: Some(user_message_command_id),
                 content: user_content,
-            }),
+            })),
         )?;
         conversation_identified(conversation_id);
 
@@ -70,10 +73,12 @@ impl TurnService {
         let turn_id = ConversationTurnId::new();
         self.event_store.append_new_conversation_event(
             conversation_id,
-            ConversationEvent::Shared(ConversationEventKind::TurnRequested {
-                command_id: ConversationCommandId::new(),
-                turn_id,
-            }),
+            ConversationEvent::Shared(ConversationEventKind::Command(
+                ConversationCommand::TurnRequested {
+                    command_id: ConversationCommandId::new(),
+                    turn_id,
+                },
+            )),
         )?;
         let conversation = self.event_store.load_conversation(conversation_id)?;
         report_progress(TurnProgress::InvocationStarted {
@@ -104,8 +109,8 @@ impl TurnService {
                     )?;
                 }
                 ConversationEvent::Shared(conversation_kind) => match &conversation_kind {
-                    ConversationEventKind::Assistant { .. }
-                    | ConversationEventKind::Communication { .. } => {
+                    ConversationEventKind::Fact(ConversationFact::Assistant { .. })
+                    | ConversationEventKind::Fact(ConversationFact::Communication { .. }) => {
                         ensure_event_belongs_to_turn(&conversation_kind, turn_id)?;
                         self.event_store.append_new_conversation_event(
                             conversation_id,
@@ -115,7 +120,7 @@ impl TurnService {
                             event: conversation_kind,
                         })?;
                     }
-                    ConversationEventKind::Problem { problem, .. } => {
+                    ConversationEventKind::Fact(ConversationFact::Problem { problem, .. }) => {
                         ensure_event_belongs_to_turn(&conversation_kind, turn_id)?;
                         let problem = problem.clone();
                         self.event_store.append_new_conversation_event(
@@ -124,7 +129,7 @@ impl TurnService {
                         )?;
                         report_progress(TurnProgress::ProblemCompleted { problem })?;
                     }
-                    ConversationEventKind::TurnCompleted { .. } => {
+                    ConversationEventKind::Fact(ConversationFact::TurnCompleted { .. }) => {
                         ensure_event_belongs_to_turn(&conversation_kind, turn_id)?;
                         turn_completed = true;
                         self.event_store.append_new_conversation_event(
@@ -154,14 +159,14 @@ fn ensure_event_belongs_to_turn(
     expected_turn_id: ConversationTurnId,
 ) -> Result<(), ModelDriverError> {
     let actual_turn_id = match event {
-        ConversationEventKind::Assistant { turn_id, .. }
-        | ConversationEventKind::Communication { turn_id, .. }
-        | ConversationEventKind::TurnCompleted { turn_id, .. } => *turn_id,
-        ConversationEventKind::Problem {
+        ConversationEventKind::Fact(ConversationFact::Assistant { turn_id, .. })
+        | ConversationEventKind::Fact(ConversationFact::Communication { turn_id, .. })
+        | ConversationEventKind::Fact(ConversationFact::TurnCompleted { turn_id, .. }) => *turn_id,
+        ConversationEventKind::Fact(ConversationFact::Problem {
             turn_id: Some(turn_id),
             ..
-        } => *turn_id,
-        ConversationEventKind::Problem { turn_id: None, .. } => {
+        }) => *turn_id,
+        ConversationEventKind::Fact(ConversationFact::Problem { turn_id: None, .. }) => {
             return Err(ModelDriverError::MissingTurnIdentity);
         }
         _ => {
@@ -188,13 +193,21 @@ fn conversation_event_type(event: &ConversationEvent) -> String {
 
 fn conversation_event_kind_name(event: &ConversationEventKind) -> String {
     match event {
-        ConversationEventKind::Assistant { .. } => "assistant".to_owned(),
-        ConversationEventKind::Communication { .. } => "communication".to_owned(),
-        ConversationEventKind::Problem { .. } => "problem".to_owned(),
-        ConversationEventKind::TurnCompleted { .. } => "turn_completed".to_owned(),
-        ConversationEventKind::UserMessageRequested { .. } => "user_message_requested".to_owned(),
-        ConversationEventKind::User { .. } => "user".to_owned(),
-        ConversationEventKind::TurnRequested { .. } => "turn_requested".to_owned(),
+        ConversationEventKind::Fact(ConversationFact::Assistant { .. }) => "assistant".to_owned(),
+        ConversationEventKind::Fact(ConversationFact::Communication { .. }) => {
+            "communication".to_owned()
+        }
+        ConversationEventKind::Fact(ConversationFact::Problem { .. }) => "problem".to_owned(),
+        ConversationEventKind::Fact(ConversationFact::TurnCompleted { .. }) => {
+            "turn_completed".to_owned()
+        }
+        ConversationEventKind::Command(ConversationCommand::UserMessageRequested { .. }) => {
+            "user_message_requested".to_owned()
+        }
+        ConversationEventKind::Fact(ConversationFact::User { .. }) => "user".to_owned(),
+        ConversationEventKind::Command(ConversationCommand::TurnRequested { .. }) => {
+            "turn_requested".to_owned()
+        }
     }
 }
 
@@ -211,11 +224,12 @@ mod tests {
     use crate::conversation::DriverEventReadError;
     use crate::conversation::DriverEventReader;
     use crate::conversation::{
-        AssistantResponse, Conversation, ConversationEvent, ConversationEventClass,
-        ConversationEventError, ConversationEventExtension, ConversationEventKind,
-        ConversationEventRecord, ConversationId, ConversationProblem, ConversationTurnId,
-        DriverEventEnvelope, ModelCommunication, ModelEventImportance, ModelId, ModelInvocationId,
-        ModelIssue, ModelSource, ProviderId, StoredConversationEventKind, TurnOutcome, UserPrompt,
+        AssistantResponse, Conversation, ConversationCommand, ConversationEvent,
+        ConversationEventClass, ConversationEventError, ConversationEventExtension,
+        ConversationEventKind, ConversationEventRecord, ConversationFact, ConversationId,
+        ConversationProblem, ConversationTurnId, DriverEventEnvelope, ModelCommunication,
+        ModelEventImportance, ModelId, ModelInvocationId, ModelIssue, ModelSource, ProviderId,
+        StoredConversationEventKind, TurnOutcome, UserPrompt,
     };
     use crate::model_driver::{ModelDriver, ModelDriverError, ModelOutputStream};
     use crate::persistence::EventStore;
@@ -323,12 +337,12 @@ mod tests {
                     .into_iter()
                     .map(|output| Ok(ConversationEvent::Shared(output))),
             );
-            outputs.push(Ok(ConversationEvent::Shared(
-                ConversationEventKind::TurnCompleted {
+            outputs.push(Ok(ConversationEvent::Shared(ConversationEventKind::Fact(
+                ConversationFact::TurnCompleted {
                     turn_id,
                     outcome: turn_outcome,
                 },
-            )));
+            ))));
             async move { Ok(stream::iter(outputs).boxed()) }.boxed()
         }
     }
@@ -422,23 +436,27 @@ mod tests {
     ) -> ConversationEventKind {
         match output {
             TestOutput::Assistant(message) => assistant_kind(message, turn_id, invocation_id),
-            TestOutput::Communication(message) => ConversationEventKind::Communication {
-                turn_id,
-                invocation_id,
-                data: None,
-                communication: ModelCommunication::new(
-                    message.clone(),
-                    ModelEventImportance::Detailed,
-                    "test".to_owned(),
-                )
-                .expect("the communication should be valid"),
-            },
-            TestOutput::Problem(problem) => ConversationEventKind::Problem {
-                turn_id: Some(turn_id),
-                invocation_id: Some(invocation_id),
-                data: None,
-                problem: problem.clone(),
-            },
+            TestOutput::Communication(message) => {
+                ConversationEventKind::Fact(ConversationFact::Communication {
+                    turn_id,
+                    invocation_id,
+                    data: None,
+                    communication: ModelCommunication::new(
+                        message.clone(),
+                        ModelEventImportance::Detailed,
+                        "test".to_owned(),
+                    )
+                    .expect("the communication should be valid"),
+                })
+            }
+            TestOutput::Problem(problem) => {
+                ConversationEventKind::Fact(ConversationFact::Problem {
+                    turn_id: Some(turn_id),
+                    invocation_id: Some(invocation_id),
+                    data: None,
+                    problem: problem.clone(),
+                })
+            }
         }
     }
 
@@ -447,13 +465,13 @@ mod tests {
         turn_id: ConversationTurnId,
         invocation_id: ModelInvocationId,
     ) -> ConversationEventKind {
-        ConversationEventKind::Assistant {
+        ConversationEventKind::Fact(ConversationFact::Assistant {
             turn_id,
             invocation_id,
             data: None,
             response: AssistantResponse::new(message.to_owned())
                 .expect("the assistant response should be valid"),
-        }
+        })
     }
 
     fn model_source(provider: &str, model: &str) -> ModelSource {
@@ -485,10 +503,10 @@ mod tests {
         let actual_turn_id = ConversationTurnId::new();
         assert_eq!(
             super::ensure_event_belongs_to_turn(
-                &ConversationEventKind::TurnCompleted {
+                &ConversationEventKind::Fact(ConversationFact::TurnCompleted {
                     turn_id: actual_turn_id,
                     outcome: TurnOutcome::Succeeded,
-                },
+                }),
                 expected_turn_id,
             ),
             Err(ModelDriverError::WrongTurnIdentity {
@@ -497,23 +515,23 @@ mod tests {
             })
         );
 
-        let problem = ConversationEventKind::Problem {
+        let problem = ConversationEventKind::Fact(ConversationFact::Problem {
             turn_id: None,
             invocation_id: None,
             data: None,
             problem: ConversationProblem::Issue(
                 ModelIssue::try_refusal("refused".to_owned()).expect("the issue should be valid"),
             ),
-        };
+        });
         assert_eq!(
             super::ensure_event_belongs_to_turn(&problem, expected_turn_id),
             Err(ModelDriverError::MissingTurnIdentity)
         );
 
-        let user = ConversationEventKind::User {
+        let user = ConversationEventKind::Fact(ConversationFact::User {
             caused_by: None,
             content: vec![],
-        };
+        });
         assert_eq!(
             super::ensure_event_belongs_to_turn(&user, expected_turn_id),
             Err(ModelDriverError::DisallowedEventKind {
@@ -571,11 +589,11 @@ mod tests {
         ));
         assert!(matches!(
             event_kind(&log[1]),
-            ConversationEventKind::User { .. }
+            ConversationEventKind::Fact(ConversationFact::User { .. })
         ));
         assert!(matches!(
             event_kind(&log[2]),
-            ConversationEventKind::TurnRequested { .. }
+            ConversationEventKind::Command(ConversationCommand::TurnRequested { .. })
         ));
         assert!(matches!(
             log[3].kind,
@@ -583,33 +601,33 @@ mod tests {
         ));
         assert!(matches!(
             event_kind(&log[4]),
-            ConversationEventKind::Communication { .. }
+            ConversationEventKind::Fact(ConversationFact::Communication { .. })
         ));
         assert!(matches!(
             event_kind(&log[5]),
-            ConversationEventKind::Assistant { .. }
+            ConversationEventKind::Fact(ConversationFact::Assistant { .. })
         ));
         assert!(matches!(
             event_kind(&log[6]),
-            ConversationEventKind::TurnCompleted {
+            ConversationEventKind::Fact(ConversationFact::TurnCompleted {
                 outcome: TurnOutcome::Succeeded,
                 ..
-            }
+            })
         ));
         let invocation_id = invocations.lock().expect("the invocation list should lock")[0].1;
         assert!(matches!(
             event_kind(&log[4]),
-            ConversationEventKind::Communication {
+            ConversationEventKind::Fact(ConversationFact::Communication {
                 invocation_id: found,
                 ..
-            } if *found == invocation_id
+            }) if *found == invocation_id
         ));
         assert!(matches!(
             event_kind(&log[5]),
-            ConversationEventKind::Assistant {
+            ConversationEventKind::Fact(ConversationFact::Assistant {
                 invocation_id: found,
                 ..
-            } if *found == invocation_id
+            }) if *found == invocation_id
         ));
         assert_eq!(inputs.lock().expect("the input list should lock").len(), 1);
     }
@@ -671,14 +689,14 @@ mod tests {
             .expect("the log should load");
         assert!(matches!(
             event_kind(&log[4]),
-            ConversationEventKind::Problem { .. }
+            ConversationEventKind::Fact(ConversationFact::Problem { .. })
         ));
         assert!(matches!(
             event_kind(&log[5]),
-            ConversationEventKind::TurnCompleted {
+            ConversationEventKind::Fact(ConversationFact::TurnCompleted {
                 outcome: TurnOutcome::Failed,
                 ..
-            }
+            })
         ));
     }
 
@@ -708,7 +726,7 @@ mod tests {
             .expect("the log should load");
         assert!(matches!(
             event_kind(&log[3]),
-            ConversationEventKind::Assistant { .. }
+            ConversationEventKind::Fact(ConversationFact::Assistant { .. })
         ));
         assert_eq!(log.len(), 4);
     }

@@ -4,7 +4,8 @@ use std::io::{self, Write};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::conversation::{
-    ConversationEventKind, ConversationId, ConversationProblem, ModelEventImportance, ModelId,
+    ConversationEventKind, ConversationFact, ConversationId, ConversationProblem,
+    ModelEventImportance, ModelId,
 };
 use crate::openai::OpenAiModelDriver;
 use crate::persistence::EventStore;
@@ -76,10 +77,10 @@ impl CommandLine {
 
 fn render_model_event(event: &ConversationEventKind, verbosity: Verbosity) -> io::Result<()> {
     let (message, importance, prefix) = match event {
-        ConversationEventKind::Assistant { response, .. } => {
+        ConversationEventKind::Fact(ConversationFact::Assistant { response, .. }) => {
             (response.message(), ModelEventImportance::Important, "")
         }
-        ConversationEventKind::Communication { communication, .. } => {
+        ConversationEventKind::Fact(ConversationFact::Communication { communication, .. }) => {
             (communication.message(), communication.importance(), "### ")
         }
         _ => return Ok(()),

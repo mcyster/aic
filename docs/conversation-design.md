@@ -103,26 +103,20 @@ Conceptually:
 
 ```rust
 enum ConversationEventKind {
+    Command(ConversationCommand),
+    Fact(ConversationFact),
+}
+
+enum ConversationCommand {
     UserMessageRequested { ... },
-    User {
-        content: Vec<UserContent>,
-    },
     TurnRequested { ... },
-    Assistant {
-        invocation_id: ModelInvocationId,
-        data: Option<ModelData>,
-        response: AssistantResponse,
-    },
-    Communication {
-        invocation_id: ModelInvocationId,
-        data: Option<ModelData>,
-        communication: ModelCommunication,
-    },
-    Problem {
-        invocation_id: Option<ModelInvocationId>,
-        data: Option<ModelData>,
-        problem: ConversationProblem,
-    },
+}
+
+enum ConversationFact {
+    User { ... },
+    Assistant { ... },
+    Communication { ... },
+    Problem { ... },
     TurnCompleted { ... },
     ToolRequest(...),
     ToolResponse(...),

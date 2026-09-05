@@ -9,11 +9,11 @@ use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
 pub(crate) use event::{
-    AssistantResponse, ConversationEvent, ConversationEventClass, ConversationEventError,
-    ConversationEventExtension, ConversationEventKind, ConversationEventRecord,
-    DriverEventEnvelope, DriverEventReadError, DriverEventReader, InvalidAssistantResponse,
-    InvalidModelCommunication, ModelCommunication, ModelEvent, ModelEventImportance,
-    StoredConversationEventKind, TurnOutcome, UserContent,
+    AssistantResponse, ConversationCommand, ConversationEvent, ConversationEventClass,
+    ConversationEventError, ConversationEventExtension, ConversationEventKind,
+    ConversationEventRecord, ConversationFact, DriverEventEnvelope, DriverEventReadError,
+    DriverEventReader, InvalidAssistantResponse, InvalidModelCommunication, ModelCommunication,
+    ModelEvent, ModelEventImportance, StoredConversationEventKind, TurnOutcome, UserContent,
 };
 pub(crate) use id::{
     ConversationCommandId, ConversationEventId, ConversationId, ConversationTurnId,
@@ -172,8 +172,9 @@ mod tests {
 
     use super::{
         Conversation, ConversationCommandId, ConversationEventId, ConversationEventKind,
-        ConversationEventRecord, ConversationId, ConversationTurnId, InvalidConversation,
-        InvalidUserPrompt, StoredConversationEventKind, UserContent, UserPrompt,
+        ConversationEventRecord, ConversationFact, ConversationId, ConversationTurnId,
+        InvalidConversation, InvalidUserPrompt, StoredConversationEventKind, UserContent,
+        UserPrompt,
     };
 
     fn user_event(conversation_id: ConversationId, position: u64) -> ConversationEventRecord {
@@ -183,10 +184,12 @@ mod tests {
             id: ConversationEventId::new(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
             schema_version: 7,
-            kind: StoredConversationEventKind::Shared(ConversationEventKind::User {
-                caused_by: Some(ConversationCommandId::new()),
-                content: vec![UserContent::Text(format!("event {position}"))],
-            }),
+            kind: StoredConversationEventKind::Shared(ConversationEventKind::Fact(
+                ConversationFact::User {
+                    caused_by: Some(ConversationCommandId::new()),
+                    content: vec![UserContent::Text(format!("event {position}"))],
+                },
+            )),
         }
     }
 
@@ -274,16 +277,13 @@ mod tests {
             "id": event_id,
             "timestamp": "2026-08-22T18:42:31.482Z",
             "schema_version": 11,
-            "type": "assistant",
-            "turn_id": ConversationTurnId::new(),
-            "invocation_id": crate::conversation::ModelInvocationId::new(),
-            "model": {
-                "source": {
-                    "provider": "openai",
-                    "model": "gpt-5.6"
-                }
-            },
-            "response": { "message": "   " }
+            "class": "fact",
+            "event": {
+                "type": "assistant",
+                "turn_id": ConversationTurnId::new(),
+                "invocation_id": crate::conversation::ModelInvocationId::new(),
+                "response": { "message": "   " }
+            }
         }))
         .expect("derived deserialization should construct the conversation event");
 
@@ -306,19 +306,16 @@ mod tests {
             "id": event_id,
             "timestamp": "2026-08-22T18:42:31.482Z",
             "schema_version": 11,
-            "type": "communication",
-            "turn_id": ConversationTurnId::new(),
-            "invocation_id": crate::conversation::ModelInvocationId::new(),
-            "model": {
-                "source": {
-                    "provider": "openai",
-                    "model": "gpt-5.6"
+            "class": "fact",
+            "event": {
+                "type": "communication",
+                "turn_id": ConversationTurnId::new(),
+                "invocation_id": crate::conversation::ModelInvocationId::new(),
+                "communication": {
+                    "message": "reasoning",
+                    "importance": "detailed",
+                    "subtype": "   "
                 }
-            },
-            "communication": {
-                "message": "reasoning",
-                "importance": "detailed",
-                "subtype": "   "
             }
         }))
         .expect("derived deserialization should construct the conversation event");
@@ -341,21 +338,18 @@ mod tests {
             "position": 0,
             "id": event_id,
             "timestamp": "2026-08-22T18:42:31.482Z",
-            "schema_version": 8,
-            "type": "problem",
-            "turn_id": null,
-            "invocation_id": null,
-            "model": {
-                "source": {
-                    "provider": "openai",
-                    "model": "gpt-5.6"
-                }
-            },
-            "problem": {
-                "category": "issue",
-                "detail": {
-                    "type": "refusal",
-                    "message": "   "
+            "schema_version": 11,
+            "class": "fact",
+            "event": {
+                "type": "problem",
+                "turn_id": null,
+                "invocation_id": null,
+                "problem": {
+                    "category": "issue",
+                    "detail": {
+                        "type": "refusal",
+                        "message": "   "
+                    }
                 }
             }
         }))
@@ -379,12 +373,15 @@ mod tests {
             "position": 0,
             "id": event_id,
             "timestamp": "2026-08-22T18:42:31.482Z",
-            "schema_version": 10,
-            "type": "assistant",
-            "turn_id": ConversationTurnId::new(),
-            "invocation_id": crate::conversation::ModelInvocationId::new(),
-            "data": {},
-            "response": { "message": "The answer is 42." }
+            "schema_version": 11,
+            "class": "fact",
+            "event": {
+                "type": "assistant",
+                "turn_id": ConversationTurnId::new(),
+                "invocation_id": crate::conversation::ModelInvocationId::new(),
+                "data": {},
+                "response": { "message": "The answer is 42." }
+            }
         }))
         .expect("derived deserialization should construct the conversation event");
 
@@ -406,17 +403,16 @@ mod tests {
             "position": 0,
             "id": event_id,
             "timestamp": "2026-08-22T18:42:31.482Z",
-            "schema_version": 9,
-            "type": "problem",
-            "source": {
-                "provider": "openai",
-                "model": "gpt-5.6"
-            },
-            "problem": {
-                "category": "invocation",
-                "detail": {
-                    "type": "transport",
-                    "message": "The model provider could not be reached."
+            "schema_version": 11,
+            "class": "fact",
+            "event": {
+                "type": "problem",
+                "problem": {
+                    "category": "invocation",
+                    "detail": {
+                        "type": "transport",
+                        "message": "The model provider could not be reached."
+                    }
                 }
             }
         }))
@@ -427,7 +423,9 @@ mod tests {
 
         assert!(matches!(
             conversation.events()[0].kind,
-            StoredConversationEventKind::Shared(ConversationEventKind::Problem { .. })
+            StoredConversationEventKind::Shared(ConversationEventKind::Fact(
+                ConversationFact::Problem { .. }
+            ))
         ));
     }
 
