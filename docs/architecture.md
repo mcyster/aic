@@ -67,10 +67,11 @@ for portable assistant or problem meaning.
 ## Conversation Projection
 
 `Conversation` is an immutable projection reconstructed from the ordered log.
-It excludes command records from model-visible history and permits positions to
-have gaps because commands and lifecycle records occupy positions. Provider
-projections also exclude commands and turn lifecycle facts unless a provider
-has a concrete semantic reason to use them.
+It excludes command records and driver-defined records from model-visible
+history and permits positions to have gaps because commands, extension records,
+and lifecycle records occupy positions. Provider projections also exclude
+commands and turn lifecycle facts unless a provider has a concrete semantic
+reason to use them.
 
 Everything made visible to a model must be recorded in semantic facts or
 immutably referenced by them. Provider transport events, raw streaming deltas,

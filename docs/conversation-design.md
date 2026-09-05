@@ -66,7 +66,7 @@ Conceptually:
 ```rust
 struct Conversation {
     id: ConversationId,
-    events: Vec<ConversationEvent>,
+    events: Vec<ConversationEventRecord>,
 }
 ```
 
@@ -92,7 +92,12 @@ future UIs
 
 ## 3. ConversationEvent and ConversationEventKind
 
-`ConversationEvent` is the complete canonical log record persisted and replayed. Shared `ConversationEventKind` contains command records and portable semantic facts. Driver-defined records use an opaque `DriverEventEnvelope` in the same log and are excluded from the model-facing `Conversation` projection.
+`ConversationEvent` is the stream value produced by a driver. It contains either
+a shared `ConversationEventKind` or a driver-defined extension event. The
+persisted canonical record is `ConversationEventRecord`; it adds identity,
+position, timestamp, and schema metadata. Driver-defined records use an opaque
+`DriverEventEnvelope` in the same log and are excluded from the model-facing
+`Conversation` projection.
 
 Conceptually:
 
@@ -734,7 +739,11 @@ A caller that wants batch behavior can collect the stream. No separate batch int
 
 User input and `TurnRequested` are appended before invocation. The driver maps provider-native activity to driver-defined records and semantic event kinds, including `ModelDetails` and driver-created `ModelInvocationId` values where the event concerns a model. The append boundary assigns canonical envelope metadata. The caller persists and may display each returned semantic event immediately while the invocation remains active.
 
-Provider protocol events and raw text deltas remain internal to the driver. They are not `ConversationEvent`s and are not persisted merely because they arrived. The driver aggregates those deltas and yields only completed semantic output such as an `AssistantResponse`, `ModelCommunication`, or `ModelIssue`.
+Provider protocol events and raw text deltas remain internal to the driver. They
+are not conversation events and are not persisted merely because they arrived.
+The driver aggregates those deltas and yields shared semantic output such as an
+`AssistantResponse`, `ModelCommunication`, or `ModelIssue`, alongside any
+driver-defined conversation events.
 
 Conceptually:
 
