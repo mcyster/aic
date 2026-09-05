@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use super::{ConversationEventKind, DriverEventEnvelope, InvalidConversationEventKind};
+use super::{
+    ConversationEventClass, ConversationEventKind, DriverEventEnvelope,
+    InvalidConversationEventKind,
+};
 use crate::conversation::{ConversationEventId, ConversationId};
 
 pub(crate) const SCHEMA_VERSION: u32 = 11;
@@ -19,6 +22,10 @@ pub(crate) struct ConversationEventRecord {
 }
 
 impl ConversationEventRecord {
+    pub(crate) fn class(&self) -> ConversationEventClass {
+        self.kind.class()
+    }
+
     pub(crate) fn new(
         conversation_id: ConversationId,
         position: u64,
@@ -62,6 +69,13 @@ pub(crate) enum StoredConversationEventKind {
 }
 
 impl StoredConversationEventKind {
+    pub(crate) fn class(&self) -> ConversationEventClass {
+        match self {
+            Self::Shared(event) => event.class(),
+            Self::Extension(event) => event.class(),
+        }
+    }
+
     pub(super) fn ensure_valid(&self) -> Result<(), InvalidConversationEventKind> {
         match self {
             Self::Shared(event) => event.ensure_valid(),

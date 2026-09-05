@@ -11,11 +11,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::conversation::{
-    AssistantResponse, Conversation, ConversationEvent, ConversationEventError,
-    ConversationEventExtension, ConversationEventKind, ConversationProblem, ConversationTurnId,
-    DriverEventEnvelope, DriverEventReadError, DriverEventReader, InvalidAssistantResponse,
-    InvalidConversationProblem, InvalidModelCommunication, InvalidModelData, InvocationError,
-    ModelCommunication, ModelData, ModelDetails, ModelEvent, ModelEventImportance, ModelId,
+    AssistantResponse, Conversation, ConversationEvent, ConversationEventClass,
+    ConversationEventError, ConversationEventExtension, ConversationEventKind, ConversationProblem,
+    ConversationTurnId, DriverEventEnvelope, DriverEventReadError, DriverEventReader,
+    InvalidAssistantResponse, InvalidConversationProblem, InvalidModelCommunication,
+    InvocationError, ModelCommunication, ModelData, ModelEvent, ModelEventImportance, ModelId,
     ModelInvocationId, ModelIssue, ModelSource, ProviderId, StoredConversationEventKind,
     TurnOutcome, UserContent,
 };
@@ -84,6 +84,10 @@ struct OpenAiInvocationRequested {
 }
 
 impl ConversationEventExtension for OpenAiInvocationRequested {
+    fn class(&self) -> ConversationEventClass {
+        ConversationEventClass::Command
+    }
+
     fn driver_name(&self) -> &str {
         "openai"
     }
@@ -162,8 +166,6 @@ impl ModelDriver for OpenAiModelDriver {
             .json(&request_body)
             .build();
         let http_client = self.http_client.clone();
-        let source = self.source.clone();
-
         async move {
             let request = match request {
                 Ok(request) => request,
@@ -173,7 +175,6 @@ impl ModelDriver for OpenAiModelDriver {
                         invocation_event,
                         turn_id,
                         invocation_id,
-                        &source,
                         error,
                         FailureStage::BeforeStream,
                     ));
@@ -186,7 +187,6 @@ impl ModelDriver for OpenAiModelDriver {
                         invocation_event,
                         turn_id,
                         invocation_id,
-                        &source,
                         OpenAiError::Transport(error.to_string()),
                         FailureStage::BeforeStream,
                     ));
@@ -201,7 +201,6 @@ impl ModelDriver for OpenAiModelDriver {
                             invocation_event,
                             turn_id,
                             invocation_id,
-                            &source,
                             OpenAiError::Transport(error.to_string()),
                             FailureStage::BeforeStream,
                         ));
@@ -212,14 +211,12 @@ impl ModelDriver for OpenAiModelDriver {
                         model_issue_stream(issue),
                         turn_id,
                         invocation_id,
-                        source,
                         Box::new(invocation_event),
                     )),
                     Err(error) => Ok(invocation_error_stream(
                         invocation_event,
                         turn_id,
                         invocation_id,
-                        &source,
                         error,
                         FailureStage::BeforeStream,
                     )),
@@ -238,7 +235,6 @@ impl ModelDriver for OpenAiModelDriver {
                 model_output_stream(response_bytes),
                 turn_id,
                 invocation_id,
-                source,
                 Box::new(invocation_event),
             ))
         }
@@ -346,7 +342,6 @@ struct ConversationEventStreamState {
     provider_events: ProviderOutputStream,
     turn_id: ConversationTurnId,
     invocation_id: ModelInvocationId,
-    source: ModelSource,
     invocation_event: Option<Box<dyn ConversationEventExtension>>,
     pending_events: VecDeque<ConversationEvent>,
     turn_failed: bool,
@@ -357,7 +352,6 @@ fn invocation_error_stream(
     invocation_event: OpenAiInvocationRequested,
     turn_id: ConversationTurnId,
     invocation_id: ModelInvocationId,
-    source: &ModelSource,
     error: OpenAiError,
     failure_stage: FailureStage,
 ) -> ModelOutputStream {
@@ -366,9 +360,7 @@ fn invocation_error_stream(
         Ok(ConversationEvent::Shared(ConversationEventKind::Problem {
             turn_id: Some(turn_id),
             invocation_id: Some(invocation_id),
-            model: Some(
-                ModelDetails::new(source.clone(), None).expect("the model details should be valid"),
-            ),
+            data: None,
             problem: provider_problem(&error, failure_stage),
         })),
         Ok(ConversationEvent::Shared(
@@ -385,7 +377,6 @@ fn conversation_event_stream(
     provider_events: ProviderOutputStream,
     turn_id: ConversationTurnId,
     invocation_id: ModelInvocationId,
-    source: ModelSource,
     invocation_event: Box<dyn ConversationEventExtension>,
 ) -> ModelOutputStream {
     stream::unfold(
@@ -393,7 +384,6 @@ fn conversation_event_stream(
             provider_events,
             turn_id,
             invocation_id,
-            source,
             invocation_event: Some(invocation_event),
             pending_events: VecDeque::new(),
             turn_failed: false,
@@ -415,7 +405,6 @@ fn conversation_event_stream(
                         driver_event,
                         state.turn_id,
                         state.invocation_id,
-                        &state.source,
                     );
                     let driver_output = match driver_output {
                         Ok(driver_output) => driver_output,
@@ -423,7 +412,6 @@ fn conversation_event_stream(
                             state.pending_events = failure_events(
                                 state.turn_id,
                                 state.invocation_id,
-                                &state.source,
                                 error,
                                 FailureStage::DuringStream,
                             );
@@ -446,7 +434,6 @@ fn conversation_event_stream(
                     state.pending_events = failure_events(
                         state.turn_id,
                         state.invocation_id,
-                        &state.source,
                         error,
                         FailureStage::DuringStream,
                     );
@@ -487,7 +474,6 @@ enum FailureStage {
 fn failure_events(
     turn_id: ConversationTurnId,
     invocation_id: ModelInvocationId,
-    source: &ModelSource,
     error: OpenAiError,
     failure_stage: FailureStage,
 ) -> VecDeque<ConversationEvent> {
@@ -495,9 +481,7 @@ fn failure_events(
         ConversationEvent::Shared(ConversationEventKind::Problem {
             turn_id: Some(turn_id),
             invocation_id: Some(invocation_id),
-            model: Some(
-                ModelDetails::new(source.clone(), None).expect("the model details should be valid"),
-            ),
+            data: None,
             problem: provider_problem(&error, failure_stage),
         }),
         ConversationEvent::Shared(ConversationEventKind::TurnCompleted {
@@ -545,27 +529,26 @@ fn translate_model_driver_event(
     driver_event: ModelDriverEvent,
     turn_id: ConversationTurnId,
     invocation_id: ModelInvocationId,
-    source: &ModelSource,
 ) -> Result<ConversationEvent, OpenAiError> {
     let kind = match driver_event {
         ModelDriverEvent::Model { event, data } => match event {
             ModelEvent::Assistant(response) => ConversationEventKind::Assistant {
                 turn_id,
                 invocation_id,
-                model: ModelDetails::new(source.clone(), data).map_err(invalid_model_data)?,
+                data,
                 response,
             },
             ModelEvent::Communication(communication) => ConversationEventKind::Communication {
                 turn_id,
                 invocation_id,
-                model: ModelDetails::new(source.clone(), data).map_err(invalid_model_data)?,
+                data,
                 communication,
             },
         },
         ModelDriverEvent::Problem { problem, data } => ConversationEventKind::Problem {
             turn_id: Some(turn_id),
             invocation_id: Some(invocation_id),
-            model: Some(ModelDetails::new(source.clone(), data).map_err(invalid_model_data)?),
+            data,
             problem: ConversationProblem::Issue(problem),
         },
     };
@@ -1198,10 +1181,6 @@ fn invalid_conversation_problem(error: InvalidConversationProblem) -> OpenAiErro
     OpenAiError::InvalidResponse(error.to_string())
 }
 
-fn invalid_model_data(error: InvalidModelData) -> OpenAiError {
-    OpenAiError::InvalidResponse(error.to_string())
-}
-
 fn append_delta(payload: &Value, output: &mut AccumulatedText) -> Result<(), OpenAiError> {
     if output.emitted {
         return Err(OpenAiError::InvalidResponse(format!(
@@ -1338,8 +1317,8 @@ mod tests {
     use crate::conversation::{
         AssistantResponse, Conversation, ConversationEvent, ConversationEventId,
         ConversationEventKind, ConversationEventRecord, ConversationId, ConversationProblem,
-        ConversationTurnId, ModelCommunication, ModelData, ModelDetails, ModelEvent,
-        ModelEventImportance, ModelId, ModelInvocationId, ModelIssue, ModelSource, ProviderId,
+        ConversationTurnId, ModelCommunication, ModelData, ModelEvent, ModelEventImportance,
+        ModelId, ModelInvocationId, ModelIssue, ModelSource, ProviderId,
         StoredConversationEventKind, UserContent,
     };
     use crate::model_driver::ModelDriver;
@@ -1367,10 +1346,6 @@ mod tests {
     #[test]
     fn semantic_input_projects_canonical_events_and_ignores_model_data() {
         let conversation_id = ConversationId::new();
-        let source = ModelSource::new(
-            ProviderId::from_str("openai").expect("the provider identifier should be valid"),
-            ModelId::from_str("gpt-5.6").expect("the model identifier should be valid"),
-        );
         let model_data = ModelData::new(Map::from_iter([(
             "native".to_owned(),
             Value::String("ignored".to_owned()),
@@ -1393,8 +1368,7 @@ mod tests {
                 ConversationEventKind::Communication {
                     turn_id,
                     invocation_id,
-                    model: ModelDetails::new(source.clone(), Some(model_data.clone()))
-                        .expect("the model details should be valid"),
+                    data: Some(model_data.clone()),
                     communication: ModelCommunication::new(
                         "Reasoning".to_owned(),
                         ModelEventImportance::Detailed,
@@ -1409,8 +1383,7 @@ mod tests {
                 ConversationEventKind::Assistant {
                     turn_id,
                     invocation_id,
-                    model: ModelDetails::new(source, Some(model_data))
-                        .expect("the model details should be valid"),
+                    data: Some(model_data),
                     response: AssistantResponse::new("Hello.".to_owned())
                         .expect("the assistant response should be valid"),
                 },
@@ -1551,21 +1524,13 @@ mod tests {
             &second_event,
             ConversationEventKind::Assistant { .. }
         ));
-        let ConversationEventKind::Communication { model, .. } = &first_event else {
-            panic!("the first event should be a model event");
-        };
-        assert_eq!(model.source(), &source());
-        let ConversationEventKind::Assistant { model, .. } = &second_event else {
-            panic!("the second event should be a model event");
-        };
-        assert_eq!(model.source(), &source());
         assert!(matches!(
             &first_event,
-            ConversationEventKind::Communication { model, .. } if model.data().is_none()
+            ConversationEventKind::Communication { data, .. } if data.is_none()
         ));
         assert!(matches!(
             &second_event,
-            ConversationEventKind::Assistant { model, .. } if model.data().is_none()
+            ConversationEventKind::Assistant { data, .. } if data.is_none()
         ));
         assert!(matches!(
             model_events.next().await,

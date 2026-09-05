@@ -38,10 +38,11 @@ TurnCompleted
 `Problem` may be model-associated or unrelated. Model provenance is optional
 metadata on the applicable fact rather than the fact's primary kind.
 
-`ModelDetails` retains the model source and optional opaque model data. A
-model-produced fact also carries a `ModelInvocationId`, allowing several
-assistant, communication, problem, or future tool facts to refer to one model
-invocation without repeating the invocation record on every fact.
+Driver-defined invocation events retain the model source and invocation-wide
+configuration. A model-produced fact carries only a `ModelInvocationId` and
+optional event-specific model data, allowing several assistant, communication,
+problem, or future tool facts to refer to one invocation without repeating its
+provenance.
 
 ## Commands And Turns
 

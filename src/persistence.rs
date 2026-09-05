@@ -9,8 +9,8 @@ use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 use crate::conversation::{
-    Conversation, ConversationEvent, ConversationEventRecord, ConversationId,
-    StoredConversationEventKind,
+    Conversation, ConversationEvent, ConversationEventClass, ConversationEventRecord,
+    ConversationId, StoredConversationEventKind,
 };
 
 pub(crate) struct EventStore {
@@ -48,14 +48,7 @@ impl EventStore {
         let events = self
             .load_conversation_log(conversation_id)?
             .into_iter()
-            .filter_map(|mut event| match event.kind {
-                StoredConversationEventKind::Shared(kind) if !kind.is_command() => {
-                    event.kind = StoredConversationEventKind::Shared(kind);
-                    Some(event)
-                }
-                StoredConversationEventKind::Shared(_)
-                | StoredConversationEventKind::Extension(_) => None,
-            })
+            .filter(|event| event.class() == ConversationEventClass::Fact)
             .collect();
         let conversation = Conversation::from_events(events).map_err(invalid_conversation_data)?;
         if conversation.id() != conversation_id {
@@ -213,15 +206,12 @@ fn invalid_conversation_data(error: impl Error + Send + Sync + 'static) -> io::E
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use serde_json::{Map, Value};
 
     use super::EventStore;
     use crate::conversation::{
         AssistantResponse, ConversationCommandId, ConversationEvent, ConversationEventKind,
-        ConversationId, ConversationTurnId, ModelData, ModelDetails, ModelId, ModelInvocationId,
-        ModelSource, ProviderId, UserContent,
+        ConversationId, ConversationTurnId, ModelData, ModelInvocationId, UserContent,
     };
 
     fn temporary_store() -> EventStore {
@@ -286,10 +276,6 @@ mod tests {
     fn event_store_persists_model_data_on_the_event_envelope() {
         let store = temporary_store();
         let conversation_id = ConversationId::new();
-        let source = ModelSource::new(
-            ProviderId::from_str("openai").expect("the provider identifier should be valid"),
-            ModelId::from_str("gpt-5.6").expect("the model identifier should be valid"),
-        );
         let model_data = ModelData::new(Map::from_iter([(
             "response_id".to_owned(),
             Value::String("resp_1".to_owned()),
@@ -302,8 +288,7 @@ mod tests {
                 ConversationEvent::Shared(ConversationEventKind::Assistant {
                     turn_id: ConversationTurnId::new(),
                     invocation_id: ModelInvocationId::new(),
-                    model: ModelDetails::new(source, Some(model_data))
-                        .expect("the model details should be valid"),
+                    data: Some(model_data),
                     response: AssistantResponse::new("The answer is 42.".to_owned())
                         .expect("the assistant response should be valid"),
                 }),

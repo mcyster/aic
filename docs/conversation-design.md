@@ -109,17 +109,18 @@ enum ConversationEventKind {
     },
     TurnRequested { ... },
     Assistant {
-        model: ModelDetails,
         invocation_id: ModelInvocationId,
+        data: Option<ModelData>,
         response: AssistantResponse,
     },
     Communication {
-        model: ModelDetails,
         invocation_id: ModelInvocationId,
+        data: Option<ModelData>,
         communication: ModelCommunication,
     },
     Problem {
-        model: Option<ModelDetails>,
+        invocation_id: Option<ModelInvocationId>,
+        data: Option<ModelData>,
         problem: ConversationProblem,
     },
     TurnCompleted { ... },
@@ -131,12 +132,21 @@ enum ConversationEventKind {
 }
 ```
 
-`ModelDetails` keeps the model source and optional model-native data together. Model-produced facts carry a stable `ModelInvocationId`; several facts can refer to one driver-defined invocation record. A model-associated problem has model details, while an unrelated problem may use `None`. User events cannot carry model details. The portable kind contains the complete meaning of the event; model data never does.
+Model provenance belongs to the driver-defined invocation event, not to shared
+assistant, communication, or problem facts. Those facts carry only an
+`invocation_id` where applicable and optional event-specific `ModelData`. A
+driver-independent consumer can continue from their portable content without
+interpreting the invocation event.
 
 `DriverEventEnvelope` stores the driver name, driver version, event type, event
 schema version, human-readable description, and opaque JSON payload. A driver
 provided decoder may reconstruct its concrete event. If the driver is
 unavailable, the envelope remains readable and preserved without decoding.
+
+Every event also has a typed `ConversationEventClass`: shared variants derive
+`Command` or `Fact` from their kind, while driver extensions declare the class
+through the extension contract and persist it in the envelope. The class is
+independent from the `Shared`/`Extension` schema owner dimension.
 
 The vocabulary should grow only when a concrete repeated semantic need justifies another event type.
 
@@ -324,7 +334,9 @@ A failed model invocation never removes the already-durable `User` event.
 
 ## 9. Assistant And Communication
 
-`Assistant` and `Communication` are top-level semantic event kinds. Model provenance and optional model-native data belong to their applicable `ModelDetails`; the event also carries the producing `ModelInvocationId`.
+`Assistant` and `Communication` are top-level semantic event kinds. They carry
+portable content, optional event-specific `ModelData`, and the producing
+`ModelInvocationId`, but do not repeat driver or model provenance.
 
 The durable common shape is:
 
@@ -525,9 +537,13 @@ Data is not model input by default.
 
 ## 17. Model-specific data
 
-The optional `ModelData` inside `ModelDetails` is the one channel for driver-native enrichment.
+`ModelData` is optional event-specific driver data carried directly by the
+shared fact it describes.
 
-It retains model/provider-specific information that is useful enough to preserve but does not justify a universal field. `ModelData` is opaque to the conversation and supports JSON serialization. `ModelDetails` keeps it with the owning `ModelSource`, so the driver can decide whether it knows how to interpret the content. The driver that creates it defines and interprets it, and another driver may ignore it safely.
+It retains model/provider-specific information that is useful enough to preserve
+but does not justify a universal shared field. `ModelData` is opaque to the
+conversation's meaning but remains serialized and inspectable. The driver that
+creates it defines and interprets it, and another driver may ignore it safely.
 
 The portable event kind must contain the complete meaning of the event. `ModelData` may preserve native fidelity or improve continuation, but it must never be required to understand the conversation.
 
@@ -543,21 +559,23 @@ Cross-driver replay must continue to work from portable fields when model data i
 
 `ConversationProblem::Invocation` means the invocation machinery failed. `ModelDriverError` remains the detailed control-flow error. The turn service sanitizes it, appends the invocation problem, and returns the original error.
 
-A `Problem` is a top-level conversation event. A model-associated problem carries `Some(ModelDetails)`; a future problem unrelated to a model may carry `None`. It is not model output merely because it concerns a model invocation.
+A `Problem` is a top-level conversation event. It may reference an invocation
+and carry event-specific `ModelData`, but does not repeat invocation provenance.
+It is not model output merely because it concerns a model invocation.
 
 An invocation failure before a stream exists therefore leaves:
 
 ```text
 User(...)
-Problem(model=Some(...), problem=Invocation(...))
+Problem(invocation_id=Some(...), problem=Invocation(...))
 ```
 
 If an established stream fails later, it leaves:
 
 ```text
 User(...)
-Model(...completed semantic event...)
-Problem(model=Some(...), problem=Invocation(...))
+Assistant(...completed semantic event...)
+Problem(invocation_id=Some(...), problem=Invocation(...))
 ```
 
 Completed semantic events already yielded remain valid conversation facts, and events already appended are not rolled back. Incomplete provider deltas that never formed a completed `ModelEvent` are discarded.
@@ -737,7 +755,7 @@ A caller that wants batch behavior can collect the stream. No separate batch int
 
 ## 23. Returned event persistence
 
-User input and `TurnRequested` are appended before invocation. The driver maps provider-native activity to driver-defined records and semantic event kinds, including `ModelDetails` and driver-created `ModelInvocationId` values where the event concerns a model. The append boundary assigns canonical envelope metadata. The caller persists and may display each returned semantic event immediately while the invocation remains active.
+User input and `TurnRequested` are appended before invocation. The driver maps provider-native activity to driver-defined records and semantic event kinds, including driver-created `ModelInvocationId` values and event-specific `ModelData` where applicable. The append boundary assigns canonical envelope metadata. The caller persists and may display each returned semantic event immediately while the invocation remains active.
 
 Provider protocol events and raw text deltas remain internal to the driver. They
 are not conversation events and are not persisted merely because they arrived.

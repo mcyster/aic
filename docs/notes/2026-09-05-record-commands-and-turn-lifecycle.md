@@ -12,8 +12,9 @@ visible for future replay without making commands part of model-visible history.
 
 Semantic event kinds remain readable. `User`, `Assistant`, `Communication`, and
 `Problem` describe different meanings. A generic `Model` wrapper should not hide
-those distinctions. Applicable model facts carry `ModelDetails` and a stable
-`ModelInvocationId`.
+those distinctions. Applicable model facts carry a stable `ModelInvocationId`
+and optional event-specific model data. Invocation provenance remains in the
+driver-defined invocation event.
 
 ## Simple Greeting
 

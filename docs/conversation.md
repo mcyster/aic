@@ -83,7 +83,10 @@ Conversation events define a universal semantic minimum and permit lossless enri
 
 Driver-specific data enriches portable semantics; it must not replace them. The portable representation must contain enough information for another compatible driver to continue meaningfully, and semantically important structured concepts remain structured. For example, a tool request retains its portable call ID, tool name, and arguments even if it also contains a provider-specific call ID.
 
-Driver-specific details remain immutable parts of the Conversation Log through `ModelDetails` on applicable facts. `ModelDetails` always contains a `ModelSource` and may contain opaque JSON-serializable `ModelData`. Model-produced facts also carry a `ModelInvocationId`; a driver-defined invocation record is stored once and output facts reference it. Raw provider transport events do not become semantic conversation events merely because they are provider-specific.
+Driver-defined invocation records own model source, model, and invocation-specific
+configuration. Shared model-produced facts carry only a `ModelInvocationId` and
+optional event-specific `ModelData`. Raw provider transport events do not become
+semantic conversation events merely because they are provider-specific.
 
 ## Event Meanings
 
@@ -95,7 +98,7 @@ Large or binary content belongs in a content store and is referenced by a strong
 
 ### Assistant And Communication
 
-`Assistant` records the model's actual response to the conversation. It participates in portable continuation and is always `Important`. Its applicable `ModelDetails` and `ModelInvocationId` identify the producing model invocation.
+`Assistant` records the model's actual response to the conversation. It participates in portable continuation and is always `Important`. Its `ModelInvocationId` identifies the producing invocation; provenance remains in the driver-defined invocation event.
 
 `Communication` records auxiliary model-produced information such as detailed reasoning, reasoning summaries, status, or emerging concepts. Communications are persisted but are not automatically replayed as assistant responses.
 
@@ -105,7 +108,7 @@ Both event kinds retain meaningful portable messages, and the portable event kin
 
 ### Problem
 
-`Problem` records a `ConversationProblem` as a top-level conversation event. It is not model output merely because it concerns a model invocation. A model-associated problem carries `Some(ModelDetails)`; a future unrelated problem may carry `None`. `ConversationProblem::Issue` records a semantic model limitation or unsuccessful outcome, such as refusal or context exhaustion. `ConversationProblem::Invocation` records a sanitized operational invocation failure. Every concrete problem provides one meaningful message, and the shared parent exposes that message and whether retrying the unchanged invocation may reasonably succeed. The enclosing conversation event does not duplicate the message and does not add generic severity.
+`Problem` records a `ConversationProblem` as a top-level conversation event. It is not model output merely because it concerns a model invocation. Applicable problems may carry an invocation ID and event-specific model data, but do not repeat invocation provenance. `ConversationProblem::Issue` records a semantic model limitation or unsuccessful outcome, such as refusal or context exhaustion. `ConversationProblem::Invocation` records a sanitized operational invocation failure. Every concrete problem provides one meaningful message, and the shared parent exposes that message and whether retrying the unchanged invocation may reasonably succeed. The enclosing conversation event does not duplicate the message and does not add generic severity.
 
 There is no `Other` problem kind. A newly understood semantic problem receives a specific shared kind, while unusable provider output and unclassified invocation failure retain their distinct existing meanings. Problems are not automatically projected into every provider request; each driver decides how a retained problem should inform a later model.
 
@@ -169,7 +172,7 @@ Event positions must not be used as semantic identifiers.
 
 User input and commands are appended before model invocation. `TurnRequested` establishes the caller-to-driver request. The driver creates any invocation record and identity, then returns a stream of driver events, semantic event kinds, and explicit `TurnCompleted`. The consumer controls demand by polling that stream for its next event; receiving several events does not represent several model requests.
 
-The driver combines each model-produced result with applicable `ModelDetails` and `ModelInvocationId`, but does not allocate durable envelope metadata. The append boundary assigns record identity, timestamp, and position. If invocation setup or the stream fails, the caller creates and appends a sanitized `ConversationProblem::Invocation` and returns the detailed `ModelDriverError`; it does not synthesize turn completion. Stream exhaustion without `TurnCompleted` is incomplete execution, not success. Completed semantic events already yielded remain valid conversation facts and appended events are not rolled back.
+The driver combines each model-produced result with its `ModelInvocationId` and optional event-specific `ModelData`, but does not allocate durable envelope metadata. The append boundary assigns record identity, timestamp, and position. If invocation setup or the stream fails, the driver emits a sanitized `ConversationProblem::Invocation` and explicit completion when it can continue through the event contract. The caller does not synthesize turn completion. Stream exhaustion without `TurnCompleted` is incomplete execution, not success. Completed semantic events already yielded remain valid conversation facts and appended events are not rolled back.
 
 This supersedes the earlier batch contract in which all model events were returned only after the complete invocation succeeded and all model output was discarded on a late provider failure. A caller that needs batch behavior can collect the stream; no separate batch interface is required.
 

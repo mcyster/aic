@@ -9,16 +9,17 @@ use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
 pub(crate) use event::{
-    AssistantResponse, ConversationEvent, ConversationEventError, ConversationEventExtension,
-    ConversationEventKind, ConversationEventRecord, DriverEventEnvelope, DriverEventReadError,
-    DriverEventReader, InvalidAssistantResponse, InvalidModelCommunication, ModelCommunication,
-    ModelEvent, ModelEventImportance, StoredConversationEventKind, TurnOutcome, UserContent,
+    AssistantResponse, ConversationEvent, ConversationEventClass, ConversationEventError,
+    ConversationEventExtension, ConversationEventKind, ConversationEventRecord,
+    DriverEventEnvelope, DriverEventReadError, DriverEventReader, InvalidAssistantResponse,
+    InvalidModelCommunication, ModelCommunication, ModelEvent, ModelEventImportance,
+    StoredConversationEventKind, TurnOutcome, UserContent,
 };
 pub(crate) use id::{
     ConversationCommandId, ConversationEventId, ConversationId, ConversationTurnId,
     ModelInvocationId,
 };
-pub(crate) use model::{ModelDetails, ModelId, ModelSource, ProviderId};
+pub(crate) use model::{ModelId, ModelSource, ProviderId};
 pub(crate) use model_data::{InvalidModelData, ModelData};
 pub(crate) use problem::{
     ConversationProblem, InvalidConversationProblem, InvocationError, ModelIssue,
@@ -382,13 +383,7 @@ mod tests {
             "type": "assistant",
             "turn_id": ConversationTurnId::new(),
             "invocation_id": crate::conversation::ModelInvocationId::new(),
-            "model": {
-                "source": {
-                    "provider": "openai",
-                    "model": "gpt-5.6"
-                },
-                "data": {}
-            },
+            "data": {},
             "response": { "message": "The answer is 42." }
         }))
         .expect("derived deserialization should construct the conversation event");

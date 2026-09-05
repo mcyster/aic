@@ -4,7 +4,11 @@ use std::fmt::{Display, Formatter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::ConversationEventClass;
+
 pub(crate) trait ConversationEventExtension: Send {
+    fn class(&self) -> ConversationEventClass;
+
     fn driver_name(&self) -> &str;
 
     fn driver_version(&self) -> &str;
@@ -19,6 +23,7 @@ pub(crate) trait ConversationEventExtension: Send {
 
     fn to_envelope(&self) -> Result<DriverEventEnvelope, ConversationEventError> {
         DriverEventEnvelope::new(
+            self.class(),
             self.driver_name().to_owned(),
             self.driver_version().to_owned(),
             self.event_type().to_owned(),
@@ -82,6 +87,7 @@ impl Error for ConversationEventError {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct DriverEventEnvelope {
+    class: ConversationEventClass,
     driver: String,
     driver_version: String,
     event_type: String,
@@ -93,6 +99,7 @@ pub(crate) struct DriverEventEnvelope {
 #[allow(dead_code)]
 impl DriverEventEnvelope {
     pub(crate) fn new(
+        class: ConversationEventClass,
         driver: String,
         driver_version: String,
         event_type: String,
@@ -101,6 +108,7 @@ impl DriverEventEnvelope {
         payload: Value,
     ) -> Result<Self, InvalidDriverEventEnvelope> {
         let event = Self {
+            class,
             driver,
             driver_version,
             event_type,
@@ -114,6 +122,10 @@ impl DriverEventEnvelope {
 
     pub(crate) fn driver(&self) -> &str {
         &self.driver
+    }
+
+    pub(crate) fn class(&self) -> ConversationEventClass {
+        self.class
     }
 
     pub(crate) fn driver_version(&self) -> &str {

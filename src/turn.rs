@@ -73,7 +73,6 @@ impl TurnService {
             ConversationEvent::Shared(ConversationEventKind::TurnRequested {
                 command_id: ConversationCommandId::new(),
                 turn_id,
-                model: source.clone(),
             }),
         )?;
         let conversation = self.event_store.load_conversation(conversation_id)?;
@@ -212,11 +211,11 @@ mod tests {
     use crate::conversation::DriverEventReadError;
     use crate::conversation::DriverEventReader;
     use crate::conversation::{
-        AssistantResponse, Conversation, ConversationEvent, ConversationEventError,
-        ConversationEventExtension, ConversationEventKind, ConversationEventRecord, ConversationId,
-        ConversationProblem, ConversationTurnId, DriverEventEnvelope, ModelCommunication,
-        ModelDetails, ModelEventImportance, ModelId, ModelInvocationId, ModelIssue, ModelSource,
-        ProviderId, StoredConversationEventKind, TurnOutcome, UserPrompt,
+        AssistantResponse, Conversation, ConversationEvent, ConversationEventClass,
+        ConversationEventError, ConversationEventExtension, ConversationEventKind,
+        ConversationEventRecord, ConversationId, ConversationProblem, ConversationTurnId,
+        DriverEventEnvelope, ModelCommunication, ModelEventImportance, ModelId, ModelInvocationId,
+        ModelIssue, ModelSource, ProviderId, StoredConversationEventKind, TurnOutcome, UserPrompt,
     };
     use crate::model_driver::{ModelDriver, ModelDriverError, ModelOutputStream};
     use crate::persistence::EventStore;
@@ -240,6 +239,10 @@ mod tests {
     }
 
     impl ConversationEventExtension for TestInvocationRequested {
+        fn class(&self) -> ConversationEventClass {
+            ConversationEventClass::Command
+        }
+
         fn driver_name(&self) -> &str {
             "test"
         }
@@ -304,7 +307,7 @@ mod tests {
             let semantic_outputs = self
                 .outputs
                 .iter()
-                .map(|output| output_kind(output, &self.source, turn_id, invocation_id))
+                .map(|output| output_kind(output, turn_id, invocation_id))
                 .collect::<Vec<_>>();
             let turn_outcome = if self
                 .outputs
@@ -385,13 +388,11 @@ mod tests {
             _conversation: &'invoke Conversation,
             turn_id: ConversationTurnId,
         ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
-            let source = self.source.clone();
             let invocation_id = ModelInvocationId::new();
             async move {
                 Ok(stream::iter(vec![
                     Ok(ConversationEvent::Shared(assistant_kind(
                         "Completed answer",
-                        &source,
                         turn_id,
                         invocation_id,
                     ))),
@@ -416,19 +417,15 @@ mod tests {
 
     fn output_kind(
         output: &TestOutput,
-        source: &ModelSource,
         turn_id: ConversationTurnId,
         invocation_id: ModelInvocationId,
     ) -> ConversationEventKind {
         match output {
-            TestOutput::Assistant(message) => {
-                assistant_kind(message, source, turn_id, invocation_id)
-            }
+            TestOutput::Assistant(message) => assistant_kind(message, turn_id, invocation_id),
             TestOutput::Communication(message) => ConversationEventKind::Communication {
                 turn_id,
                 invocation_id,
-                model: ModelDetails::new(source.clone(), None)
-                    .expect("the model details should be valid"),
+                data: None,
                 communication: ModelCommunication::new(
                     message.clone(),
                     ModelEventImportance::Detailed,
@@ -439,10 +436,7 @@ mod tests {
             TestOutput::Problem(problem) => ConversationEventKind::Problem {
                 turn_id: Some(turn_id),
                 invocation_id: Some(invocation_id),
-                model: Some(
-                    ModelDetails::new(source.clone(), None)
-                        .expect("the model details should be valid"),
-                ),
+                data: None,
                 problem: problem.clone(),
             },
         }
@@ -450,15 +444,13 @@ mod tests {
 
     fn assistant_kind(
         message: &str,
-        source: &ModelSource,
         turn_id: ConversationTurnId,
         invocation_id: ModelInvocationId,
     ) -> ConversationEventKind {
         ConversationEventKind::Assistant {
             turn_id,
             invocation_id,
-            model: ModelDetails::new(source.clone(), None)
-                .expect("the model details should be valid"),
+            data: None,
             response: AssistantResponse::new(message.to_owned())
                 .expect("the assistant response should be valid"),
         }
@@ -508,7 +500,7 @@ mod tests {
         let problem = ConversationEventKind::Problem {
             turn_id: None,
             invocation_id: None,
-            model: None,
+            data: None,
             problem: ConversationProblem::Issue(
                 ModelIssue::try_refusal("refused".to_owned()).expect("the issue should be valid"),
             ),
@@ -574,7 +566,8 @@ mod tests {
         assert_eq!(log.len(), 7);
         assert!(matches!(
             &log[0].kind,
-            StoredConversationEventKind::Shared(kind) if kind.is_command()
+            StoredConversationEventKind::Shared(kind)
+                if kind.class() == ConversationEventClass::Command
         ));
         assert!(matches!(
             event_kind(&log[1]),
