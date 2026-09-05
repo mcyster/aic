@@ -93,9 +93,9 @@ impl TurnService {
                 Err(error) => return Err(Box::new(error)),
             };
             if turn_completed {
-                return Err(Box::new(ModelDriverError::InvalidOutput(
-                    "the model driver emitted output after completing the turn".to_owned(),
-                )));
+                return Err(Box::new(ModelDriverError::OutputAfterCompletion {
+                    event_type: conversation_event_type(&driver_output),
+                }));
             }
             match driver_output {
                 ConversationEvent::Extension(event) => {
@@ -127,12 +127,6 @@ impl TurnService {
                     }
                     ConversationEventKind::TurnCompleted { .. } => {
                         ensure_event_belongs_to_turn(&conversation_kind, turn_id)?;
-                        if turn_completed {
-                            let error = ModelDriverError::InvalidOutput(
-                                "the model driver completed the turn more than once".to_owned(),
-                            );
-                            return Err(Box::new(error));
-                        }
                         turn_completed = true;
                         self.event_store.append_new_conversation_event(
                             conversation_id,
@@ -140,9 +134,9 @@ impl TurnService {
                         )?;
                     }
                     _ => {
-                        let error = ModelDriverError::InvalidOutput(
-                            "the model driver returned an invalid conversation event".to_owned(),
-                        );
+                        let error = ModelDriverError::DisallowedEventKind {
+                            event_type: conversation_event_kind_name(&conversation_kind),
+                        };
                         return Err(Box::new(error));
                     }
                 },
@@ -169,22 +163,40 @@ fn ensure_event_belongs_to_turn(
             ..
         } => *turn_id,
         ConversationEventKind::Problem { turn_id: None, .. } => {
-            return Err(ModelDriverError::InvalidOutput(
-                "the model driver returned a problem without a turn".to_owned(),
-            ));
+            return Err(ModelDriverError::MissingTurnIdentity);
         }
         _ => {
-            return Err(ModelDriverError::InvalidOutput(
-                "the model driver returned an invalid conversation event".to_owned(),
-            ));
+            return Err(ModelDriverError::DisallowedEventKind {
+                event_type: conversation_event_kind_name(event),
+            });
         }
     };
     if actual_turn_id != expected_turn_id {
-        return Err(ModelDriverError::InvalidOutput(
-            "the model driver returned an event for another turn".to_owned(),
-        ));
+        return Err(ModelDriverError::WrongTurnIdentity {
+            expected: expected_turn_id,
+            actual: actual_turn_id,
+        });
     }
     Ok(())
+}
+
+fn conversation_event_type(event: &ConversationEvent) -> String {
+    match event {
+        ConversationEvent::Extension(_) => "driver_event".to_owned(),
+        ConversationEvent::Shared(event) => conversation_event_kind_name(event),
+    }
+}
+
+fn conversation_event_kind_name(event: &ConversationEventKind) -> String {
+    match event {
+        ConversationEventKind::Assistant { .. } => "assistant".to_owned(),
+        ConversationEventKind::Communication { .. } => "communication".to_owned(),
+        ConversationEventKind::Problem { .. } => "problem".to_owned(),
+        ConversationEventKind::TurnCompleted { .. } => "turn_completed".to_owned(),
+        ConversationEventKind::UserMessageRequested { .. } => "user_message_requested".to_owned(),
+        ConversationEventKind::User { .. } => "user".to_owned(),
+        ConversationEventKind::TurnRequested { .. } => "turn_requested".to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -341,7 +353,12 @@ mod tests {
             _conversation: &'invoke Conversation,
             _turn_id: ConversationTurnId,
         ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
-            async { Err(ModelDriverError::InvalidOutput("failure".to_owned())) }.boxed()
+            async {
+                Err(ModelDriverError::DisallowedEventKind {
+                    event_type: "test_failure".to_owned(),
+                })
+            }
+            .boxed()
         }
     }
 
@@ -378,7 +395,9 @@ mod tests {
                         turn_id,
                         invocation_id,
                     ))),
-                    Err(ModelDriverError::InvalidOutput("late failure".to_owned())),
+                    Err(ModelDriverError::DisallowedEventKind {
+                        event_type: "late_failure".to_owned(),
+                    }),
                 ])
                 .boxed())
             }
@@ -466,6 +485,49 @@ mod tests {
             std::env::temp_dir().join(format!("tog-turn-test-{}", uuid::Uuid::now_v7())),
         )
         .expect("the event store should be created")
+    }
+
+    #[test]
+    fn driver_contract_errors_preserve_the_violation_details() {
+        let expected_turn_id = ConversationTurnId::new();
+        let actual_turn_id = ConversationTurnId::new();
+        assert_eq!(
+            super::ensure_event_belongs_to_turn(
+                &ConversationEventKind::TurnCompleted {
+                    turn_id: actual_turn_id,
+                    outcome: TurnOutcome::Succeeded,
+                },
+                expected_turn_id,
+            ),
+            Err(ModelDriverError::WrongTurnIdentity {
+                expected: expected_turn_id,
+                actual: actual_turn_id,
+            })
+        );
+
+        let problem = ConversationEventKind::Problem {
+            turn_id: None,
+            invocation_id: None,
+            model: None,
+            problem: ConversationProblem::Issue(
+                ModelIssue::try_refusal("refused".to_owned()).expect("the issue should be valid"),
+            ),
+        };
+        assert_eq!(
+            super::ensure_event_belongs_to_turn(&problem, expected_turn_id),
+            Err(ModelDriverError::MissingTurnIdentity)
+        );
+
+        let user = ConversationEventKind::User {
+            caused_by: None,
+            content: vec![],
+        };
+        assert_eq!(
+            super::ensure_event_belongs_to_turn(&user, expected_turn_id),
+            Err(ModelDriverError::DisallowedEventKind {
+                event_type: "user".to_owned(),
+            })
+        );
     }
 
     fn event_kind(event: &ConversationEventRecord) -> &ConversationEventKind {

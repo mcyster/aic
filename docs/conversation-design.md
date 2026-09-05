@@ -696,9 +696,22 @@ trait ModelDriver: DriverEventReader {
         Result<ModelOutputStream, ModelDriverError>,
     >;
 }
+
+enum ModelDriverError {
+    WrongTurnIdentity { expected, actual },
+    MissingTurnIdentity,
+    DisallowedEventKind { event_type: String },
+    OutputAfterCompletion { event_type: String },
+    IncompleteTurn,
+}
 ```
 
 This is conceptually `Future<Stream<ConversationEvent>>`, or `Mono<Flux<ConversationEvent>>` in Reactor terminology. The caller supplies only the immutable conversation and turn identity. The driver creates invocation identities, driver events, and invocation-specific data. Shared semantic events remain concrete and portable. Every output is a conversation event and is appended through the shared record boundary.
+
+`ModelDriverError` describes only failures of this shared contract. Provider
+failures that the driver can describe are emitted as portable `Problem` events;
+terminal provider failures are followed by the driver's explicit
+`TurnCompleted { outcome: failed }`.
 
 The important Phase 1 properties are:
 
