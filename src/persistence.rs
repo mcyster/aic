@@ -8,7 +8,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-use crate::conversation::{Conversation, ConversationEvent, ConversationEventKind, ConversationId};
+use crate::conversation::{
+    Conversation, ConversationEvent, ConversationEventKind, ConversationId, ConversationRecordKind,
+};
+use crate::model_driver::DriverEvent;
 
 pub(crate) struct EventStore {
     root_directory: PathBuf,
@@ -45,7 +48,13 @@ impl EventStore {
         let events = self
             .load_conversation_log(conversation_id)?
             .into_iter()
-            .filter(|event| !event.kind.is_command())
+            .filter_map(|mut event| match event.kind {
+                ConversationRecordKind::Event(kind) if !kind.is_command() => {
+                    event.kind = ConversationRecordKind::Event(kind);
+                    Some(event)
+                }
+                ConversationRecordKind::Event(_) | ConversationRecordKind::Driver(_) => None,
+            })
             .collect();
         let conversation = Conversation::from_events(events).map_err(invalid_conversation_data)?;
         if conversation.id() != conversation_id {
@@ -69,6 +78,23 @@ impl EventStore {
         conversation_id: ConversationId,
         kind: ConversationEventKind,
     ) -> io::Result<ConversationEvent> {
+        self.append_new_record(conversation_id, ConversationRecordKind::Event(kind))
+    }
+
+    pub(crate) fn append_driver_event(
+        &self,
+        conversation_id: ConversationId,
+        event: &dyn DriverEvent,
+    ) -> io::Result<ConversationEvent> {
+        let envelope = event.to_envelope().map_err(io::Error::other)?;
+        self.append_new_record(conversation_id, ConversationRecordKind::Driver(envelope))
+    }
+
+    fn append_new_record(
+        &self,
+        conversation_id: ConversationId,
+        kind: ConversationRecordKind,
+    ) -> io::Result<ConversationEvent> {
         let conversation_directory = self.conversation_directory(conversation_id);
         create_private_directory(&conversation_directory)?;
         let events_directory = conversation_directory.join("events");
@@ -87,8 +113,16 @@ impl EventStore {
             }
             conversation.events().last().map(|event| event.position)
         };
-        let conversation_event =
-            ConversationEvent::new(conversation_id, next_position(previous_position)?, kind);
+        let conversation_event = match kind {
+            ConversationRecordKind::Event(kind) => {
+                ConversationEvent::new(conversation_id, next_position(previous_position)?, kind)
+            }
+            ConversationRecordKind::Driver(event) => ConversationEvent::new_driver(
+                conversation_id,
+                next_position(previous_position)?,
+                event,
+            ),
+        };
         write_json_atomically(
             &event_path(
                 &events_directory,

@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use time::OffsetDateTime;
 
 use super::{
@@ -21,7 +22,7 @@ pub(crate) struct ConversationEvent {
     pub(crate) timestamp: OffsetDateTime,
     pub(crate) schema_version: u32,
     #[serde(flatten)]
-    pub(crate) kind: ConversationEventKind,
+    pub(crate) kind: ConversationRecordKind,
 }
 
 impl ConversationEvent {
@@ -36,7 +37,22 @@ impl ConversationEvent {
             id: ConversationEventId::new(),
             timestamp: OffsetDateTime::now_utc(),
             schema_version: SCHEMA_VERSION,
-            kind,
+            kind: ConversationRecordKind::Event(kind),
+        }
+    }
+
+    pub(crate) fn new_driver(
+        conversation_id: ConversationId,
+        position: u64,
+        event: DriverEventEnvelope,
+    ) -> Self {
+        Self {
+            conversation_id,
+            position,
+            id: ConversationEventId::new(),
+            timestamp: OffsetDateTime::now_utc(),
+            schema_version: SCHEMA_VERSION,
+            kind: ConversationRecordKind::Driver(event),
         }
     }
 
@@ -44,6 +60,115 @@ impl ConversationEvent {
         self.kind.ensure_valid()
     }
 }
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum ConversationRecordKind {
+    Event(ConversationEventKind),
+    Driver(DriverEventEnvelope),
+}
+
+impl ConversationRecordKind {
+    pub(super) fn ensure_valid(&self) -> Result<(), InvalidConversationEventKind> {
+        match self {
+            Self::Event(event) => event.ensure_valid(),
+            Self::Driver(event) => event
+                .ensure_valid()
+                .map_err(InvalidConversationEventKind::DriverEvent),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct DriverEventEnvelope {
+    driver: String,
+    driver_version: String,
+    event_type: String,
+    event_schema_version: u32,
+    description: String,
+    payload: Value,
+}
+
+#[allow(dead_code)]
+impl DriverEventEnvelope {
+    pub(crate) fn new(
+        driver: String,
+        driver_version: String,
+        event_type: String,
+        event_schema_version: u32,
+        description: String,
+        payload: Value,
+    ) -> Result<Self, InvalidDriverEventEnvelope> {
+        let event = Self {
+            driver,
+            driver_version,
+            event_type,
+            event_schema_version,
+            description,
+            payload,
+        };
+        event.ensure_valid()?;
+        Ok(event)
+    }
+
+    pub(crate) fn driver(&self) -> &str {
+        &self.driver
+    }
+
+    pub(crate) fn driver_version(&self) -> &str {
+        &self.driver_version
+    }
+
+    pub(crate) fn event_type(&self) -> &str {
+        &self.event_type
+    }
+
+    pub(crate) fn event_schema_version(&self) -> u32 {
+        self.event_schema_version
+    }
+
+    pub(crate) fn payload(&self) -> &Value {
+        &self.payload
+    }
+
+    fn ensure_valid(&self) -> Result<(), InvalidDriverEventEnvelope> {
+        if self.driver.trim().is_empty() {
+            return Err(InvalidDriverEventEnvelope::DriverName);
+        }
+        if self.driver_version.trim().is_empty() {
+            return Err(InvalidDriverEventEnvelope::DriverVersion);
+        }
+        if self.event_type.trim().is_empty() {
+            return Err(InvalidDriverEventEnvelope::EventType);
+        }
+        if self.description.trim().is_empty() {
+            return Err(InvalidDriverEventEnvelope::Description);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum InvalidDriverEventEnvelope {
+    DriverName,
+    DriverVersion,
+    EventType,
+    Description,
+}
+
+impl Display for InvalidDriverEventEnvelope {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::DriverName => "driver name must not be empty",
+            Self::DriverVersion => "driver version must not be empty",
+            Self::EventType => "driver event type must not be empty",
+            Self::Description => "driver event description must not be empty",
+        };
+        write!(formatter, "{message}")
+    }
+}
+
+impl Error for InvalidDriverEventEnvelope {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -60,12 +185,6 @@ pub(crate) enum ConversationEventKind {
     TurnRequested {
         command_id: ConversationCommandId,
         turn_id: ConversationTurnId,
-        model: ModelSource,
-    },
-    ModelInvocationRequested {
-        command_id: ConversationCommandId,
-        turn_id: ConversationTurnId,
-        invocation_id: ModelInvocationId,
         model: ModelSource,
     },
     Assistant {
@@ -99,7 +218,7 @@ impl ConversationEventKind {
     pub(super) fn ensure_valid(&self) -> Result<(), InvalidConversationEventKind> {
         match self {
             Self::UserMessageRequested { .. } | Self::User { .. } => Ok(()),
-            Self::TurnRequested { .. } | Self::ModelInvocationRequested { .. } => Ok(()),
+            Self::TurnRequested { .. } => Ok(()),
             Self::Assistant {
                 model, response, ..
             } => {
@@ -139,9 +258,7 @@ impl ConversationEventKind {
     pub(crate) fn is_command(&self) -> bool {
         matches!(
             self,
-            Self::UserMessageRequested { .. }
-                | Self::TurnRequested { .. }
-                | Self::ModelInvocationRequested { .. }
+            Self::UserMessageRequested { .. } | Self::TurnRequested { .. }
         )
     }
 }
@@ -159,6 +276,7 @@ pub(super) enum InvalidConversationEventKind {
     ModelCommunication(InvalidModelCommunication),
     ConversationProblem(InvalidConversationProblem),
     ModelData(InvalidModelData),
+    DriverEvent(InvalidDriverEventEnvelope),
 }
 
 impl Display for InvalidConversationEventKind {
@@ -168,6 +286,7 @@ impl Display for InvalidConversationEventKind {
             Self::ModelCommunication(error) => Display::fmt(error, formatter),
             Self::ConversationProblem(error) => Display::fmt(error, formatter),
             Self::ModelData(error) => Display::fmt(error, formatter),
+            Self::DriverEvent(error) => Display::fmt(error, formatter),
         }
     }
 }

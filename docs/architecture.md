@@ -59,10 +59,10 @@ is requested, allowing messages to accumulate independently from agent work.
 An assistant response is not a completion marker, and a problem does not always
 complete a turn because orchestration may recover or retry.
 
-`ModelInvocationRequested` records the invocation command and its stable
-`ModelInvocationId`. Returned model facts reference that identifier. The
-invocation record is execution metadata, not a replacement for portable
-assistant or problem meaning.
+The driver records its own invocation event, including a stable
+`ModelInvocationId`, as an opaque driver event. Returned model facts reference
+that identifier. The invocation record is execution metadata, not a replacement
+for portable assistant or problem meaning.
 
 ## Conversation Projection
 
@@ -79,22 +79,25 @@ representation.
 
 ## Model Driver Boundary
 
-The configured `ModelDriver` receives an immutable `Conversation` and an
-invocation identity, then yields completed semantic output kinds. It does not
-allocate durable record positions, timestamps, or record identifiers. The
-event store assigns that envelope metadata at the shared append boundary.
+The configured `ModelDriver` receives an immutable `Conversation` and a
+`ConversationTurnId`, then yields shared semantic events, driver-defined events,
+and an explicit `TurnCompleted` event. It creates invocation identities and
+invocation-specific data. It does not allocate durable record positions,
+timestamps, or record identifiers. The event store assigns that envelope
+metadata at the shared append boundary.
 
 ```text
 immutable Conversation
     -> ModelDriver invocation
-    -> completed semantic facts with invocation ID
+    -> driver events, semantic facts, and TurnCompleted
     -> append boundary assigns record metadata
     -> log and presentation projections
 ```
 
 Provider-specific protocol events and raw deltas remain private to the driver.
-The caller owns command recording, persistence, turn completion, retry policy,
-and the outer orchestration loop.
+The caller owns command recording, persistence, retry policy, and the outer
+orchestration loop. The driver owns invocation identities and reports turn
+completion explicitly.
 
 The [Conversation Model](conversation.md) summarizes the stable vocabulary. The
 [Conversation and ModelDriver Architecture](conversation-design.md) contains

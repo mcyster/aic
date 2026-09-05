@@ -276,6 +276,14 @@ fn turn_persists_events_and_prints_semantic_output() {
     .expect("the persisted user event should be JSON");
     assert_eq!(user_event["schema_version"], 11);
     assert_eq!(user_event["type"], "user");
+    let invocation_event: Value = serde_json::from_reader(
+        fs::File::open(&event_paths[3]).expect("the invocation event should open"),
+    )
+    .expect("the invocation event should be JSON");
+    assert_eq!(invocation_event["driver"], "openai");
+    assert_eq!(invocation_event["event_type"], "model_invocation_requested");
+    assert_eq!(invocation_event["event_schema_version"], 1);
+    assert!(invocation_event["payload"]["invocation_id"].is_string());
     let model_event: Value = serde_json::from_reader(
         fs::File::open(&event_paths[4]).expect("the persisted model event should open"),
     )

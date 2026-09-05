@@ -23,7 +23,7 @@ Adding user content and requesting agent work are separate concepts:
 UserMessageRequested
 User
 TurnRequested
-ModelInvocationRequested
+DriverInvocationEvent
 Assistant
 TurnCompleted
 ```
@@ -32,9 +32,9 @@ TurnCompleted
 accepted contribution to portable conversation history. User content can exist
 before a turn is requested, so it does not need to belong to a turn.
 
-`TurnRequested` starts agent work. `ModelInvocationRequested` records the model
-invocation command and its `ModelInvocationId`. Assistant, communication,
-problem, and future model-produced tool facts reference that identifier.
+`TurnRequested` starts agent work. The driver creates a driver-defined invocation
+event and its `ModelInvocationId`. Assistant, communication, problem, and future
+model-produced tool facts reference that identifier.
 
 `TurnCompleted` is an explicit terminal fact. An assistant response and turn
 completion are independent: one invocation may produce multiple events, and a
@@ -52,6 +52,11 @@ Turn IDs associate work and outcomes. Invocation IDs distinguish multiple
 attempts or invocations within one turn. Tool execution will need its own
 correlation when introduced; adjacency is not sufficient once work runs
 concurrently.
+
+Driver-defined records use a shared envelope containing the driver name and
+version, event type and schema version, human-readable description, and opaque
+payload. A driver decoder may reconstruct the concrete event; unavailable
+drivers do not prevent preserving the envelope.
 
 The append boundary assigns durable positions, record IDs, and timestamps.
 Drivers do not allocate positions from an input snapshot. Log order records

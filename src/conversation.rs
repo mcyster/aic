@@ -9,9 +9,9 @@ use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
 pub(crate) use event::{
-    AssistantResponse, ConversationEvent, ConversationEventKind, InvalidAssistantResponse,
-    InvalidModelCommunication, ModelCommunication, ModelEvent, ModelEventImportance, TurnOutcome,
-    UserContent,
+    AssistantResponse, ConversationEvent, ConversationEventKind, ConversationRecordKind,
+    DriverEventEnvelope, InvalidAssistantResponse, InvalidModelCommunication, ModelCommunication,
+    ModelEvent, ModelEventImportance, TurnOutcome, UserContent,
 };
 pub(crate) use id::{
     ConversationCommandId, ConversationEventId, ConversationId, ConversationTurnId,
@@ -168,8 +168,8 @@ mod tests {
 
     use super::{
         Conversation, ConversationCommandId, ConversationEvent, ConversationEventId,
-        ConversationEventKind, ConversationId, ConversationTurnId, InvalidConversation,
-        InvalidUserPrompt, UserContent, UserPrompt,
+        ConversationEventKind, ConversationId, ConversationRecordKind, ConversationTurnId,
+        InvalidConversation, InvalidUserPrompt, UserContent, UserPrompt,
     };
 
     fn user_event(conversation_id: ConversationId, position: u64) -> ConversationEvent {
@@ -179,10 +179,10 @@ mod tests {
             id: ConversationEventId::new(),
             timestamp: OffsetDateTime::UNIX_EPOCH,
             schema_version: 7,
-            kind: ConversationEventKind::User {
+            kind: ConversationRecordKind::Event(ConversationEventKind::User {
                 caused_by: Some(ConversationCommandId::new()),
                 content: vec![UserContent::Text(format!("event {position}"))],
-            },
+            }),
         }
     }
 
@@ -429,7 +429,7 @@ mod tests {
 
         assert!(matches!(
             conversation.events()[0].kind,
-            ConversationEventKind::Problem { .. }
+            ConversationRecordKind::Event(ConversationEventKind::Problem { .. })
         ));
     }
 

@@ -56,7 +56,7 @@ Fact record
     something was accepted or happened
 ```
 
-For example, `UserMessageRequested` records input received by the system and `User` records the accepted conversation content. `TurnRequested` starts agent work, while `TurnCompleted` records its terminal outcome. `ModelInvocationRequested` records the model invocation and its stable `ModelInvocationId`; produced model facts reference that identifier.
+For example, `UserMessageRequested` records input received by the system and `User` records the accepted conversation content. `TurnRequested` starts agent work, while `TurnCompleted` records its terminal outcome. A driver-defined invocation record carries its stable `ModelInvocationId`; produced model facts reference that identifier.
 
 The intended record vocabulary is:
 
@@ -64,7 +64,6 @@ The intended record vocabulary is:
 UserMessageRequested
 User
 TurnRequested
-ModelInvocationRequested
 Assistant
 Communication
 Problem
@@ -84,7 +83,7 @@ Conversation events define a universal semantic minimum and permit lossless enri
 
 Driver-specific data enriches portable semantics; it must not replace them. The portable representation must contain enough information for another compatible driver to continue meaningfully, and semantically important structured concepts remain structured. For example, a tool request retains its portable call ID, tool name, and arguments even if it also contains a provider-specific call ID.
 
-Driver-specific details remain immutable parts of the Conversation Log through `ModelDetails` on applicable facts. `ModelDetails` always contains a `ModelSource` and may contain opaque JSON-serializable `ModelData`. Model-produced facts also carry a `ModelInvocationId`; the invocation command is recorded once and output facts reference it. Raw provider transport events do not become semantic conversation events merely because they are provider-specific.
+Driver-specific details remain immutable parts of the Conversation Log through `ModelDetails` on applicable facts. `ModelDetails` always contains a `ModelSource` and may contain opaque JSON-serializable `ModelData`. Model-produced facts also carry a `ModelInvocationId`; a driver-defined invocation record is stored once and output facts reference it. Raw provider transport events do not become semantic conversation events merely because they are provider-specific.
 
 ## Event Meanings
 
@@ -110,7 +109,7 @@ Both event kinds retain meaningful portable messages, and the portable event kin
 
 There is no `Other` problem kind. A newly understood semantic problem receives a specific shared kind, while unusable provider output and unclassified invocation failure retain their distinct existing meanings. Problems are not automatically projected into every provider request; each driver decides how a retained problem should inform a later model.
 
-`ModelDriverError` is not durable conversation state. It carries detailed Rust control-flow information from invocation setup or stream consumption. The turn service converts it into a sanitized `ConversationProblem::Invocation`, creates and appends that problem fact with the applicable `ModelInvocationId`, and then returns the original error. Raw provider bodies, credentials, stack traces, and sensitive request data are not copied into durable problems.
+`ModelDriverError` is not durable conversation state. It carries detailed Rust control-flow information from invocation setup or stream consumption. The turn service converts it into a sanitized `ConversationProblem::Invocation`, creates and appends that problem fact, and then returns the original error. A recoverable problem does not itself complete or fail a turn; the driver reports `TurnCompleted` explicitly. Raw provider bodies, credentials, stack traces, and sensitive request data are not copied into durable problems.
 
 For example, several provider events may project to one response:
 
@@ -168,9 +167,9 @@ Event positions must not be used as semantic identifiers.
 
 ## Durability And Projection
 
-User input and commands are appended before model invocation. `TurnRequested` and `ModelInvocationRequested` establish the recorded lifecycle and invocation identity. The asynchronous invocation returns a stream of completed semantic event kinds. The consumer controls demand by polling that stream for its next event; receiving several events does not represent several model requests.
+User input and commands are appended before model invocation. `TurnRequested` establishes the caller-to-driver request. The driver creates any invocation record and identity, then returns a stream of driver events, semantic event kinds, and explicit `TurnCompleted`. The consumer controls demand by polling that stream for its next event; receiving several events does not represent several model requests.
 
-The driver combines each model-produced result with applicable `ModelDetails` and `ModelInvocationId`, but does not allocate durable envelope metadata. The append boundary assigns record identity, timestamp, and position. If invocation setup or the stream fails, the caller creates and appends a sanitized `ConversationProblem::Invocation`, then appends `TurnCompleted { outcome: failed }` and returns the detailed `ModelDriverError`. Completed semantic events already yielded remain valid conversation facts and appended events are not rolled back. A successful or semantic-problem invocation ends with an explicit `TurnCompleted` fact.
+The driver combines each model-produced result with applicable `ModelDetails` and `ModelInvocationId`, but does not allocate durable envelope metadata. The append boundary assigns record identity, timestamp, and position. If invocation setup or the stream fails, the caller creates and appends a sanitized `ConversationProblem::Invocation` and returns the detailed `ModelDriverError`; it does not synthesize turn completion. Stream exhaustion without `TurnCompleted` is incomplete execution, not success. Completed semantic events already yielded remain valid conversation facts and appended events are not rolled back.
 
 This supersedes the earlier batch contract in which all model events were returned only after the complete invocation succeeded and all model output was discarded on a late provider failure. A caller that needs batch behavior can collect the stream; no separate batch interface is required.
 
