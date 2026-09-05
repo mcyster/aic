@@ -25,23 +25,24 @@ Where uncertain:
 
 ## 1. Architectural overview
 
-Phase 1 has one durable semantic event stream:
+Phase 1 has one durable ordered log containing commands and semantic facts:
 
 ```text
 Conversation Log
+    requested work
     semantic history
+    turn lifecycle
     durable replay source
-    cross-model / cross-provider contract
 ```
 
-A `ModelDriver` consumes an immutable reference to the reconstructed conversation. One asynchronous invocation establishes a stream that yields completed `ConversationEvent`s:
+A `ModelDriver` consumes an immutable reference to the reconstructed conversation. One asynchronous invocation establishes a stream that yields completed semantic event kinds:
 
 ```text
 immutable Conversation
     → asynchronous ModelDriver invocation
-    → stream of completed ConversationEvents
-    → caller persists and presents each returned event
-    → ConversationEvents appended incrementally
+    → stream of completed semantic facts
+    → append boundary assigns record metadata
+    → facts appended and presented incrementally
 ```
 
 One invocation is one provider/model invocation. For OpenAI, it is one REST request with one SSE response stream; consuming several semantic events from that stream does not make several model requests.
@@ -58,7 +59,7 @@ Later, concrete benefits may justify making some of that provider-specific infor
 
 ## 2. Conversation
 
-A conversation begins with its first semantic `ConversationEvent`. The durable event stream is authoritative; `Conversation` is an immutable in-memory projection reconstructed from it.
+A conversation begins with its first accepted semantic event. The durable log is authoritative; `Conversation` is an immutable projection reconstructed from non-command records.
 
 Conceptually:
 
@@ -69,7 +70,7 @@ struct Conversation {
 }
 ```
 
-There is no independently persisted conversation record and no empty persisted conversation. Construction validates that the sequence contains at least one event, all events carry the same `ConversationId`, and positions form a valid order. The projection exposes read-only access to its ID and events.
+There is no independently persisted conversation record and no empty persisted conversation. Construction validates that the sequence contains at least one event, all events carry the same `ConversationId`, and positions are strictly ordered. Commands and lifecycle records may create gaps in projected positions.
 
 The Conversation Log answers:
 
@@ -91,23 +92,33 @@ future UIs
 
 ## 3. ConversationEvent and ConversationEventKind
 
-`ConversationEvent` is the complete canonical fact persisted, replayed, or published. `ConversationEventKind` defines its semantic content, which describes facts rather than provider transport mechanics.
+`ConversationEvent` is the complete canonical log record persisted and replayed. `ConversationEventKind` contains both command records and semantic facts; commands are excluded from the model-facing `Conversation` projection.
 
 Conceptually:
 
 ```rust
 enum ConversationEventKind {
+    UserMessageRequested { ... },
     User {
         content: Vec<UserContent>,
     },
-    Model {
+    TurnRequested { ... },
+    ModelInvocationRequested { ... },
+    Assistant {
         model: ModelDetails,
-        event: ModelEvent,
+        invocation_id: ModelInvocationId,
+        response: AssistantResponse,
+    },
+    Communication {
+        model: ModelDetails,
+        invocation_id: ModelInvocationId,
+        communication: ModelCommunication,
     },
     Problem {
         model: Option<ModelDetails>,
         problem: ConversationProblem,
     },
+    TurnCompleted { ... },
     ToolRequest(...),
     ToolResponse(...),
     Context(...),
@@ -116,7 +127,7 @@ enum ConversationEventKind {
 }
 ```
 
-`ModelDetails` keeps the model source and optional model-native data together. A model event always has model details; a model-associated problem has model details as well, while a future unrelated problem may use `None`. User events cannot carry model details. The portable kind contains the complete meaning of the event; model data never does.
+`ModelDetails` keeps the model source and optional model-native data together. Model-produced facts carry a stable `ModelInvocationId`; several facts can refer to one invocation without repeating its invocation record. A model-associated problem has model details, while an unrelated problem may use `None`. User events cannot carry model details. The portable kind contains the complete meaning of the event; model data never does.
 
 The vocabulary should grow only when a concrete repeated semantic need justifies another event type.
 
@@ -126,28 +137,28 @@ OpenAI Responses events such as `response.created`, text deltas, and function ar
 
 ## 4. Commands and events
 
-Commands represent intent:
+The log records both command intent and resulting facts:
 
 ```text
-PostUserInput
-InvokeModelDriver
-ExecuteTool
-MutateContext
-SetData
-PostAutomation
+UserMessageRequested
+TurnRequested
+ModelInvocationRequested
+ToolExecutionRequested
 ```
 
-Conversation events represent facts:
+The distinction is semantic, not physical:
 
 ```text
-Command
-    something should happen
+Command record
+    a request was received
 
-ConversationEvent
-    something happened
+Fact record
+    something was accepted or happened
 ```
 
-Commands are not part of canonical conversation history.
+Commands remain in the ordered log for input visibility and future replay. The
+model-facing projection excludes them. `TurnCompleted` is an explicit fact and
+does not need to be inferred from an assistant response or a problem.
 
 Do not force every command into:
 
@@ -168,6 +179,9 @@ Conceptually:
 ```rust
 struct ConversationId(Uuid);
 struct ConversationEventId(Uuid);
+struct ConversationCommandId(Uuid);
+struct ConversationTurnId(Uuid);
+struct ModelInvocationId(Uuid);
 struct ToolCallId(Uuid);
 struct ImageId(Uuid);
 struct FileId(Uuid);
@@ -298,16 +312,16 @@ A failed model invocation never removes the already-durable `User` event.
 
 ---
 
-## 9. ModelEvent
+## 9. Assistant And Communication
 
-`ModelEvent` records successful typed model output. Provenance and optional model-native data belong to `ModelDetails` on the enclosing `ConversationEventKind::Model`, not to `ModelEvent`.
+`Assistant` and `Communication` are top-level semantic event kinds. Model provenance and optional model-native data belong to their applicable `ModelDetails`; the event also carries the producing `ModelInvocationId`.
 
 The durable common shape is:
 
 ```rust
-enum ModelEvent {
-    Assistant(AssistantResponse),
-    Communication(ModelCommunication),
+enum ConversationEventKind {
+    Assistant { ... },
+    Communication { ... },
 }
 
 enum ConversationProblem {
@@ -322,7 +336,7 @@ enum ModelEventImportance {
 }
 ```
 
-`ModelEvent::Assistant(AssistantResponse)` is the actual response used for portable continuation and is always important. `ModelEvent::Communication(ModelCommunication)` carries auxiliary information with a subtype and importance.
+`Assistant` is the actual response used for portable continuation and is always important. `Communication` carries auxiliary information with a subtype and importance.
 
 ---
 
@@ -341,14 +355,39 @@ output.done
 but the semantic conversation may record:
 
 ```text
-Model(model=..., event=Assistant(AssistantResponse(message="Hello")))
+Assistant(model=..., invocation_id=..., message="Hello")
 ```
 
 A driver emits detailed reasoning as a detailed communication, a reasoning summary as an interesting communication, and final output as an assistant response. Consumers such as the CLI choose which communications to present. Only assistant responses are replayed as assistant history.
 
 ---
 
-## 11. ToolRequest
+## 11. Turn Lifecycle
+
+User content and agent work are separate concepts. A user message may be
+accepted before any turn is requested, and several messages may be available to
+one turn. A turn records requested work and ends with an explicit terminal fact:
+
+```text
+UserMessageRequested
+User
+TurnRequested
+ModelInvocationRequested
+Assistant / Communication / Problem
+TurnCompleted
+```
+
+An assistant response does not complete a turn by itself. A problem may be
+recoverable, so it does not necessarily complete a turn either. `TurnCompleted`
+records the terminal outcome after orchestration has finished or given up.
+
+`ModelInvocationRequested` has a stable `ModelInvocationId`. Every model fact
+produced by that invocation references the identifier. A retry may use another
+invocation identifier while remaining part of the same turn.
+
+---
+
+## 12. ToolRequest
 
 `ToolRequest` records that a model requested a tool invocation.
 
@@ -619,7 +658,7 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 
 type ModelOutputStream =
-    BoxStream<'static, Result<ConversationEvent, ModelDriverError>>;
+    BoxStream<'static, Result<ConversationEventKind, ModelDriverError>>;
 
 trait ModelDriver {
     fn source(&self) -> &ModelSource;
@@ -627,6 +666,8 @@ trait ModelDriver {
     fn invoke<'invoke>(
         &'invoke self,
         conversation: &'invoke Conversation,
+        turn_id: ConversationTurnId,
+        invocation_id: ModelInvocationId,
     ) -> BoxFuture<
         'invoke,
         Result<ModelOutputStream, ModelDriverError>,
@@ -634,7 +675,7 @@ trait ModelDriver {
 }
 ```
 
-This is conceptually `Future<Stream<ConversationEvent>>`, or `Mono<Flux<ConversationEvent>>` in Reactor terminology. The outer future establishes the provider invocation and returns its stream. Request construction, authentication, connection, or HTTP failure may prevent a stream from being established. The established stream yields `Result<ConversationEvent, ModelDriverError>` because provider invocation may also fail after streaming has begun. A model-reported problem is a `ConversationEvent` on that stream, not a parallel output channel.
+This is conceptually `Future<Stream<ConversationEventKind>>`, or `Mono<Flux<ConversationEventKind>>` in Reactor terminology. The outer future establishes the provider invocation and returns its stream. Request construction, authentication, connection, or HTTP failure may prevent a stream from being established. The established stream yields `Result<ConversationEventKind, ModelDriverError>` because provider invocation may also fail after streaming has begun. A model-reported problem is a semantic event on that stream, not a parallel output channel.
 
 The important Phase 1 properties are:
 
@@ -642,7 +683,7 @@ The important Phase 1 properties are:
 - input is a complete immutable conversation reconstructed from conversation events
 - the driver owns and exposes its stable provider/model source
 - invocation is asynchronous and stream-first
-- the stream yields zero or more completed `ConversationEvent`s, each with portable meaning and any applicable `ModelDetails`
+- the stream yields zero or more completed semantic event kinds, each with portable meaning, applicable `ModelDetails`, and the supplied `ModelInvocationId`
 - the consumer controls demand by polling for the next event
 - the caller owns the outer model/tool loop
 - expected failures are strongly typed
@@ -654,7 +695,7 @@ A caller that wants batch behavior can collect the stream. No separate batch int
 
 ## 23. Returned event persistence
 
-User input is appended before model invocation. The driver maps provider-native activity to complete `ConversationEvent`s, including `ModelDetails` where the event concerns a model, and canonical envelope metadata. The caller persists and may display each returned conversation event immediately while the invocation remains active.
+User input, `TurnRequested`, and `ModelInvocationRequested` are appended before invocation. The driver maps provider-native activity to semantic event kinds, including `ModelDetails` and the supplied `ModelInvocationId` where the event concerns a model. The append boundary assigns canonical envelope metadata. The caller persists and may display each returned semantic event immediately while the invocation remains active.
 
 Provider protocol events and raw text deltas remain internal to the driver. They are not `ConversationEvent`s and are not persisted merely because they arrived. The driver aggregates those deltas and yields only completed semantic output such as an `AssistantResponse`, `ModelCommunication`, or `ModelIssue`.
 
@@ -666,7 +707,8 @@ User already durable
 await ModelDriver invocation
     ↓
 setup failure before stream
-    → append sanitized Problem(model=Some(...), problem=Invocation(...))
+    → append sanitized Problem(invocation_id=..., problem=Invocation(...))
+    → append TurnCompleted(outcome=failed)
     → return detailed ModelDriverError
 
 or
@@ -676,12 +718,13 @@ await ModelDriver invocation
 poll stream
     ↓
 completed ConversationEvent
-    → display and append the returned event
+    → display and append the returned semantic event
     ↓
 later stream failure
     → completed events remain durable
     → incomplete provider deltas are discarded
-    → append sanitized Problem(model=Some(...), problem=Invocation(...))
+    → append sanitized Problem(invocation_id=..., problem=Invocation(...))
+    → append TurnCompleted(outcome=failed)
     → return detailed ModelDriverError
 ```
 
@@ -694,10 +737,10 @@ This supersedes the previous batch contract, which returned all model events onl
 An established invocation yields typed model-associated semantic facts incrementally:
 
 ```rust
-Result<ConversationEvent, ModelDriverError>
+Result<ConversationEventKind, ModelDriverError>
 ```
 
-This supports assistant responses, auxiliary communications, and model-reported problems as one conversation-event stream. The driver owns construction of returned conversation envelopes; provider-specific intermediate events remain private to the driver. Invocation errors enter the `ConversationEventKind::Problem` surface only after caller-owned sanitization. Stream polling supplies demand and natural backpressure at this boundary.
+This supports assistant responses, auxiliary communications, and model-reported problems as one semantic stream. The append boundary owns durable envelope construction; provider-specific intermediate events remain private to the driver. Invocation errors enter the `Problem` surface only after caller-owned sanitization. Stream polling supplies demand and natural backpressure at this boundary.
 
 ---
 
@@ -708,7 +751,7 @@ Expected model failures are explicit both while establishing the invocation and 
 ```rust
 BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>>
 
-BoxStream<'static, Result<ConversationEvent, ModelDriverError>>
+BoxStream<'static, Result<ConversationEventKind, ModelDriverError>>
 ```
 
 A small error model might begin with:

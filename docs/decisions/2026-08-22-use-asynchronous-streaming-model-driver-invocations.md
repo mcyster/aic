@@ -1,5 +1,7 @@
 # Use Asynchronous Streaming ModelDriver Invocations
 
+> Superseded by [Record Commands And Turn Lifecycle](../notes/2026-09-05-record-commands-and-turn-lifecycle.md) for the durable record shape and append boundary. The asynchronous streaming choice remains current.
+
 ## Why
 
 The original `ModelDriver` contract returned a batch of semantic model events only after an entire provider invocation succeeded. That contract could not expose completed semantic output incrementally or preserve it when a provider stream failed later.

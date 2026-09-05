@@ -42,7 +42,11 @@ impl EventStore {
         &self,
         conversation_id: ConversationId,
     ) -> io::Result<Conversation> {
-        let events = self.load_conversation_events(conversation_id)?;
+        let events = self
+            .load_conversation_log(conversation_id)?
+            .into_iter()
+            .filter(|event| !event.kind.is_command())
+            .collect();
         let conversation = Conversation::from_events(events).map_err(invalid_conversation_data)?;
         if conversation.id() != conversation_id {
             return Err(io::Error::new(
@@ -51,6 +55,13 @@ impl EventStore {
             ));
         }
         Ok(conversation)
+    }
+
+    pub(crate) fn load_conversation_log(
+        &self,
+        conversation_id: ConversationId,
+    ) -> io::Result<Vec<ConversationEvent>> {
+        self.load_conversation_events(conversation_id)
     }
 
     pub(crate) fn append_new_conversation_event(
@@ -87,38 +98,6 @@ impl EventStore {
             &conversation_event,
         )?;
         Ok(conversation_event)
-    }
-
-    pub(crate) fn append_conversation_event(&self, event: ConversationEvent) -> io::Result<()> {
-        let conversation_directory = self.conversation_directory(event.conversation_id);
-        create_private_directory(&conversation_directory)?;
-        let events_directory = conversation_directory.join("events");
-        create_private_directory(&events_directory)?;
-        let mut existing_events = self.load_conversation_events(event.conversation_id)?;
-        let previous_position = if existing_events.is_empty() {
-            None
-        } else {
-            Conversation::from_events(existing_events.clone())
-                .map_err(invalid_conversation_data)?;
-            existing_events.last().map(|event| event.position)
-        };
-        let expected_position = next_position(previous_position)?;
-        if event.position != expected_position {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "expected conversation event position {expected_position}, found {}",
-                    event.position
-                ),
-            ));
-        }
-        existing_events.push(event.clone());
-        Conversation::from_events(existing_events).map_err(invalid_conversation_data)?;
-        write_json_atomically(
-            &event_path(&events_directory, event.position, &event.id.storage_key()),
-            &event,
-        )?;
-        Ok(())
     }
 
     fn load_conversation_events(
@@ -205,8 +184,9 @@ mod tests {
 
     use super::EventStore;
     use crate::conversation::{
-        AssistantResponse, ConversationEvent, ConversationEventKind, ConversationId, ModelData,
-        ModelDetails, ModelEvent, ModelId, ModelSource, ProviderId, UserContent,
+        AssistantResponse, ConversationCommandId, ConversationEventKind, ConversationId,
+        ConversationTurnId, ModelData, ModelDetails, ModelId, ModelInvocationId, ModelSource,
+        ProviderId, UserContent,
     };
 
     fn temporary_store() -> EventStore {
@@ -223,6 +203,7 @@ mod tests {
             .append_new_conversation_event(
                 conversation_id,
                 ConversationEventKind::User {
+                    caused_by: Some(ConversationCommandId::new()),
                     content: vec![UserContent::Text("first".to_owned())],
                 },
             )
@@ -231,6 +212,7 @@ mod tests {
             .append_new_conversation_event(
                 conversation_id,
                 ConversationEventKind::User {
+                    caused_by: Some(ConversationCommandId::new()),
                     content: vec![UserContent::Text("second".to_owned())],
                 },
             )
@@ -238,11 +220,11 @@ mod tests {
 
         assert_eq!(first_event.conversation_id, conversation_id);
         assert_eq!(first_event.position, 0);
-        assert_eq!(first_event.schema_version, 10);
+        assert_eq!(first_event.schema_version, 11);
         assert_ne!(first_event.timestamp, time::OffsetDateTime::UNIX_EPOCH);
         assert_eq!(second_event.conversation_id, conversation_id);
         assert_eq!(second_event.position, 1);
-        assert_eq!(second_event.schema_version, 10);
+        assert_eq!(second_event.schema_version, 11);
         assert_ne!(second_event.timestamp, time::OffsetDateTime::UNIX_EPOCH);
         assert_ne!(second_event.id, first_event.id);
 
@@ -279,20 +261,18 @@ mod tests {
         )]))
         .expect("the model data should be valid");
 
-        let model_event = ConversationEvent::new(
-            conversation_id,
-            0,
-            ConversationEventKind::Model {
-                model: ModelDetails::new(source, Some(model_data))
-                    .expect("the model details should be valid"),
-                event: ModelEvent::Assistant(
-                    AssistantResponse::new("The answer is 42.".to_owned())
+        let model_event = store
+            .append_new_conversation_event(
+                conversation_id,
+                ConversationEventKind::Assistant {
+                    turn_id: ConversationTurnId::new(),
+                    invocation_id: ModelInvocationId::new(),
+                    model: ModelDetails::new(source, Some(model_data))
+                        .expect("the model details should be valid"),
+                    response: AssistantResponse::new("The answer is 42.".to_owned())
                         .expect("the assistant response should be valid"),
-                ),
-            },
-        );
-        store
-            .append_conversation_event(model_event.clone())
+                },
+            )
             .expect("the model event should be persisted");
 
         let conversation = store

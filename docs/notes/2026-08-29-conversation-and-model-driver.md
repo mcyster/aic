@@ -1,5 +1,7 @@
 # Conversation and ModelDriver
 
+The later [Record Commands And Turn Lifecycle](2026-09-05-record-commands-and-turn-lifecycle.md) note supersedes the driver-owned envelope and command-exclusion portions of this note.
+
 The central conclusion from the design discussions is that `tog` should preserve
 a portable semantic conversation before it preserves provider execution history.
 

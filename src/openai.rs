@@ -9,10 +9,11 @@ use reqwest::StatusCode;
 use serde_json::{Map, Value, json};
 
 use crate::conversation::{
-    AssistantResponse, Conversation, ConversationEvent, ConversationEventKind, ConversationId,
-    ConversationProblem, InvalidAssistantResponse, InvalidConversationProblem,
+    AssistantResponse, Conversation, ConversationEventKind, ConversationProblem,
+    ConversationTurnId, InvalidAssistantResponse, InvalidConversationProblem,
     InvalidModelCommunication, InvalidModelData, ModelCommunication, ModelData, ModelDetails,
-    ModelEvent, ModelEventImportance, ModelId, ModelIssue, ModelSource, ProviderId, UserContent,
+    ModelEvent, ModelEventImportance, ModelId, ModelInvocationId, ModelIssue, ModelSource,
+    ProviderId, UserContent,
 };
 use crate::model_driver::{ModelDriver, ModelDriverError, ModelOutputStream};
 
@@ -65,6 +66,8 @@ impl ModelDriver for OpenAiModelDriver {
     fn invoke<'invoke>(
         &'invoke self,
         conversation: &'invoke Conversation,
+        turn_id: ConversationTurnId,
+        invocation_id: ModelInvocationId,
     ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
         let mut request_body = Map::new();
         request_body.insert(
@@ -83,19 +86,9 @@ impl ModelDriver for OpenAiModelDriver {
             .json(&request_body)
             .build();
         let http_client = self.http_client.clone();
-        let conversation_id = conversation.id();
-        let next_position = conversation
-            .events()
-            .last()
-            .and_then(|event| event.position.checked_add(1));
         let source = self.source.clone();
 
         async move {
-            let next_position = next_position.ok_or_else(|| {
-                ModelDriverError::InvalidResponse(
-                    "the conversation has no available position for model output".to_owned(),
-                )
-            })?;
             let request =
                 request.map_err(|error| ModelDriverError::InvalidRequest(error.to_string()))?;
             let response = http_client
@@ -111,8 +104,8 @@ impl ModelDriver for OpenAiModelDriver {
                 return match classify_response_failure(response_status, response_body) {
                     Ok(issue) => Ok(conversation_event_stream(
                         model_issue_stream(issue),
-                        conversation_id,
-                        next_position,
+                        turn_id,
+                        invocation_id,
                         source,
                     )),
                     Err(error) => Err(error),
@@ -129,8 +122,8 @@ impl ModelDriver for OpenAiModelDriver {
                 .boxed();
             Ok(conversation_event_stream(
                 model_output_stream(response_bytes),
-                conversation_id,
-                next_position,
+                turn_id,
+                invocation_id,
                 source,
             ))
         }
@@ -144,7 +137,7 @@ fn semantic_input(conversation: &Conversation) -> Value {
             .events()
             .iter()
             .filter_map(|conversation_event| match &conversation_event.kind {
-                ConversationEventKind::User { content } => {
+                ConversationEventKind::User { content, .. } => {
                     let text = content
                         .iter()
                         .map(|content| match content {
@@ -154,12 +147,15 @@ fn semantic_input(conversation: &Conversation) -> Value {
                         .join("\n");
                     Some(json!({ "role": "user", "content": text }))
                 }
-                ConversationEventKind::Model {
-                    event: ModelEvent::Assistant(response),
-                    ..
-                } => Some(json!({ "role": "assistant", "content": response.message() })),
-                ConversationEventKind::Model { .. } => None,
-                ConversationEventKind::Problem { .. } => None,
+                ConversationEventKind::Assistant { response, .. } => {
+                    Some(json!({ "role": "assistant", "content": response.message() }))
+                }
+                ConversationEventKind::UserMessageRequested { .. }
+                | ConversationEventKind::TurnRequested { .. }
+                | ConversationEventKind::ModelInvocationRequested { .. }
+                | ConversationEventKind::Communication { .. }
+                | ConversationEventKind::Problem { .. }
+                | ConversationEventKind::TurnCompleted { .. } => None,
             })
             .collect(),
     )
@@ -211,23 +207,23 @@ fn model_issue_stream(issue: ModelIssue) -> ProviderOutputStream {
 
 struct ConversationEventStreamState {
     provider_events: ProviderOutputStream,
-    conversation_id: ConversationId,
-    next_position: u64,
+    turn_id: ConversationTurnId,
+    invocation_id: ModelInvocationId,
     source: ModelSource,
     terminated: bool,
 }
 
 fn conversation_event_stream(
     provider_events: ProviderOutputStream,
-    conversation_id: ConversationId,
-    next_position: u64,
+    turn_id: ConversationTurnId,
+    invocation_id: ModelInvocationId,
     source: ModelSource,
 ) -> ModelOutputStream {
     stream::unfold(
         ConversationEventStreamState {
             provider_events,
-            conversation_id,
-            next_position,
+            turn_id,
+            invocation_id,
             source,
             terminated: false,
         },
@@ -239,8 +235,8 @@ fn conversation_event_stream(
                 Some(Ok(driver_event)) => {
                     let conversation_event = translate_model_driver_event(
                         driver_event,
-                        state.conversation_id,
-                        state.next_position,
+                        state.turn_id,
+                        state.invocation_id,
                         &state.source,
                     );
                     let conversation_event = match conversation_event {
@@ -248,19 +244,6 @@ fn conversation_event_stream(
                         Err(error) => {
                             state.terminated = true;
                             return Some((Err(error), state));
-                        }
-                    };
-                    state.next_position = match state.next_position.checked_add(1) {
-                        Some(next_position) => next_position,
-                        None => {
-                            state.terminated = true;
-                            return Some((
-                                Err(ModelDriverError::InvalidResponse(
-                                    "the model output exceeded available conversation positions"
-                                        .to_owned(),
-                                )),
-                                state,
-                            ));
                         }
                     };
                     Some((Ok(conversation_event), state))
@@ -278,21 +261,33 @@ fn conversation_event_stream(
 
 fn translate_model_driver_event(
     driver_event: ModelDriverEvent,
-    conversation_id: ConversationId,
-    position: u64,
+    turn_id: ConversationTurnId,
+    invocation_id: ModelInvocationId,
     source: &ModelSource,
-) -> Result<ConversationEvent, ModelDriverError> {
+) -> Result<ConversationEventKind, ModelDriverError> {
     let kind = match driver_event {
-        ModelDriverEvent::Model { event, data } => ConversationEventKind::Model {
-            model: ModelDetails::new(source.clone(), data).map_err(invalid_model_data)?,
-            event,
+        ModelDriverEvent::Model { event, data } => match event {
+            ModelEvent::Assistant(response) => ConversationEventKind::Assistant {
+                turn_id,
+                invocation_id,
+                model: ModelDetails::new(source.clone(), data).map_err(invalid_model_data)?,
+                response,
+            },
+            ModelEvent::Communication(communication) => ConversationEventKind::Communication {
+                turn_id,
+                invocation_id,
+                model: ModelDetails::new(source.clone(), data).map_err(invalid_model_data)?,
+                communication,
+            },
         },
         ModelDriverEvent::Problem { problem, data } => ConversationEventKind::Problem {
+            turn_id: Some(turn_id),
+            invocation_id: Some(invocation_id),
             model: Some(ModelDetails::new(source.clone(), data).map_err(invalid_model_data)?),
             problem: ConversationProblem::Issue(problem),
         },
     };
-    Ok(ConversationEvent::new(conversation_id, position, kind))
+    Ok(kind)
 }
 
 #[derive(Default)]
@@ -1062,9 +1057,9 @@ mod tests {
 
     use crate::conversation::{
         AssistantResponse, Conversation, ConversationEvent, ConversationEventId,
-        ConversationEventKind, ConversationId, ConversationProblem, ModelCommunication, ModelData,
-        ModelDetails, ModelEvent, ModelEventImportance, ModelId, ModelIssue, ModelSource,
-        ProviderId, UserContent,
+        ConversationEventKind, ConversationId, ConversationProblem, ConversationTurnId,
+        ModelCommunication, ModelData, ModelDetails, ModelEvent, ModelEventImportance, ModelId,
+        ModelInvocationId, ModelIssue, ModelSource, ProviderId, UserContent,
     };
     use crate::model_driver::{ModelDriver, ModelDriverError};
 
@@ -1100,40 +1095,43 @@ mod tests {
             Value::String("ignored".to_owned()),
         )]))
         .expect("the model data should be valid");
+        let turn_id = ConversationTurnId::new();
+        let invocation_id = ModelInvocationId::new();
         let conversation = Conversation::from_events(vec![
             conversation_event(
                 conversation_id,
                 0,
                 ConversationEventKind::User {
+                    caused_by: None,
                     content: vec![UserContent::Text("Hello".to_owned())],
                 },
             ),
             conversation_event(
                 conversation_id,
                 1,
-                ConversationEventKind::Model {
+                ConversationEventKind::Communication {
+                    turn_id,
+                    invocation_id,
                     model: ModelDetails::new(source.clone(), Some(model_data.clone()))
                         .expect("the model details should be valid"),
-                    event: ModelEvent::Communication(
-                        ModelCommunication::new(
-                            "Reasoning".to_owned(),
-                            ModelEventImportance::Detailed,
-                            "reasoning".to_owned(),
-                        )
-                        .expect("the model communication should be valid"),
-                    ),
+                    communication: ModelCommunication::new(
+                        "Reasoning".to_owned(),
+                        ModelEventImportance::Detailed,
+                        "reasoning".to_owned(),
+                    )
+                    .expect("the model communication should be valid"),
                 },
             ),
             conversation_event(
                 conversation_id,
                 2,
-                ConversationEventKind::Model {
+                ConversationEventKind::Assistant {
+                    turn_id,
+                    invocation_id,
                     model: ModelDetails::new(source, Some(model_data))
                         .expect("the model details should be valid"),
-                    event: ModelEvent::Assistant(
-                        AssistantResponse::new("Hello.".to_owned())
-                            .expect("the assistant response should be valid"),
-                    ),
+                    response: AssistantResponse::new("Hello.".to_owned())
+                        .expect("the assistant response should be valid"),
                 },
             ),
         ])
@@ -1189,6 +1187,7 @@ mod tests {
             conversation_id,
             0,
             ConversationEventKind::User {
+                caused_by: None,
                 content: vec![UserContent::Text("Hello".to_owned())],
             },
         )])
@@ -1232,7 +1231,11 @@ mod tests {
         };
 
         let mut model_events = driver
-            .invoke(&test_conversation())
+            .invoke(
+                &test_conversation(),
+                ConversationTurnId::new(),
+                ModelInvocationId::new(),
+            )
             .await
             .expect("the invocation should establish its stream");
         let first_event = model_events
@@ -1247,36 +1250,28 @@ mod tests {
             .expect("the answer should be valid");
 
         assert!(matches!(
-            &first_event.kind,
-            ConversationEventKind::Model {
-                model: _,
-                event: ModelEvent::Communication(_),
-            }
+            &first_event,
+            ConversationEventKind::Communication { .. }
         ));
         assert!(matches!(
-            &second_event.kind,
-            ConversationEventKind::Model {
-                model: _,
-                event: ModelEvent::Assistant(_),
-            }
+            &second_event,
+            ConversationEventKind::Assistant { .. }
         ));
-        let ConversationEventKind::Model { model, .. } = &first_event.kind else {
+        let ConversationEventKind::Communication { model, .. } = &first_event else {
             panic!("the first event should be a model event");
         };
         assert_eq!(model.source(), &source());
-        let ConversationEventKind::Model { model, .. } = &second_event.kind else {
+        let ConversationEventKind::Assistant { model, .. } = &second_event else {
             panic!("the second event should be a model event");
         };
         assert_eq!(model.source(), &source());
-        assert_eq!(first_event.position, 1);
-        assert_eq!(second_event.position, 2);
         assert!(matches!(
-            &first_event.kind,
-            ConversationEventKind::Model { model, .. } if model.data().is_none()
+            &first_event,
+            ConversationEventKind::Communication { model, .. } if model.data().is_none()
         ));
         assert!(matches!(
-            &second_event.kind,
-            ConversationEventKind::Model { model, .. } if model.data().is_none()
+            &second_event,
+            ConversationEventKind::Assistant { model, .. } if model.data().is_none()
         ));
         assert!(model_events.next().await.is_none());
         server.join().expect("the mock server should stop");
@@ -1306,7 +1301,13 @@ mod tests {
             source: source(),
         };
 
-        let result = driver.invoke(&test_conversation()).await;
+        let result = driver
+            .invoke(
+                &test_conversation(),
+                ConversationTurnId::new(),
+                ModelInvocationId::new(),
+            )
+            .await;
 
         assert!(matches!(result, Err(ModelDriverError::Authentication(_))));
         server.join().expect("the mock server should stop");
@@ -1343,7 +1344,11 @@ mod tests {
         };
 
         let mut model_events = driver
-            .invoke(&test_conversation())
+            .invoke(
+                &test_conversation(),
+                ConversationTurnId::new(),
+                ModelInvocationId::new(),
+            )
             .await
             .expect("the context-limit outcome should establish a semantic stream");
         let model_event = model_events
@@ -1353,13 +1358,13 @@ mod tests {
             .expect("the context-limit issue should be valid");
 
         assert!(matches!(
-            &model_event.kind,
+            &model_event,
             ConversationEventKind::Problem {
                 problem: ConversationProblem::Issue(ModelIssue::ContextLimitExceeded { .. }),
                 ..
             }
         ));
-        let ConversationEventKind::Problem { problem, .. } = &model_event.kind else {
+        let ConversationEventKind::Problem { problem, .. } = &model_event else {
             panic!("the output should be a model issue");
         };
         assert_eq!(problem.message(), "The model context limit was exceeded.");

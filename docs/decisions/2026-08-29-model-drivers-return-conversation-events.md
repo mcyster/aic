@@ -1,5 +1,7 @@
 # Make ModelDrivers Return Conversation Events
 
+> Superseded by [Record Commands And Turn Lifecycle](../notes/2026-09-05-record-commands-and-turn-lifecycle.md). Drivers now return semantic event kinds; the append boundary creates durable envelopes.
+
 ## Status
 
 Accepted

@@ -4,9 +4,12 @@ use std::fmt::{Display, Formatter};
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 
-use crate::conversation::{Conversation, ConversationEvent, ModelSource};
+use crate::conversation::{
+    Conversation, ConversationEventKind, ConversationTurnId, ModelInvocationId, ModelSource,
+};
 
-pub(crate) type ModelOutputStream = BoxStream<'static, Result<ConversationEvent, ModelDriverError>>;
+pub(crate) type ModelOutputStream =
+    BoxStream<'static, Result<ConversationEventKind, ModelDriverError>>;
 
 pub(crate) trait ModelDriver {
     fn source(&self) -> &ModelSource;
@@ -14,6 +17,8 @@ pub(crate) trait ModelDriver {
     fn invoke<'invoke>(
         &'invoke self,
         conversation: &'invoke Conversation,
+        turn_id: ConversationTurnId,
+        invocation_id: ModelInvocationId,
     ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>>;
 }
 

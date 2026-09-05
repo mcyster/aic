@@ -1,5 +1,7 @@
 # Introduce the ModelDriver Boundary
 
+> Superseded by [Record Commands And Turn Lifecycle](../notes/2026-09-05-record-commands-and-turn-lifecycle.md) for driver output envelope ownership. The provider-neutral driver boundary remains current.
+
 ## Why
 
 The first provider integration established concrete OpenAI Responses transport and replay concerns. Allowing those concepts to remain in turn orchestration would make provider-native history a requirement for conversation continuation and would prevent model or provider switching from semantic history alone.

@@ -1,5 +1,7 @@
 # Represent Model-Associated Problems as Conversation Events
 
+> Superseded by [Record Commands And Turn Lifecycle](../notes/2026-09-05-record-commands-and-turn-lifecycle.md) for event taxonomy and turn completion. The distinction between semantic problems and operational errors remains current.
+
 ## Why
 
 Model limitations and invocation failures both need a portable, sanitized durable representation. They remain distinct from detailed Rust control-flow errors, but both are facts associated with a selected model invocation and therefore have a meaningful `ModelSource`.

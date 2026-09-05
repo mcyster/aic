@@ -1,5 +1,7 @@
 # Separate Portable Conversation Meaning from Model Data
 
+> Superseded by [Record Commands And Turn Lifecycle](../notes/2026-09-05-record-commands-and-turn-lifecycle.md) and the current conversation record implementation. This file remains historical context for the model-data separation.
+
 ## Why
 
 Model-specific data lived inside the portable event vocabulary: `AssistantResponse` and `ModelCommunication` carried `extensions`, and `ModelIssue::Other` accepted arbitrary extension objects. The `Problem` kind also repeated the invoked `ModelSource`, which made problems look like model output merely because they concerned a model invocation. At the driver boundary, the earlier output wrapper ran as a second channel beside model events, so a model-reported problem was not visibly a conversation event on the driver's stream.

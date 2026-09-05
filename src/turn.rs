@@ -3,8 +3,9 @@ use std::error::Error;
 use futures_util::StreamExt;
 
 use crate::conversation::{
-    ConversationEventKind, ConversationId, ConversationProblem, InvalidConversationProblem,
-    InvocationError, ModelDetails, ModelEvent, ModelSource, UserContent, UserPrompt,
+    ConversationCommandId, ConversationEventKind, ConversationId, ConversationProblem,
+    ConversationTurnId, InvalidConversationProblem, InvocationError, ModelDetails,
+    ModelInvocationId, ModelSource, TurnOutcome, UserContent, UserPrompt,
 };
 use crate::model_driver::{ModelDriver, ModelDriverError};
 use crate::persistence::EventStore;
@@ -18,7 +19,7 @@ pub(crate) struct TurnRequest {
 
 pub(crate) enum TurnProgress {
     InvocationStarted { model: String },
-    EventCompleted { event: ModelEvent },
+    EventCompleted { event: ConversationEventKind },
     ProblemCompleted { problem: ConversationProblem },
 }
 
@@ -48,78 +49,152 @@ impl TurnService {
             }
             None => ConversationId::new(),
         };
+        let user_content = vec![UserContent::Text(request.user_prompt.text().to_owned())];
+        let user_message_command_id = ConversationCommandId::new();
+        self.event_store.append_new_conversation_event(
+            conversation_id,
+            ConversationEventKind::UserMessageRequested {
+                command_id: user_message_command_id,
+                content: user_content.clone(),
+            },
+        )?;
         self.event_store.append_new_conversation_event(
             conversation_id,
             ConversationEventKind::User {
-                content: vec![UserContent::Text(request.user_prompt.text().to_owned())],
+                caused_by: Some(user_message_command_id),
+                content: user_content,
             },
         )?;
         conversation_identified(conversation_id);
 
-        let conversation = self.event_store.load_conversation(conversation_id)?;
         let source = self.model_driver.source().clone();
+        let turn_id = ConversationTurnId::new();
+        self.event_store.append_new_conversation_event(
+            conversation_id,
+            ConversationEventKind::TurnRequested {
+                command_id: ConversationCommandId::new(),
+                turn_id,
+                model: source.clone(),
+            },
+        )?;
+        let conversation = self.event_store.load_conversation(conversation_id)?;
+        let invocation_id = ModelInvocationId::new();
+        self.event_store.append_new_conversation_event(
+            conversation_id,
+            ConversationEventKind::ModelInvocationRequested {
+                command_id: ConversationCommandId::new(),
+                turn_id,
+                invocation_id,
+                model: source.clone(),
+            },
+        )?;
         report_progress(TurnProgress::InvocationStarted {
             model: source.model().as_str().to_owned(),
         })?;
-        let mut conversation_events = match self.model_driver.invoke(&conversation).await {
+
+        let mut conversation_events = match self
+            .model_driver
+            .invoke(&conversation, turn_id, invocation_id)
+            .await
+        {
             Ok(conversation_events) => conversation_events,
             Err(error) => {
                 self.append_invocation_problem(
                     conversation_id,
+                    turn_id,
+                    invocation_id,
                     &source,
                     &error,
                     InvocationStage::BeforeStream,
                 )?;
+                self.append_turn_completed(conversation_id, turn_id, TurnOutcome::Failed)?;
                 return Err(Box::new(error));
             }
         };
+
+        let mut turn_failed = false;
         while let Some(conversation_event) = conversation_events.next().await {
-            let conversation_event = match conversation_event {
-                Ok(conversation_event) => conversation_event,
+            let conversation_kind = match conversation_event {
+                Ok(conversation_kind) => conversation_kind,
                 Err(error) => {
                     self.append_invocation_problem(
                         conversation_id,
+                        turn_id,
+                        invocation_id,
                         &source,
                         &error,
                         InvocationStage::DuringStream,
                     )?;
+                    self.append_turn_completed(conversation_id, turn_id, TurnOutcome::Failed)?;
                     return Err(Box::new(error));
                 }
             };
-            match &conversation_event.kind {
-                ConversationEventKind::Model { event, .. } => {
-                    let event = event.clone();
-                    self.event_store
-                        .append_conversation_event(conversation_event)?;
-                    report_progress(TurnProgress::EventCompleted { event })?;
+            match &conversation_kind {
+                ConversationEventKind::Assistant { .. }
+                | ConversationEventKind::Communication { .. } => {
+                    self.event_store.append_new_conversation_event(
+                        conversation_id,
+                        conversation_kind.clone(),
+                    )?;
+                    report_progress(TurnProgress::EventCompleted {
+                        event: conversation_kind,
+                    })?;
                 }
                 ConversationEventKind::Problem { problem, .. } => {
                     let problem = problem.clone();
+                    turn_failed = true;
                     self.event_store
-                        .append_conversation_event(conversation_event)?;
+                        .append_new_conversation_event(conversation_id, conversation_kind)?;
                     report_progress(TurnProgress::ProblemCompleted { problem })?;
                 }
-                ConversationEventKind::User { .. } => {
+                _ => {
                     let error = ModelDriverError::InvalidResponse(
-                        "the model driver returned a user conversation event".to_owned(),
+                        "the model driver returned an invalid conversation event".to_owned(),
                     );
                     self.append_invocation_problem(
                         conversation_id,
+                        turn_id,
+                        invocation_id,
                         &source,
                         &error,
                         InvocationStage::DuringStream,
                     )?;
+                    self.append_turn_completed(conversation_id, turn_id, TurnOutcome::Failed)?;
                     return Err(Box::new(error));
                 }
             }
         }
 
+        self.append_turn_completed(
+            conversation_id,
+            turn_id,
+            if turn_failed {
+                TurnOutcome::Failed
+            } else {
+                TurnOutcome::Succeeded
+            },
+        )?;
+        Ok(())
+    }
+
+    fn append_turn_completed(
+        &self,
+        conversation_id: ConversationId,
+        turn_id: ConversationTurnId,
+        outcome: TurnOutcome,
+    ) -> TurnResultValue<()> {
+        self.event_store.append_new_conversation_event(
+            conversation_id,
+            ConversationEventKind::TurnCompleted { turn_id, outcome },
+        )?;
         Ok(())
     }
 
     fn append_invocation_problem(
         &self,
         conversation_id: ConversationId,
+        turn_id: ConversationTurnId,
+        invocation_id: ModelInvocationId,
         source: &ModelSource,
         error: &ModelDriverError,
         stage: InvocationStage,
@@ -129,6 +204,8 @@ impl TurnService {
         self.event_store.append_new_conversation_event(
             conversation_id,
             ConversationEventKind::Problem {
+                turn_id: Some(turn_id),
+                invocation_id: Some(invocation_id),
                 model: Some(model),
                 problem,
             },
@@ -186,23 +263,28 @@ mod tests {
     use futures_util::future::BoxFuture;
     use futures_util::stream;
     use futures_util::{FutureExt, StreamExt};
-    use serde_json::{Map, Value};
 
-    use super::{TurnProgress, TurnRequest, TurnService};
+    use super::{TurnRequest, TurnService};
     use crate::conversation::{
-        AssistantResponse, Conversation, ConversationEvent, ConversationEventKind, ConversationId,
-        ConversationProblem, InvocationError, ModelCommunication, ModelData, ModelDetails,
-        ModelEvent, ModelEventImportance, ModelId, ModelIssue, ModelSource, ProviderId,
-        UserContent, UserPrompt,
+        AssistantResponse, Conversation, ConversationEventKind, ConversationId,
+        ConversationProblem, ConversationTurnId, InvocationError, ModelCommunication, ModelDetails,
+        ModelEventImportance, ModelId, ModelInvocationId, ModelIssue, ModelSource, ProviderId,
+        TurnOutcome, UserPrompt,
     };
     use crate::model_driver::{ModelDriver, ModelDriverError, ModelOutputStream};
     use crate::persistence::EventStore;
 
+    enum TestOutput {
+        Assistant(String),
+        Communication(String),
+        Problem(ConversationProblem),
+    }
+
     struct RecordingModelDriver {
         source: ModelSource,
-        events: Vec<ModelEvent>,
-        data: Option<ModelData>,
+        outputs: Vec<TestOutput>,
         inputs: Arc<Mutex<Vec<Conversation>>>,
+        invocations: Arc<Mutex<Vec<(ConversationTurnId, ModelInvocationId)>>>,
     }
 
     impl ModelDriver for RecordingModelDriver {
@@ -213,39 +295,23 @@ mod tests {
         fn invoke<'invoke>(
             &'invoke self,
             conversation: &'invoke Conversation,
+            turn_id: ConversationTurnId,
+            invocation_id: ModelInvocationId,
         ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
             self.inputs
                 .lock()
                 .expect("the model input list should lock")
                 .push(conversation.clone());
-            let events = self.events.clone();
-            let data = self.data.clone();
-            let conversation_id = conversation.id();
-            let source = self.source.clone();
-            let first_position = next_position(conversation);
-            async move {
-                Ok(stream::iter(
-                    events
-                        .into_iter()
-                        .enumerate()
-                        .map(move |(event_index, event)| {
-                            ConversationEvent::new(
-                                conversation_id,
-                                first_position
-                                    + u64::try_from(event_index)
-                                        .expect("the event index should fit in a position"),
-                                ConversationEventKind::Model {
-                                    model: ModelDetails::new(source.clone(), data.clone())
-                                        .expect("the model details should be valid"),
-                                    event,
-                                },
-                            )
-                        })
-                        .map(Ok),
-                )
-                .boxed())
-            }
-            .boxed()
+            self.invocations
+                .lock()
+                .expect("the invocation list should lock")
+                .push((turn_id, invocation_id));
+            let outputs = self
+                .outputs
+                .iter()
+                .map(|output| output_kind(output, &self.source, turn_id, invocation_id))
+                .collect::<Vec<_>>();
+            async move { Ok(stream::iter(outputs.into_iter().map(Ok)).boxed()) }.boxed()
         }
     }
 
@@ -261,6 +327,8 @@ mod tests {
         fn invoke<'invoke>(
             &'invoke self,
             _conversation: &'invoke Conversation,
+            _turn_id: ConversationTurnId,
+            _invocation_id: ModelInvocationId,
         ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
             async { Err(ModelDriverError::Provider("failure".to_owned())) }.boxed()
         }
@@ -268,47 +336,6 @@ mod tests {
 
     struct LateFailingModelDriver {
         source: ModelSource,
-        completed_event: ModelEvent,
-    }
-
-    struct IssueModelDriver {
-        source: ModelSource,
-        issue: ModelIssue,
-        data: Option<ModelData>,
-    }
-
-    impl ModelDriver for IssueModelDriver {
-        fn source(&self) -> &ModelSource {
-            &self.source
-        }
-
-        fn invoke<'invoke>(
-            &'invoke self,
-            conversation: &'invoke Conversation,
-        ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
-            let issue = self.issue.clone();
-            let data = self.data.clone();
-            let conversation_id = conversation.id();
-            let position = next_position(conversation);
-            let source = self.source.clone();
-            async move {
-                Ok(stream::once(async move {
-                    Ok(ConversationEvent::new(
-                        conversation_id,
-                        position,
-                        ConversationEventKind::Problem {
-                            model: Some(
-                                ModelDetails::new(source, data)
-                                    .expect("the model details should be valid"),
-                            ),
-                            problem: ConversationProblem::Issue(issue),
-                        },
-                    ))
-                })
-                .boxed())
-            }
-            .boxed()
-        }
     }
 
     impl ModelDriver for LateFailingModelDriver {
@@ -318,28 +345,74 @@ mod tests {
 
         fn invoke<'invoke>(
             &'invoke self,
-            conversation: &'invoke Conversation,
+            _conversation: &'invoke Conversation,
+            turn_id: ConversationTurnId,
+            invocation_id: ModelInvocationId,
         ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
-            let completed_event = self.completed_event.clone();
-            let conversation_id = conversation.id();
-            let position = next_position(conversation);
             let source = self.source.clone();
             async move {
                 Ok(stream::iter(vec![
-                    Ok(ConversationEvent::new(
-                        conversation_id,
-                        position,
-                        ConversationEventKind::Model {
-                            model: ModelDetails::new(source, None)
-                                .expect("the model details should be valid"),
-                            event: completed_event,
-                        },
+                    Ok(assistant_kind(
+                        "Completed answer",
+                        &source,
+                        turn_id,
+                        invocation_id,
                     )),
                     Err(ModelDriverError::Transport("late failure".to_owned())),
                 ])
                 .boxed())
             }
             .boxed()
+        }
+    }
+
+    fn output_kind(
+        output: &TestOutput,
+        source: &ModelSource,
+        turn_id: ConversationTurnId,
+        invocation_id: ModelInvocationId,
+    ) -> ConversationEventKind {
+        match output {
+            TestOutput::Assistant(message) => {
+                assistant_kind(message, source, turn_id, invocation_id)
+            }
+            TestOutput::Communication(message) => ConversationEventKind::Communication {
+                turn_id,
+                invocation_id,
+                model: ModelDetails::new(source.clone(), None)
+                    .expect("the model details should be valid"),
+                communication: ModelCommunication::new(
+                    message.clone(),
+                    ModelEventImportance::Detailed,
+                    "test".to_owned(),
+                )
+                .expect("the communication should be valid"),
+            },
+            TestOutput::Problem(problem) => ConversationEventKind::Problem {
+                turn_id: Some(turn_id),
+                invocation_id: Some(invocation_id),
+                model: Some(
+                    ModelDetails::new(source.clone(), None)
+                        .expect("the model details should be valid"),
+                ),
+                problem: problem.clone(),
+            },
+        }
+    }
+
+    fn assistant_kind(
+        message: &str,
+        source: &ModelSource,
+        turn_id: ConversationTurnId,
+        invocation_id: ModelInvocationId,
+    ) -> ConversationEventKind {
+        ConversationEventKind::Assistant {
+            turn_id,
+            invocation_id,
+            model: ModelDetails::new(source.clone(), None)
+                .expect("the model details should be valid"),
+            response: AssistantResponse::new(message.to_owned())
+                .expect("the assistant response should be valid"),
         }
     }
 
@@ -350,328 +423,152 @@ mod tests {
         )
     }
 
-    fn model_data() -> ModelData {
-        ModelData::new(Map::from_iter([(
-            "response_id".to_owned(),
-            Value::String("resp_1".to_owned()),
-        )]))
-        .expect("the model data should be valid")
-    }
-
-    fn next_position(conversation: &Conversation) -> u64 {
-        conversation
-            .events()
-            .last()
-            .expect("the conversation should have an event")
-            .position
-            .checked_add(1)
-            .expect("the conversation should have an available position")
-    }
-
-    fn assistant_response(message: &str) -> ModelEvent {
-        ModelEvent::Assistant(
-            AssistantResponse::new(message.to_owned())
-                .expect("the assistant response should be valid"),
-        )
-    }
-
-    fn communication(message: &str, importance: ModelEventImportance) -> ModelEvent {
-        ModelEvent::Communication(
-            ModelCommunication::new(message.to_owned(), importance, "test".to_owned())
-                .expect("the model communication should be valid"),
-        )
-    }
-
-    fn conversation_model_event_kind(
-        source: &ModelSource,
-        event: ModelEvent,
-    ) -> ConversationEventKind {
-        ConversationEventKind::Model {
-            model: ModelDetails::new(source.clone(), None)
-                .expect("the model details should be valid"),
-            event,
-        }
-    }
-
     fn turn_request(conversation_id: Option<ConversationId>, prompt: &str) -> TurnRequest {
         TurnRequest {
             conversation_id,
-            user_prompt: UserPrompt::from_str(prompt).expect("the user prompt should be valid"),
+            user_prompt: prompt
+                .parse::<UserPrompt>()
+                .expect("the prompt should be valid"),
         }
     }
 
-    #[tokio::test]
-    async fn another_model_driver_continues_from_semantic_conversation_alone() {
-        let root_directory =
-            std::env::temp_dir().join(format!("tog-model-driver-test-{}", uuid::Uuid::now_v7()));
-        let event_store =
-            EventStore::new(root_directory.clone()).expect("the event store should be created");
-        let first_source = model_source("first-provider", "first-model");
-        let first_service = TurnService::new(
-            event_store,
-            Box::new(RecordingModelDriver {
-                source: first_source.clone(),
-                events: vec![assistant_response("First answer")],
-                data: None,
-                inputs: Arc::new(Mutex::new(Vec::new())),
-            }),
-        );
-        let mut conversation_id = None;
-        first_service
-            .execute(
-                turn_request(None, "First question"),
-                |identified_conversation_id| {
-                    conversation_id = Some(identified_conversation_id);
-                },
-                |_| Ok(()),
-            )
-            .await
-            .expect("the first turn should complete");
-        let conversation_id =
-            conversation_id.expect("the first turn should identify its conversation");
-
-        let second_inputs = Arc::new(Mutex::new(Vec::new()));
-        let second_service = TurnService::new(
-            EventStore::new(root_directory).expect("the event store should reopen"),
-            Box::new(RecordingModelDriver {
-                source: model_source("second-provider", "second-model"),
-                events: vec![assistant_response("Second answer")],
-                data: None,
-                inputs: Arc::clone(&second_inputs),
-            }),
-        );
-        second_service
-            .execute(
-                turn_request(Some(conversation_id), "Second question"),
-                |_| {},
-                |_| Ok(()),
-            )
-            .await
-            .expect("the second turn should complete");
-
-        let recorded_inputs = second_inputs
-            .lock()
-            .expect("the second model input list should lock");
-        assert_eq!(recorded_inputs[0].id(), conversation_id);
-        let recorded_events = recorded_inputs[0]
-            .events()
-            .iter()
-            .map(|conversation_event| conversation_event.kind.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            recorded_events,
-            [
-                ConversationEventKind::User {
-                    content: vec![UserContent::Text("First question".to_owned())]
-                },
-                conversation_model_event_kind(&first_source, assistant_response("First answer")),
-                ConversationEventKind::User {
-                    content: vec![UserContent::Text("Second question".to_owned())]
-                }
-            ]
-        );
+    fn new_store() -> EventStore {
+        EventStore::new(
+            std::env::temp_dir().join(format!("tog-turn-test-{}", uuid::Uuid::now_v7())),
+        )
+        .expect("the event store should be created")
     }
 
     #[tokio::test]
-    async fn completed_events_are_persisted_before_they_are_reported() {
-        let root_directory =
-            std::env::temp_dir().join(format!("tog-returned-events-test-{}", uuid::Uuid::now_v7()));
-        let event_store =
-            EventStore::new(root_directory.clone()).expect("the event store should be created");
+    async fn a_turn_records_commands_outputs_and_completion() {
+        let event_store = new_store();
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let invocations = Arc::new(Mutex::new(Vec::new()));
         let source = model_source("test-provider", "test-model");
         let service = TurnService::new(
             event_store,
             Box::new(RecordingModelDriver {
-                source: source.clone(),
-                events: vec![
-                    communication("Thinking", ModelEventImportance::Detailed),
-                    assistant_response("Answer"),
+                source,
+                outputs: vec![
+                    TestOutput::Communication("Thinking".to_owned()),
+                    TestOutput::Assistant("Answer".to_owned()),
                 ],
-                data: None,
-                inputs: Arc::new(Mutex::new(Vec::new())),
+                inputs: Arc::clone(&inputs),
+                invocations: Arc::clone(&invocations),
             }),
         );
+        let mut conversation_id = None;
 
-        let identified_conversation_id = Arc::new(Mutex::new(None));
-        let identification = Arc::clone(&identified_conversation_id);
-        let report_conversation_id = Arc::clone(&identified_conversation_id);
-        let reported_event_counts = Arc::new(Mutex::new(Vec::new()));
-        let report_counts = Arc::clone(&reported_event_counts);
-        let report_root_directory = root_directory.clone();
         service
             .execute(
                 turn_request(None, "Question"),
-                move |conversation_id| {
-                    *identification
-                        .lock()
-                        .expect("the conversation identification should lock") =
-                        Some(conversation_id);
-                },
-                move |progress| {
-                    if let TurnProgress::EventCompleted { .. } = progress {
-                        let conversation_id = report_conversation_id
-                            .lock()
-                            .expect("the conversation identification should lock")
-                            .expect("the turn should identify its conversation");
-                        let event_count = EventStore::new(report_root_directory.clone())?
-                            .load_conversation(conversation_id)?
-                            .events()
-                            .len();
-                        report_counts
-                            .lock()
-                            .expect("the report count list should lock")
-                            .push(event_count);
-                    }
-                    Ok(())
-                },
+                |identified| conversation_id = Some(identified),
+                |_| Ok(()),
             )
             .await
             .expect("the turn should complete");
-        let conversation_id = identified_conversation_id
-            .lock()
-            .expect("the conversation identification should lock")
-            .expect("the turn should identify its conversation");
 
-        assert_eq!(
-            *reported_event_counts
-                .lock()
-                .expect("the report count list should lock"),
-            [2, 3]
-        );
-        let conversation = EventStore::new(root_directory)
-            .expect("the event store should reopen")
-            .load_conversation(conversation_id)
-            .expect("the conversation should load");
-        assert_eq!(
-            conversation.events()[1].kind,
-            conversation_model_event_kind(
-                &source,
-                communication("Thinking", ModelEventImportance::Detailed)
-            )
-        );
-        let ConversationEventKind::Model {
-            model: event_model,
-            event: ModelEvent::Assistant(_),
-        } = &conversation.events()[2].kind
-        else {
-            panic!("the event should be an assistant response");
-        };
-        assert_eq!(event_model.source(), &source);
+        let conversation_id = conversation_id.expect("the conversation should be identified");
+        let log = service
+            .event_store
+            .load_conversation_log(conversation_id)
+            .expect("the log should load");
+        assert_eq!(log.len(), 7);
+        assert!(log[0].kind.is_command());
+        assert!(matches!(log[1].kind, ConversationEventKind::User { .. }));
+        assert!(matches!(
+            log[2].kind,
+            ConversationEventKind::TurnRequested { .. }
+        ));
+        assert!(matches!(
+            log[3].kind,
+            ConversationEventKind::ModelInvocationRequested { .. }
+        ));
+        assert!(matches!(
+            log[4].kind,
+            ConversationEventKind::Communication { .. }
+        ));
+        assert!(matches!(
+            log[5].kind,
+            ConversationEventKind::Assistant { .. }
+        ));
+        assert!(matches!(
+            log[6].kind,
+            ConversationEventKind::TurnCompleted {
+                outcome: TurnOutcome::Succeeded,
+                ..
+            }
+        ));
+        let invocation_id = invocations.lock().expect("the invocation list should lock")[0].1;
+        assert!(matches!(
+            log[4].kind,
+            ConversationEventKind::Communication {
+                invocation_id: found,
+                ..
+            } if found == invocation_id
+        ));
+        assert!(matches!(
+            log[5].kind,
+            ConversationEventKind::Assistant {
+                invocation_id: found,
+                ..
+            } if found == invocation_id
+        ));
+        assert_eq!(inputs.lock().expect("the input list should lock").len(), 1);
     }
 
     #[tokio::test]
-    async fn failed_invocation_persists_a_sanitized_problem() {
-        let root_directory = std::env::temp_dir().join(format!(
-            "tog-model-driver-failure-test-{}",
-            uuid::Uuid::now_v7()
-        ));
-        let event_store =
-            EventStore::new(root_directory).expect("the event store should be created");
+    async fn failed_invocation_records_problem_and_failed_completion() {
         let service = TurnService::new(
-            event_store,
+            new_store(),
             Box::new(FailingModelDriver {
                 source: model_source("test-provider", "test-model"),
             }),
         );
-
-        let mut conversation_id = None;
-        let result = service
-            .execute(
-                turn_request(None, "Question"),
-                |identified_conversation_id| {
-                    conversation_id = Some(identified_conversation_id);
-                },
-                |_| Ok(()),
-            )
-            .await;
-
-        assert!(result.is_err());
-        let conversation = service
-            .event_store
-            .load_conversation(conversation_id.expect("the turn should identify its conversation"))
-            .expect("the conversation should load");
-        assert_eq!(conversation.events().len(), 2);
-        assert!(matches!(
-            conversation.events()[0].kind,
-            ConversationEventKind::User { .. }
-        ));
-        let ConversationEventKind::Problem { problem, .. } = &conversation.events()[1].kind else {
-            panic!("the second event should be an invocation problem");
-        };
-        assert_eq!(
-            problem.message(),
-            "The model provider failed the invocation."
-        );
-        assert!(matches!(
-            problem,
-            ConversationProblem::Invocation(InvocationError::ProviderFailure { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn model_issue_is_persisted_and_reported_as_a_top_level_problem() {
-        let root_directory =
-            std::env::temp_dir().join(format!("tog-model-issue-test-{}", uuid::Uuid::now_v7()));
-        let source = model_source("test-provider", "test-model");
-        let service = TurnService::new(
-            EventStore::new(root_directory).expect("the event store should be created"),
-            Box::new(IssueModelDriver {
-                source,
-                issue: ModelIssue::try_refusal("Refused.".to_owned())
-                    .expect("the refusal should be valid"),
-                data: None,
-            }),
-        );
-        let reported_problems = Arc::new(Mutex::new(Vec::new()));
-        let problem_reports = Arc::clone(&reported_problems);
         let mut conversation_id = None;
 
-        service
-            .execute(
-                turn_request(None, "Question"),
-                |identified_conversation_id| conversation_id = Some(identified_conversation_id),
-                move |progress| {
-                    if let TurnProgress::ProblemCompleted { problem } = progress {
-                        problem_reports
-                            .lock()
-                            .expect("the problem report list should lock")
-                            .push(problem);
-                    }
-                    Ok(())
-                },
-            )
-            .await
-            .expect("the model issue turn should complete");
-
-        let conversation = service
+        assert!(
+            service
+                .execute(
+                    turn_request(None, "Question"),
+                    |identified| conversation_id = Some(identified),
+                    |_| Ok(()),
+                )
+                .await
+                .is_err()
+        );
+        let log = service
             .event_store
-            .load_conversation(conversation_id.expect("the turn should identify its conversation"))
-            .expect("the conversation should load");
+            .load_conversation_log(conversation_id.expect("the conversation should be identified"))
+            .expect("the log should load");
         assert!(matches!(
-            &conversation.events()[1].kind,
+            log[4].kind,
             ConversationEventKind::Problem {
-                problem: ConversationProblem::Issue(ModelIssue::Refusal { .. }),
+                problem: ConversationProblem::Invocation(InvocationError::ProviderFailure { .. }),
                 ..
             }
         ));
-        let reports = reported_problems
-            .lock()
-            .expect("the problem report list should lock");
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].message(), "Refused.");
+        assert!(matches!(
+            log[5].kind,
+            ConversationEventKind::TurnCompleted {
+                outcome: TurnOutcome::Failed,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
-    async fn model_data_supplied_with_a_model_event_is_persisted_on_the_envelope() {
-        let root_directory =
-            std::env::temp_dir().join(format!("tog-model-data-test-{}", uuid::Uuid::now_v7()));
+    async fn a_model_problem_completes_a_failed_turn_without_control_flow_failure() {
+        let issue = ConversationProblem::Issue(
+            ModelIssue::try_refusal("Refused.".to_owned()).expect("the issue should be valid"),
+        );
         let service = TurnService::new(
-            EventStore::new(root_directory).expect("the event store should be created"),
+            new_store(),
             Box::new(RecordingModelDriver {
                 source: model_source("test-provider", "test-model"),
-                events: vec![assistant_response("Answer")],
-                data: Some(model_data()),
+                outputs: vec![TestOutput::Problem(issue)],
                 inputs: Arc::new(Mutex::new(Vec::new())),
+                invocations: Arc::new(Mutex::new(Vec::new())),
             }),
         );
         let mut conversation_id = None;
@@ -679,154 +576,60 @@ mod tests {
         service
             .execute(
                 turn_request(None, "Question"),
-                |identified_conversation_id| conversation_id = Some(identified_conversation_id),
+                |identified| conversation_id = Some(identified),
                 |_| Ok(()),
             )
             .await
-            .expect("the turn should complete");
-
-        let conversation = service
+            .expect("a semantic model problem should not fail control flow");
+        let log = service
             .event_store
-            .load_conversation(conversation_id.expect("the turn should identify its conversation"))
-            .expect("the conversation should load");
+            .load_conversation_log(conversation_id.expect("the conversation should be identified"))
+            .expect("the log should load");
+        assert!(matches!(log[4].kind, ConversationEventKind::Problem { .. }));
         assert!(matches!(
-            conversation.events()[1].kind,
-            ConversationEventKind::Model { .. }
+            log[5].kind,
+            ConversationEventKind::TurnCompleted {
+                outcome: TurnOutcome::Failed,
+                ..
+            }
         ));
-        let ConversationEventKind::Model { model, .. } = &conversation.events()[1].kind else {
-            panic!("the event should be a model event");
-        };
-        assert_eq!(model.data(), Some(&model_data()));
     }
 
     #[tokio::test]
-    async fn model_data_supplied_with_a_model_problem_is_persisted_on_the_envelope() {
-        let root_directory = std::env::temp_dir().join(format!(
-            "tog-problem-model-data-test-{}",
-            uuid::Uuid::now_v7()
-        ));
+    async fn late_stream_failure_preserves_output_before_failed_completion() {
         let service = TurnService::new(
-            EventStore::new(root_directory).expect("the event store should be created"),
-            Box::new(IssueModelDriver {
-                source: model_source("test-provider", "test-model"),
-                issue: ModelIssue::try_refusal("Refused.".to_owned())
-                    .expect("the refusal should be valid"),
-                data: Some(model_data()),
-            }),
-        );
-        let mut conversation_id = None;
-
-        service
-            .execute(
-                turn_request(None, "Question"),
-                |identified_conversation_id| conversation_id = Some(identified_conversation_id),
-                |_| Ok(()),
-            )
-            .await
-            .expect("the model issue turn should complete");
-
-        let conversation = service
-            .event_store
-            .load_conversation(conversation_id.expect("the turn should identify its conversation"))
-            .expect("the conversation should load");
-        assert!(matches!(
-            conversation.events()[1].kind,
-            ConversationEventKind::Problem { .. }
-        ));
-        let ConversationEventKind::Problem { model, .. } = &conversation.events()[1].kind else {
-            panic!("the event should be a problem event");
-        };
-        assert_eq!(
-            model.as_ref().and_then(ModelDetails::data),
-            Some(&model_data())
-        );
-    }
-
-    #[tokio::test]
-    async fn late_stream_failure_preserves_the_completed_model_event() {
-        let root_directory = std::env::temp_dir().join(format!(
-            "tog-late-model-driver-failure-test-{}",
-            uuid::Uuid::now_v7()
-        ));
-        let service = TurnService::new(
-            EventStore::new(root_directory).expect("the event store should be created"),
+            new_store(),
             Box::new(LateFailingModelDriver {
                 source: model_source("test-provider", "test-model"),
-                completed_event: assistant_response("Completed answer"),
             }),
         );
-
         let mut conversation_id = None;
-        let result = service
-            .execute(
-                turn_request(None, "Question"),
-                |identified_conversation_id| conversation_id = Some(identified_conversation_id),
-                |_| Ok(()),
-            )
-            .await;
 
-        assert!(result.is_err());
-        let conversation = service
-            .event_store
-            .load_conversation(conversation_id.expect("the turn should identify its conversation"))
-            .expect("the conversation should load");
-        assert_eq!(conversation.events().len(), 3);
-        assert_eq!(
-            conversation.events()[1].kind,
-            conversation_model_event_kind(
-                service.model_driver.source(),
-                assistant_response("Completed answer")
-            )
+        assert!(
+            service
+                .execute(
+                    turn_request(None, "Question"),
+                    |identified| conversation_id = Some(identified),
+                    |_| Ok(()),
+                )
+                .await
+                .is_err()
         );
+        let log = service
+            .event_store
+            .load_conversation_log(conversation_id.expect("the conversation should be identified"))
+            .expect("the log should load");
         assert!(matches!(
-            conversation.events()[2].kind,
-            ConversationEventKind::Problem {
-                problem: ConversationProblem::Invocation(InvocationError::StreamInterrupted { .. }),
+            log[4].kind,
+            ConversationEventKind::Assistant { .. }
+        ));
+        assert!(matches!(log[5].kind, ConversationEventKind::Problem { .. }));
+        assert!(matches!(
+            log[6].kind,
+            ConversationEventKind::TurnCompleted {
+                outcome: TurnOutcome::Failed,
                 ..
             }
         ));
-    }
-
-    #[tokio::test]
-    async fn nonexistent_conversation_is_not_created_by_a_turn() {
-        let root_directory = std::env::temp_dir().join(format!(
-            "tog-missing-conversation-test-{}",
-            uuid::Uuid::now_v7()
-        ));
-        let event_store =
-            EventStore::new(root_directory.clone()).expect("the event store should be created");
-        let conversation_id = ConversationId::new();
-        let inputs = Arc::new(Mutex::new(Vec::new()));
-        let service = TurnService::new(
-            event_store,
-            Box::new(RecordingModelDriver {
-                source: model_source("test-provider", "test-model"),
-                events: Vec::new(),
-                data: None,
-                inputs: Arc::clone(&inputs),
-            }),
-        );
-
-        let result = service
-            .execute(
-                turn_request(Some(conversation_id), "Question"),
-                |_| {},
-                |_| Ok(()),
-            )
-            .await;
-
-        assert!(result.is_err());
-        assert!(
-            inputs
-                .lock()
-                .expect("the model input list should lock")
-                .is_empty()
-        );
-        assert!(
-            !root_directory
-                .join("conversations")
-                .join(conversation_id.storage_key())
-                .exists()
-        );
     }
 }

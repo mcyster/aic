@@ -10,9 +10,13 @@ use std::str::FromStr;
 
 pub(crate) use event::{
     AssistantResponse, ConversationEvent, ConversationEventKind, InvalidAssistantResponse,
-    InvalidModelCommunication, ModelCommunication, ModelEvent, ModelEventImportance, UserContent,
+    InvalidModelCommunication, ModelCommunication, ModelEvent, ModelEventImportance, TurnOutcome,
+    UserContent,
 };
-pub(crate) use id::{ConversationEventId, ConversationId};
+pub(crate) use id::{
+    ConversationCommandId, ConversationEventId, ConversationId, ConversationTurnId,
+    ModelInvocationId,
+};
 pub(crate) use model::{ModelDetails, ModelId, ModelSource, ProviderId};
 pub(crate) use model_data::{InvalidModelData, ModelData};
 pub(crate) use problem::{
@@ -32,7 +36,8 @@ impl Conversation {
             .map(|event| event.conversation_id)
             .ok_or(InvalidConversation::Empty)?;
 
-        for (expected_position, event) in events.iter().enumerate() {
+        let mut previous_position = None;
+        for event in &events {
             if event.conversation_id != conversation_id {
                 return Err(InvalidConversation::MixedConversationIds {
                     expected: conversation_id,
@@ -40,14 +45,17 @@ impl Conversation {
                 });
             }
 
-            let expected_position =
-                u64::try_from(expected_position).map_err(|_| InvalidConversation::TooManyEvents)?;
-            if event.position != expected_position {
+            if let Some(previous_position) = previous_position
+                && event.position <= previous_position
+            {
                 return Err(InvalidConversation::InvalidPosition {
-                    expected: expected_position,
+                    expected: previous_position
+                        .checked_add(1)
+                        .ok_or(InvalidConversation::TooManyEvents)?,
                     found: event.position,
                 });
             }
+            previous_position = Some(event.position);
 
             event
                 .ensure_valid()
@@ -159,8 +167,9 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{
-        Conversation, ConversationEvent, ConversationEventId, ConversationEventKind,
-        ConversationId, InvalidConversation, InvalidUserPrompt, UserContent, UserPrompt,
+        Conversation, ConversationCommandId, ConversationEvent, ConversationEventId,
+        ConversationEventKind, ConversationId, ConversationTurnId, InvalidConversation,
+        InvalidUserPrompt, UserContent, UserPrompt,
     };
 
     fn user_event(conversation_id: ConversationId, position: u64) -> ConversationEvent {
@@ -171,6 +180,7 @@ mod tests {
             timestamp: OffsetDateTime::UNIX_EPOCH,
             schema_version: 7,
             kind: ConversationEventKind::User {
+                caused_by: Some(ConversationCommandId::new()),
                 content: vec![UserContent::Text(format!("event {position}"))],
             },
         }
@@ -207,12 +217,15 @@ mod tests {
     fn conversation_rejects_invalid_event_order() {
         let conversation_id = ConversationId::new();
 
-        let result = Conversation::from_events(vec![user_event(conversation_id, 1)]);
+        let result = Conversation::from_events(vec![
+            user_event(conversation_id, 1),
+            user_event(conversation_id, 1),
+        ]);
 
         assert_eq!(
             result,
             Err(InvalidConversation::InvalidPosition {
-                expected: 0,
+                expected: 2,
                 found: 1,
             })
         );
@@ -235,6 +248,19 @@ mod tests {
     }
 
     #[test]
+    fn conversation_accepts_gaps_left_by_command_records() {
+        let conversation_id = ConversationId::new();
+
+        let conversation = Conversation::from_events(vec![
+            user_event(conversation_id, 1),
+            user_event(conversation_id, 3),
+        ])
+        .expect("the conversation should allow command positions between events");
+
+        assert_eq!(conversation.events()[1].position, 3);
+    }
+
+    #[test]
     fn conversation_rejects_invalid_deserialized_model_events() {
         let conversation_id = ConversationId::new();
         let event_id = ConversationEventId::new();
@@ -243,18 +269,17 @@ mod tests {
             "position": 0,
             "id": event_id,
             "timestamp": "2026-08-22T18:42:31.482Z",
-            "schema_version": 7,
-            "type": "model",
+            "schema_version": 11,
+            "type": "assistant",
+            "turn_id": ConversationTurnId::new(),
+            "invocation_id": crate::conversation::ModelInvocationId::new(),
             "model": {
                 "source": {
                     "provider": "openai",
                     "model": "gpt-5.6"
                 }
             },
-            "event": {
-                "type": "assistant",
-                "message": "   "
-            }
+            "response": { "message": "   " }
         }))
         .expect("derived deserialization should construct the conversation event");
 
@@ -276,16 +301,17 @@ mod tests {
             "position": 0,
             "id": event_id,
             "timestamp": "2026-08-22T18:42:31.482Z",
-            "schema_version": 7,
-            "type": "model",
+            "schema_version": 11,
+            "type": "communication",
+            "turn_id": ConversationTurnId::new(),
+            "invocation_id": crate::conversation::ModelInvocationId::new(),
             "model": {
                 "source": {
                     "provider": "openai",
                     "model": "gpt-5.6"
                 }
             },
-            "event": {
-                "type": "communication",
+            "communication": {
                 "message": "reasoning",
                 "importance": "detailed",
                 "subtype": "   "
@@ -313,6 +339,8 @@ mod tests {
             "timestamp": "2026-08-22T18:42:31.482Z",
             "schema_version": 8,
             "type": "problem",
+            "turn_id": null,
+            "invocation_id": null,
             "model": {
                 "source": {
                     "provider": "openai",
@@ -348,7 +376,9 @@ mod tests {
             "id": event_id,
             "timestamp": "2026-08-22T18:42:31.482Z",
             "schema_version": 10,
-            "type": "model",
+            "type": "assistant",
+            "turn_id": ConversationTurnId::new(),
+            "invocation_id": crate::conversation::ModelInvocationId::new(),
             "model": {
                 "source": {
                     "provider": "openai",
@@ -356,10 +386,7 @@ mod tests {
                 },
                 "data": {}
             },
-            "event": {
-                "type": "assistant",
-                "message": "The answer is 42."
-            }
+            "response": { "message": "The answer is 42." }
         }))
         .expect("derived deserialization should construct the conversation event");
 
