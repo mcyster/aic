@@ -6,9 +6,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::conversation::{
     ConversationFact, ConversationId, ConversationProblem, ModelEventImportance, ModelId,
 };
+use crate::conversation_session::{
+    ConversationSession, ConversationSessionProgress, ConversationSessionResult,
+};
 use crate::openai::OpenAiModelDriver;
 use crate::persistence::EventStore;
-use crate::turn::{ConversationSession, TurnProgress, TurnResultValue};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -37,28 +39,31 @@ impl CommandLine {
         Self::parse_from(arguments)
     }
 
-    pub(crate) async fn execute(self) -> TurnResultValue<()> {
+    pub(crate) async fn execute(self) -> ConversationSessionResult<()> {
         match self.command {
             Command::Turn(arguments) => {
                 let user_prompt = arguments.user_prompt_words.join(" ").parse()?;
                 let verbosity = arguments.verbosity;
-                let conversation_session = ConversationSession::new(
-                    EventStore::from_environment()?,
-                    Box::new(OpenAiModelDriver::from_environment(arguments.model)?),
-                );
-                let (conversation_id, _) =
-                    conversation_session.add_user_request(arguments.conversation, user_prompt)?;
-                eprintln!("#> conversation {conversation_id}");
+                let event_store = EventStore::from_environment()?;
+                let model_driver = Box::new(OpenAiModelDriver::from_environment(arguments.model)?);
+                let conversation_session = match arguments.conversation {
+                    Some(conversation_id) => {
+                        ConversationSession::open(conversation_id, event_store, model_driver)?
+                    }
+                    None => ConversationSession::create(event_store, model_driver),
+                };
+                conversation_session.add_user_request(user_prompt)?;
+                eprintln!("#> conversation {}", conversation_session.id());
                 conversation_session
-                    .invoke(conversation_id, |progress| {
+                    .invoke(|progress| {
                         match progress {
-                            TurnProgress::InvocationStarted { model } => {
+                            ConversationSessionProgress::InvocationStarted { model } => {
                                 eprintln!("## waiting for model {model}");
                             }
-                            TurnProgress::EventCompleted { event } => {
+                            ConversationSessionProgress::EventCompleted { event } => {
                                 render_model_event(&event, verbosity)?;
                             }
-                            TurnProgress::ProblemCompleted { problem } => {
+                            ConversationSessionProgress::ProblemCompleted { problem } => {
                                 render_model_problem(&problem)?;
                             }
                         }
