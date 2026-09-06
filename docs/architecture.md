@@ -86,8 +86,9 @@ representation.
 
 ## Model Driver Boundary
 
-The configured `ModelDriver` receives an immutable `Conversation` and a
-`ConversationTurnId`, then yields shared semantic events, driver-defined events,
+The configured `ModelDriver` receives a typed `TurnInput` containing an immutable
+`Conversation`, pending user-message requests derived from that snapshot, and a
+`ConversationTurnId`. It yields shared semantic events, driver-defined events,
 and an explicit `TurnCompleted` event. It creates invocation identities and
 invocation-specific data. It does not allocate durable record positions,
 timestamps, or record identifiers. The event store assigns that envelope

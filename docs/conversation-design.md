@@ -188,18 +188,18 @@ The caller-facing API is `ConversationSession`:
 struct ConversationRequest { /* UserMessageRequested or TurnRequested */ }
 
 impl ConversationSession {
-    fn add_user_request(...) -> Result<(ConversationId, ConversationCommandId), _>;
+    fn add_user_request(...) -> Result<ConversationCommandId, _>;
 
     async fn invoke(
         &self,
-        conversation_id: ConversationId,
-        report_progress: impl FnMut(TurnProgress) -> Result<(), _>,
+        report_progress: impl FnMut(ConversationSessionProgress) -> Result<(), _>,
     ) -> Result<(), _>;
 }
 ```
 
-`ModelDriver` receives a typed request containing the immutable conversation,
-the pending user requests, and the turn identity. Its output stream returns
+`ModelDriver` receives a `TurnInput` constructed from the immutable conversation
+and turn identity. `TurnInput` derives the pending user requests from that same
+snapshot. Its output stream returns
 `DriverConversationEvent`, which has explicit command and fact branches and
 cannot return `ConversationRequest` values.
 
@@ -706,6 +706,18 @@ use futures_util::stream::BoxStream;
 type ModelOutputStream =
     BoxStream<'static, Result<ConversationEvent, ModelDriverError>>;
 
+struct TurnInput<'conversation> {
+    conversation: &'conversation Conversation,
+    turn_id: ConversationTurnId,
+}
+
+impl<'conversation> TurnInput<'conversation> {
+    fn new(conversation: &'conversation Conversation, turn_id: ConversationTurnId) -> Self;
+    fn conversation(&self) -> &'conversation Conversation;
+    fn turn_id(&self) -> ConversationTurnId;
+    fn pending_user_requests(&self) -> &[UserMessageRequest];
+}
+
 trait ConversationEventExtension: Send {
     fn driver_name(&self) -> &str;
     fn driver_version(&self) -> &str;
@@ -727,8 +739,7 @@ trait ModelDriver: DriverEventReader {
 
     fn invoke<'invoke>(
         &'invoke self,
-        conversation: &'invoke Conversation,
-        turn_id: ConversationTurnId,
+        input: TurnInput<'invoke>,
     ) -> BoxFuture<
         'invoke,
         Result<ModelOutputStream, ModelDriverError>,

@@ -13,13 +13,13 @@ use serde_json::{Map, Value, json};
 use crate::conversation::{
     AssistantResponse, Conversation, ConversationEventClass, ConversationEventError,
     ConversationEventExtension, ConversationEventKind, ConversationFact, ConversationProblem,
-    ConversationRequest, ConversationTurnId, DriverConversationEvent, DriverConversationFact,
-    DriverEventEnvelope, DriverEventReadError, DriverEventReader, InvalidAssistantResponse,
-    InvalidConversationProblem, InvalidModelCommunication, InvocationError, ModelCommunication,
-    ModelData, ModelEvent, ModelEventImportance, ModelId, ModelInvocationId, ModelIssue,
-    ModelSource, ProviderId, StoredConversationEventKind, TurnOutcome, UserContent,
+    ConversationTurnId, DriverConversationEvent, DriverConversationFact, DriverEventEnvelope,
+    DriverEventReadError, DriverEventReader, InvalidAssistantResponse, InvalidConversationProblem,
+    InvalidModelCommunication, InvocationError, ModelCommunication, ModelData, ModelEvent,
+    ModelEventImportance, ModelId, ModelInvocationId, ModelIssue, ModelSource, ProviderId,
+    StoredConversationEventKind, TurnOutcome, UserContent, UserMessageRequest,
 };
-use crate::model_driver::{ModelDriver, ModelDriverError, ModelDriverRequest, ModelOutputStream};
+use crate::model_driver::{ModelDriver, ModelDriverError, ModelOutputStream, TurnInput};
 
 type ResponseByteStream = BoxStream<'static, Result<Vec<u8>, OpenAiError>>;
 type ProviderOutputStream = BoxStream<'static, Result<ModelDriverEvent, OpenAiError>>;
@@ -140,11 +140,11 @@ impl ModelDriver for OpenAiModelDriver {
 
     fn invoke<'invoke>(
         &'invoke self,
-        request: ModelDriverRequest<'invoke>,
+        input: TurnInput<'invoke>,
     ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
-        let conversation = request.conversation();
-        let turn_id = request.turn_id();
-        let pending_user_requests = request.pending_user_requests().to_vec();
+        let conversation = input.conversation();
+        let turn_id = input.turn_id();
+        let pending_user_requests = input.pending_user_requests().to_vec();
         let pending_user_events = accepted_user_events(&pending_user_requests);
         let invocation_id = ModelInvocationId::new();
         let invocation_event = OpenAiInvocationRequested {
@@ -275,7 +275,7 @@ impl DriverEventReader for OpenAiModelDriver {
 
 fn semantic_input(
     conversation: &Conversation,
-    pending_user_requests: &[ConversationRequest],
+    pending_user_requests: &[UserMessageRequest],
 ) -> Value {
     let mut input = conversation
         .events()
@@ -301,35 +301,30 @@ fn semantic_input(
             | StoredConversationEventKind::Extension(_) => None,
         })
         .collect::<Vec<_>>();
-    input.extend(pending_user_requests.iter().filter_map(|request| {
-        request.user_message().map(|(_, content)| {
-            let text = content
-                .iter()
-                .map(|content| match content {
-                    UserContent::Text(text) => text.as_str(),
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            json!({ "role": "user", "content": text })
-        })
+    input.extend(pending_user_requests.iter().map(|request| {
+        let text = request
+            .content
+            .iter()
+            .map(|content| match content {
+                UserContent::Text(text) => text.as_str(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        json!({ "role": "user", "content": text })
     }));
     Value::Array(input)
 }
 
 fn accepted_user_events(
-    pending_user_requests: &[ConversationRequest],
+    pending_user_requests: &[UserMessageRequest],
 ) -> Vec<DriverConversationEvent> {
     pending_user_requests
         .iter()
-        .filter_map(|request| {
-            request.user_message().map(|(command_id, content)| {
-                DriverConversationEvent::Fact(DriverConversationFact::Shared(
-                    ConversationFact::User {
-                        caused_by: Some(command_id),
-                        content: content.to_owned(),
-                    },
-                ))
-            })
+        .map(|request| {
+            DriverConversationEvent::Fact(DriverConversationFact::Shared(ConversationFact::User {
+                caused_by: Some(request.command_id),
+                content: request.content.clone(),
+            }))
         })
         .collect()
 }
@@ -1371,7 +1366,7 @@ mod tests {
         ModelData, ModelEvent, ModelEventImportance, ModelId, ModelInvocationId, ModelIssue,
         ModelSource, ProviderId, StoredConversationEventKind, UserContent,
     };
-    use crate::model_driver::{ModelDriver, ModelDriverRequest};
+    use crate::model_driver::{ModelDriver, TurnInput};
 
     use super::{
         ModelDriverEvent, OpenAiError, OpenAiModelDriver, ResponseByteStream,
@@ -1514,8 +1509,8 @@ mod tests {
         )
     }
 
-    fn driver_request(conversation: &Conversation) -> ModelDriverRequest<'_> {
-        ModelDriverRequest::new(conversation, Vec::new(), ConversationTurnId::new())
+    fn driver_request(conversation: &Conversation) -> TurnInput<'_> {
+        TurnInput::new(conversation, ConversationTurnId::new())
     }
 
     #[tokio::test]

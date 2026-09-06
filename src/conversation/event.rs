@@ -42,10 +42,7 @@ impl ConversationEvent {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ConversationRequest {
-    UserMessageRequested {
-        command_id: ConversationCommandId,
-        content: Vec<UserContent>,
-    },
+    UserMessageRequested(UserMessageRequest),
     TurnRequested {
         command_id: ConversationCommandId,
         turn_id: ConversationTurnId,
@@ -53,25 +50,11 @@ pub(crate) enum ConversationRequest {
 }
 
 impl ConversationRequest {
-    pub(crate) fn user_message(&self) -> Option<(ConversationCommandId, &[UserContent])> {
-        match self {
-            Self::UserMessageRequested {
-                command_id,
-                content,
-            } => Some((*command_id, content.as_slice())),
-            Self::TurnRequested { .. } => None,
-        }
-    }
-
     pub(crate) fn command(&self) -> ConversationCommand {
         match self {
-            Self::UserMessageRequested {
-                command_id,
-                content,
-            } => ConversationCommand::UserMessageRequested {
-                command_id: *command_id,
-                content: content.clone(),
-            },
+            Self::UserMessageRequested(request) => {
+                ConversationCommand::UserMessageRequested(request.clone())
+            }
             Self::TurnRequested {
                 command_id,
                 turn_id,
@@ -85,6 +68,12 @@ impl ConversationRequest {
     pub(crate) fn class(&self) -> ConversationEventClass {
         ConversationEventClass::Command
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct UserMessageRequest {
+    pub(crate) command_id: ConversationCommandId,
+    pub(crate) content: Vec<UserContent>,
 }
 
 pub(crate) enum DriverConversationEvent {
@@ -117,10 +106,7 @@ pub(crate) enum ConversationEventKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ConversationCommand {
-    UserMessageRequested {
-        command_id: ConversationCommandId,
-        content: Vec<UserContent>,
-    },
+    UserMessageRequested(UserMessageRequest),
     TurnRequested {
         command_id: ConversationCommandId,
         turn_id: ConversationTurnId,

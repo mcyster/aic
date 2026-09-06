@@ -17,6 +17,7 @@ pub(crate) use event::{
     DriverConversationFact, DriverEventEnvelope, DriverEventReadError, DriverEventReader,
     InvalidAssistantResponse, InvalidModelCommunication, ModelCommunication, ModelEvent,
     ModelEventImportance, StoredConversationEventKind, TurnOutcome, UserContent,
+    UserMessageRequest,
 };
 pub(crate) use id::{
     ConversationCommandId, ConversationEventId, ConversationId, ConversationTurnId,
@@ -86,7 +87,7 @@ impl Conversation {
         &self.events
     }
 
-    pub(crate) fn pending_user_requests(&self) -> Vec<ConversationRequest> {
+    pub(crate) fn pending_user_requests(&self) -> Vec<UserMessageRequest> {
         let mut requests = Vec::new();
         let mut accepted_request_ids = HashSet::new();
         for event in &self.events {
@@ -94,13 +95,9 @@ impl Conversation {
                 continue;
             };
             match kind {
-                ConversationEventKind::Command(ConversationCommand::UserMessageRequested {
-                    command_id,
-                    content,
-                }) => requests.push(ConversationRequest::UserMessageRequested {
-                    command_id: *command_id,
-                    content: content.clone(),
-                }),
+                ConversationEventKind::Command(ConversationCommand::UserMessageRequested(
+                    request,
+                )) => requests.push(request.clone()),
                 ConversationEventKind::Fact(ConversationFact::User {
                     caused_by: Some(command_id),
                     ..
@@ -112,11 +109,7 @@ impl Conversation {
         }
         requests
             .into_iter()
-            .filter(|request| {
-                request
-                    .user_message()
-                    .is_some_and(|(command_id, _)| !accepted_request_ids.contains(&command_id))
-            })
+            .filter(|request| !accepted_request_ids.contains(&request.command_id))
             .collect()
     }
 }

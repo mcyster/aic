@@ -6,9 +6,9 @@ use futures_util::StreamExt;
 use crate::conversation::{
     ConversationCommandId, ConversationEvent, ConversationFact, ConversationId,
     ConversationProblem, ConversationRequest, ConversationTurnId, DriverConversationEvent,
-    DriverConversationFact, UserContent, UserPrompt,
+    DriverConversationFact, UserContent, UserMessageRequest, UserPrompt,
 };
-use crate::model_driver::{ModelDriver, ModelDriverError, ModelDriverRequest};
+use crate::model_driver::{ModelDriver, ModelDriverError, TurnInput};
 use crate::persistence::EventStore;
 
 pub(crate) type ConversationSessionResult<T> = Result<T, Box<dyn Error>>;
@@ -58,10 +58,12 @@ impl ConversationSession {
         let command_id = ConversationCommandId::new();
         self.event_store.append_new_conversation_event(
             self.conversation_id,
-            ConversationEvent::Request(ConversationRequest::UserMessageRequested {
-                command_id,
-                content: vec![UserContent::Text(user_prompt.text().to_owned())],
-            }),
+            ConversationEvent::Request(ConversationRequest::UserMessageRequested(
+                UserMessageRequest {
+                    content: vec![UserContent::Text(user_prompt.text().to_owned())],
+                    command_id,
+                },
+            )),
         )?;
         Ok(command_id)
     }
@@ -79,14 +81,15 @@ impl ConversationSession {
             }),
         )?;
         let conversation = self.event_store.load_conversation(self.conversation_id)?;
-        let pending_user_requests = conversation.pending_user_requests();
         let source = self.model_driver.source().clone();
         report_progress(ConversationSessionProgress::InvocationStarted {
             model: source.model().as_str().to_owned(),
         })?;
 
-        let driver_request = ModelDriverRequest::new(&conversation, pending_user_requests, turn_id);
-        let mut output_stream = self.model_driver.invoke(driver_request).await?;
+        let mut output_stream = self
+            .model_driver
+            .invoke(TurnInput::new(&conversation, turn_id))
+            .await?;
         let mut turn_completed = false;
         let mut accepted_request_ids = HashSet::new();
 
@@ -207,7 +210,7 @@ fn pending_request_ids(
     conversation
         .pending_user_requests()
         .iter()
-        .filter_map(|request| request.user_message().map(|(command_id, _)| command_id))
+        .map(|request| request.command_id)
         .collect()
 }
 
@@ -264,9 +267,7 @@ mod tests {
         DriverConversationFact, DriverEventEnvelope, DriverEventReadError, DriverEventReader,
         ModelId, ModelSource, ProviderId, TurnOutcome, UserPrompt,
     };
-    use crate::model_driver::{
-        ModelDriver, ModelDriverError, ModelDriverRequest, ModelOutputStream,
-    };
+    use crate::model_driver::{ModelDriver, ModelDriverError, ModelOutputStream, TurnInput};
     use crate::persistence::EventStore;
 
     struct RecordingDriver {
@@ -290,25 +291,23 @@ mod tests {
 
         fn invoke<'invoke>(
             &'invoke self,
-            request: ModelDriverRequest<'invoke>,
+            input: TurnInput<'invoke>,
         ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>> {
-            let pending_requests = request.pending_user_requests().to_vec();
+            let pending_requests = input.pending_user_requests().to_vec();
             self.pending_counts
                 .lock()
                 .expect("the pending request list should lock")
                 .push(pending_requests.len());
-            let turn_id = request.turn_id();
+            let turn_id = input.turn_id();
             let mut output = pending_requests
                 .into_iter()
-                .filter_map(|request| {
-                    request.user_message().map(|(command_id, content)| {
-                        Ok(DriverConversationEvent::Fact(
-                            DriverConversationFact::Shared(ConversationFact::User {
-                                caused_by: Some(command_id),
-                                content: content.to_owned(),
-                            }),
-                        ))
-                    })
+                .map(|request| {
+                    Ok(DriverConversationEvent::Fact(
+                        DriverConversationFact::Shared(ConversationFact::User {
+                            caused_by: Some(request.command_id),
+                            content: request.content,
+                        }),
+                    ))
                 })
                 .collect::<Vec<_>>();
             output.push(Ok(DriverConversationEvent::Fact(
