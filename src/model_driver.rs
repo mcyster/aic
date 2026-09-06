@@ -5,18 +5,51 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 
 use crate::conversation::{
-    Conversation, ConversationEvent, ConversationTurnId, DriverEventReader, ModelSource,
+    Conversation, ConversationRequest, ConversationTurnId, DriverConversationEvent,
+    DriverEventReader, ModelSource,
 };
 
-pub(crate) type ModelOutputStream = BoxStream<'static, Result<ConversationEvent, ModelDriverError>>;
+pub(crate) type ModelOutputStream =
+    BoxStream<'static, Result<DriverConversationEvent, ModelDriverError>>;
+
+pub(crate) struct ModelDriverRequest<'conversation> {
+    conversation: &'conversation Conversation,
+    pending_user_requests: Vec<ConversationRequest>,
+    turn_id: ConversationTurnId,
+}
+
+impl<'conversation> ModelDriverRequest<'conversation> {
+    pub(crate) fn new(
+        conversation: &'conversation Conversation,
+        pending_user_requests: Vec<ConversationRequest>,
+        turn_id: ConversationTurnId,
+    ) -> Self {
+        Self {
+            conversation,
+            pending_user_requests,
+            turn_id,
+        }
+    }
+
+    pub(crate) fn conversation(&self) -> &'conversation Conversation {
+        self.conversation
+    }
+
+    pub(crate) fn pending_user_requests(&self) -> &[ConversationRequest] {
+        &self.pending_user_requests
+    }
+
+    pub(crate) fn turn_id(&self) -> ConversationTurnId {
+        self.turn_id
+    }
+}
 
 pub(crate) trait ModelDriver: DriverEventReader {
     fn source(&self) -> &ModelSource;
 
     fn invoke<'invoke>(
         &'invoke self,
-        conversation: &'invoke Conversation,
-        turn_id: ConversationTurnId,
+        request: ModelDriverRequest<'invoke>,
     ) -> BoxFuture<'invoke, Result<ModelOutputStream, ModelDriverError>>;
 }
 

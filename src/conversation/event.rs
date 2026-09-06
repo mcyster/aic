@@ -18,8 +18,8 @@ use super::{
 };
 
 pub(crate) enum ConversationEvent {
-    Shared(ConversationEventKind),
-    Extension(Box<dyn ConversationEventExtension>),
+    Request(ConversationRequest),
+    Driver(DriverConversationEvent),
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -31,10 +31,78 @@ pub(crate) enum ConversationEventClass {
 
 impl ConversationEvent {
     #[allow(dead_code)]
+    #[allow(dead_code)]
     pub(crate) fn class(&self) -> ConversationEventClass {
         match self {
-            Self::Shared(event) => event.class(),
-            Self::Extension(event) => event.class(),
+            Self::Request(request) => request.class(),
+            Self::Driver(event) => event.class(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ConversationRequest {
+    UserMessageRequested {
+        command_id: ConversationCommandId,
+        content: Vec<UserContent>,
+    },
+    TurnRequested {
+        command_id: ConversationCommandId,
+        turn_id: ConversationTurnId,
+    },
+}
+
+impl ConversationRequest {
+    pub(crate) fn user_message(&self) -> Option<(ConversationCommandId, &[UserContent])> {
+        match self {
+            Self::UserMessageRequested {
+                command_id,
+                content,
+            } => Some((*command_id, content.as_slice())),
+            Self::TurnRequested { .. } => None,
+        }
+    }
+
+    pub(crate) fn command(&self) -> ConversationCommand {
+        match self {
+            Self::UserMessageRequested {
+                command_id,
+                content,
+            } => ConversationCommand::UserMessageRequested {
+                command_id: *command_id,
+                content: content.clone(),
+            },
+            Self::TurnRequested {
+                command_id,
+                turn_id,
+            } => ConversationCommand::TurnRequested {
+                command_id: *command_id,
+                turn_id: *turn_id,
+            },
+        }
+    }
+
+    pub(crate) fn class(&self) -> ConversationEventClass {
+        ConversationEventClass::Command
+    }
+}
+
+pub(crate) enum DriverConversationEvent {
+    Command(Box<dyn ConversationEventExtension>),
+    Fact(DriverConversationFact),
+}
+
+#[allow(dead_code)]
+pub(crate) enum DriverConversationFact {
+    Shared(ConversationFact),
+    Extension(Box<dyn ConversationEventExtension>),
+}
+
+impl DriverConversationEvent {
+    pub(crate) fn class(&self) -> ConversationEventClass {
+        match self {
+            Self::Command(_) => ConversationEventClass::Command,
+            Self::Fact(_) => ConversationEventClass::Fact,
         }
     }
 }

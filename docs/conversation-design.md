@@ -182,6 +182,27 @@ The caller requests a turn. The driver owns model invocation identities and
 driver-defined invocation records. Model invocation, tools, and external I/O
 naturally involve streaming, failures, and incremental output.
 
+The caller-facing API is `ConversationSession`:
+
+```rust
+struct ConversationRequest { /* UserMessageRequested or TurnRequested */ }
+
+impl ConversationSession {
+    fn add_user_request(...) -> Result<(ConversationId, ConversationCommandId), _>;
+
+    async fn invoke(
+        &self,
+        conversation_id: ConversationId,
+        report_progress: impl FnMut(TurnProgress) -> Result<(), _>,
+    ) -> Result<(), _>;
+}
+```
+
+`ModelDriver` receives a typed request containing the immutable conversation,
+the pending user requests, and the turn identity. Its output stream returns
+`DriverConversationEvent`, which has explicit command and fact branches and
+cannot return `ConversationRequest` values.
+
 ---
 
 ## 5. Strongly typed identifiers

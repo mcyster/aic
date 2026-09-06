@@ -22,6 +22,7 @@ pub(crate) struct ConversationEventRecord {
 }
 
 impl ConversationEventRecord {
+    #[allow(dead_code)]
     pub(crate) fn class(&self) -> ConversationEventClass {
         self.kind.class()
     }
@@ -69,6 +70,7 @@ pub(crate) enum StoredConversationEventKind {
 }
 
 impl StoredConversationEventKind {
+    #[allow(dead_code)]
     pub(crate) fn class(&self) -> ConversationEventClass {
         match self {
             Self::Shared(event) => event.class(),

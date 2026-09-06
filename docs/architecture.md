@@ -60,6 +60,11 @@ is requested, allowing messages to accumulate independently from agent work.
 An assistant response is not a completion marker, and a problem does not always
 complete a turn because orchestration may recover or retry.
 
+`ConversationSession` is the caller-facing interface. `add_user_request` records
+and queues user input. `invoke` records a turn request, supplies the existing
+conversation and pending user requests to the driver, and persists driver
+output as it arrives. `Conversation` remains immutable history.
+
 The driver records its own invocation event, including a stable
 `ModelInvocationId`, as an opaque driver event. Returned model facts reference
 that identifier. The invocation record is execution metadata, not a replacement

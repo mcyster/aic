@@ -4,16 +4,19 @@ mod model;
 mod model_data;
 mod problem;
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
+#[allow(unused_imports)]
 pub(crate) use event::{
     AssistantResponse, ConversationCommand, ConversationEvent, ConversationEventClass,
     ConversationEventError, ConversationEventExtension, ConversationEventKind,
-    ConversationEventRecord, ConversationFact, DriverEventEnvelope, DriverEventReadError,
-    DriverEventReader, InvalidAssistantResponse, InvalidModelCommunication, ModelCommunication,
-    ModelEvent, ModelEventImportance, StoredConversationEventKind, TurnOutcome, UserContent,
+    ConversationEventRecord, ConversationFact, ConversationRequest, DriverConversationEvent,
+    DriverConversationFact, DriverEventEnvelope, DriverEventReadError, DriverEventReader,
+    InvalidAssistantResponse, InvalidModelCommunication, ModelCommunication, ModelEvent,
+    ModelEventImportance, StoredConversationEventKind, TurnOutcome, UserContent,
 };
 pub(crate) use id::{
     ConversationCommandId, ConversationEventId, ConversationId, ConversationTurnId,
@@ -81,6 +84,40 @@ impl Conversation {
 
     pub(crate) fn events(&self) -> &[ConversationEventRecord] {
         &self.events
+    }
+
+    pub(crate) fn pending_user_requests(&self) -> Vec<ConversationRequest> {
+        let mut requests = Vec::new();
+        let mut accepted_request_ids = HashSet::new();
+        for event in &self.events {
+            let StoredConversationEventKind::Shared(kind) = &event.kind else {
+                continue;
+            };
+            match kind {
+                ConversationEventKind::Command(ConversationCommand::UserMessageRequested {
+                    command_id,
+                    content,
+                }) => requests.push(ConversationRequest::UserMessageRequested {
+                    command_id: *command_id,
+                    content: content.clone(),
+                }),
+                ConversationEventKind::Fact(ConversationFact::User {
+                    caused_by: Some(command_id),
+                    ..
+                }) => {
+                    accepted_request_ids.insert(*command_id);
+                }
+                _ => {}
+            }
+        }
+        requests
+            .into_iter()
+            .filter(|request| {
+                request
+                    .user_message()
+                    .is_some_and(|(command_id, _)| !accepted_request_ids.contains(&command_id))
+            })
+            .collect()
     }
 }
 

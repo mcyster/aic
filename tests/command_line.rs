@@ -271,8 +271,14 @@ fn turn_persists_events_and_prints_semantic_output() {
     assert_eq!(first_event["event"]["content"][0]["value"], "say hi");
     assert!(first_event.get("kind").is_none());
     assert!(first_event.get("model").is_none());
+    let turn_request: Value = serde_json::from_reader(
+        fs::File::open(&event_paths[1]).expect("the persisted turn request should open"),
+    )
+    .expect("the persisted turn request should be JSON");
+    assert_eq!(turn_request["class"], "command");
+    assert_eq!(turn_request["event"]["type"], "turn_requested");
     let user_event: Value = serde_json::from_reader(
-        fs::File::open(&event_paths[1]).expect("the persisted user event should open"),
+        fs::File::open(&event_paths[2]).expect("the persisted user event should open"),
     )
     .expect("the persisted user event should be JSON");
     assert_eq!(user_event["schema_version"], 11);

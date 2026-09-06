@@ -4,12 +4,11 @@ use std::io::{self, Write};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::conversation::{
-    ConversationEventKind, ConversationFact, ConversationId, ConversationProblem,
-    ModelEventImportance, ModelId,
+    ConversationFact, ConversationId, ConversationProblem, ModelEventImportance, ModelId,
 };
 use crate::openai::OpenAiModelDriver;
 use crate::persistence::EventStore;
-use crate::turn::{TurnProgress, TurnRequest, TurnResultValue, TurnService};
+use crate::turn::{ConversationSession, TurnProgress, TurnResultValue};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -43,44 +42,40 @@ impl CommandLine {
             Command::Turn(arguments) => {
                 let user_prompt = arguments.user_prompt_words.join(" ").parse()?;
                 let verbosity = arguments.verbosity;
-                let turn_service = TurnService::new(
+                let conversation_session = ConversationSession::new(
                     EventStore::from_environment()?,
                     Box::new(OpenAiModelDriver::from_environment(arguments.model)?),
                 );
-                turn_service
-                    .execute(
-                        TurnRequest {
-                            conversation_id: arguments.conversation,
-                            user_prompt,
-                        },
-                        |conversation_id| eprintln!("#> conversation {conversation_id}"),
-                        |progress| {
-                            match progress {
-                                TurnProgress::InvocationStarted { model } => {
-                                    eprintln!("## waiting for model {model}");
-                                }
-                                TurnProgress::EventCompleted { event } => {
-                                    render_model_event(&event, verbosity)?;
-                                }
-                                TurnProgress::ProblemCompleted { problem } => {
-                                    render_model_problem(&problem)?;
-                                }
+                let (conversation_id, _) =
+                    conversation_session.add_user_request(arguments.conversation, user_prompt)?;
+                eprintln!("#> conversation {conversation_id}");
+                conversation_session
+                    .invoke(conversation_id, |progress| {
+                        match progress {
+                            TurnProgress::InvocationStarted { model } => {
+                                eprintln!("## waiting for model {model}");
                             }
-                            Ok(())
-                        },
-                    )
+                            TurnProgress::EventCompleted { event } => {
+                                render_model_event(&event, verbosity)?;
+                            }
+                            TurnProgress::ProblemCompleted { problem } => {
+                                render_model_problem(&problem)?;
+                            }
+                        }
+                        Ok(())
+                    })
                     .await
             }
         }
     }
 }
 
-fn render_model_event(event: &ConversationEventKind, verbosity: Verbosity) -> io::Result<()> {
+fn render_model_event(event: &ConversationFact, verbosity: Verbosity) -> io::Result<()> {
     let (message, importance, prefix) = match event {
-        ConversationEventKind::Fact(ConversationFact::Assistant { response, .. }) => {
+        ConversationFact::Assistant { response, .. } => {
             (response.message(), ModelEventImportance::Important, "")
         }
-        ConversationEventKind::Fact(ConversationFact::Communication { communication, .. }) => {
+        ConversationFact::Communication { communication, .. } => {
             (communication.message(), communication.importance(), "### ")
         }
         _ => return Ok(()),
